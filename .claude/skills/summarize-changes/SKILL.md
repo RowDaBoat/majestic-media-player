@@ -31,12 +31,36 @@ summarize from the preview alone.
 
 ## 3. Write the summary
 
-- Open with one line giving the totals (files, lines added and removed).
-- Group changes by **feature or purpose**, not by file. Give each group a heading, and say *why*
-  when the code or its comments make that clear.
-- Under each group, list what changed per file using clickable links like
-  [file.nim](src/file.nim), and name the new or changed procs, types, fields and config files.
-- Mention user-visible behavior (menus, shortcuts, buttons, OSD messages, saved files) in plain
-  terms before internals.
+Write it as text worth of a commit, in one code block, with exactly these three lists in this
+order. No title line goes above a list: each one ends with its `=== End of ... ===` line, followed
+by a blank line between lists:
+
+```
+Make frame stepping instant by keeping the frames around a paused position in textures.
+Bump the version to 0.20.0.
+=== End of Changes ===
+
+Add YouTube seek bar previews from storyboards, with a toggle in the seek bar's context menu.
+Add Ctrl+D to duplicate playlist entries.
+=== End of New ===
+
+Fix the end of audio files being cut off (gapless-audio=no, ao=pulse).
+Stop listed YouTube playlists from adding their videos again after a restart.
+=== End of Fixes ===
+```
+
+- Keep all three end lines, even for a list with no items.
+- **Changes**: existing behavior that now works differently, plus refactors, docs and the version.
+- **New**: features, options, shortcuts and tools that didn't exist before.
+- **Fixes**: anything that was broken and now isn't, whichever verb describes it best.
+- Sort each list from major to minor: what users will notice most goes first; internals, docs and
+  the version go last.
+- One line per item, brief and informative, ending in a period.
+- Every item must begin with a verb in the imperative: Fix, Add, Make, Show, Separate, Clarify...
+- Describe user-visible behavior (menus, shortcuts, buttons, OSD messages, saved files) in plain
+  terms. Name a proc, file or setting only when there is no better way to say it.
+- Split unrelated changes into separate items, and leave out steps of a single change.
 - Don't list patch/diff noise (whitespace, reordering) unless that's all there is.
 - Don't include `.claude/` in the summary.
+- After the code block, flag anything that shouldn't go into the commit unnoticed, such as leftover
+  debug code or untracked personal notes. Leave these out of the list itself.
