@@ -3,7 +3,7 @@
 ## and a lightweight instance that renders seek-bar thumbnails.
 
 import std/[algorithm, atomics, json, sequtils, strutils, os, tables, times]
-import mpv, videogl, spherical, gpumem
+import mpv, videogl, spherical, gpumem, coverart
 from config import AudioExtensions
 from ytdlp import YtdlSubLangs
 
@@ -50,6 +50,7 @@ type
     timePos*, duration*: float
     timeAt: float             ## when timePos last changed, epochTime
     frameDur: float           ## the last step of timePos while playing, a frame
+    holdTime*: bool           ## the app sets timePos (step frames): mpv's lags behind
     eofReached*: bool
     backward*: bool           ## playing in reverse (ping-pong loops)
     threadless*: bool         ## opened without mpv's demuxer thread: turns
@@ -94,6 +95,10 @@ type
     loadRestarts: int         ## restarts as the file was opened
     loadedRestarts*: int      ## and once it had loaded (the next is its own)
     keepTime*: bool           ## opening: its time and duration stay as they are
+    openSeek: float           ## sought there while keepTime, -1: not; done once open
+    pausedAt: float           ## when it last paused, epoch seconds
+    endPaused: bool           ## paused by mpv on reaching the end, not by the user
+    sought*: float            ## where a seek is headed until its time gets there, -1: none
                               ## (the same media again) until it has loaded
     expanded*: seq[string]    ## expandText results, in order
     linkHooked: bool          ## LinkWaitHook added
@@ -106,7 +111,10 @@ type
     target*: VideoTarget
     path: string
     busy: bool                ## a seek is in flight
+    opening: bool             ## a file asked for hasn't started yet
     wanted, shown: float      ## requested vs. displayed time
+    wantedImage, wantedCrop: string  ## showImage's request
+    crop: string              ## and the part of the image displayed
     hasFrame*: bool
 
 var
@@ -131,7 +139,8 @@ const
     "video-scale-y", "osd-level", "osd-msg3", "osd-fractions", "osd-scale",
     "osd-margin-x", "osd-margin-y", "osd-outline-size", "osd-bar-align-x",
     "osd-bar-align-y", "osd-bar-w", "osd-bar-h", "osd-bar-outline-size",
-    "osd-bar-marker-min-size", "loop-file", "ab-loop-a", "ab-loop-b"]
+    "osd-bar-marker-min-size", "loop-file", "ab-loop-a", "ab-loop-b",
+    "audio-display", "cover-art-whitelist"]
     ## What the app sets at runtime, observed (into `props`) so a second
     ## player can be made to look and sound the same (seamless loops)
   EqFreqs* = [31.0, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000]
@@ -140,6 +149,7 @@ const
   ExpandReply = 77'u64        ## reply id of expandText
   DumpReply = 1000'u64        ## dumpFrom's, plus its count
   LinkWaitHook = 78'u64       ## reply id of the on_load hooks after yt-dlp's
+  CoverHook = 79'u64          ## the on_preloaded hook's (pickCover)
   LinkWaitMax = 30.0          ## seconds a link's opening waits at most
 
 proc onMainUpdate(d: pointer) {.cdecl.} = frameReady.store(1)
@@ -183,6 +193,13 @@ proc newPlayer*(volume: float, muted, osd: bool): Player =
   # frame buffers, so any blocking mpv call from the UI could deadlock.
   h.setOpt("vd-lavc-dr", "no")
   h.setOpt("keep-open", "yes")
+  # Gapless, mpv calls EOF with the audio still queued, and the next file
+  # (handleEof) would throw that away: the last ~0.25 s of every file.
+  h.setOpt("gapless-audio", "no")
+  # mpv's pipewire output drops the end of a file that doesn't fill PipeWire's
+  # last block (up to ~20 ms, clear on a short sound that ends loud); pulse,
+  # served by PipeWire all the same, plays it all.
+  when defined(linux): h.setOpt("ao", "pulse,")
   h.setOpt("idle", "yes")
   h.setOpt("terminal", "no")
   h.setOpt("input-default-bindings", "no")
@@ -210,6 +227,7 @@ proc newPlayer*(volume: float, muted, osd: bool): Player =
   # (hookError).
   discard mpv_request_log_messages(h, (if logAll: "warn" else: "error").cstring)
   observe(h)
+  discard mpv_hook_add(h, CoverHook, "on_preloaded", 0)
 
 proc useYtdlp*(p: Player, path: string) =
   ## Has mpv open links with the yt-dlp at path, through its built-in hook.
@@ -374,18 +392,25 @@ proc handleProp(p: Player, id: Prop, ev: ptr MpvEventProperty) =
   let d = ev.data
   template f: float = (if d == nil: 0.0 else: cast[ptr cdouble](d)[].float)
   template b: bool = (d != nil and cast[ptr cint](d)[] != 0)
-  if p.keepTime and d == nil and id in {pTimePos, pDuration}: return
+  if p.keepTime and id in {pTimePos, pDuration}: return
   case id
-  of pPause: p.paused = b
+  of pPause:
+    p.paused = b
+    if b: p.pausedAt = epochTime()
   of pTimePos:
+    if p.holdTime: return
     let step = abs(f - p.timePos)
     if step > 0.001 and step < 0.1: p.frameDur = step
     p.timePos = f
     p.timeAt = epochTime()
+    # On past it: mpv tells of the spot itself before seeking there.
+    if p.sought >= 0 and not p.seeking and f > p.sought + 0.1 and f < p.sought + 15: p.sought = -1
   of pDuration: p.duration = max(f, p.fullDuration)
   of pEof:
     p.eofReached = b
     if not p.eofReached: p.eofHandled = false
+    # mpv pauses itself at the end, around when it tells of it.
+    elif not p.paused or epochTime() - p.pausedAt < 0.2: p.endPaused = true
   of pVolume: p.volume = f
   of pMute: p.muted = b
   of pSpeed: p.speed = f
@@ -446,6 +471,45 @@ proc addSameNameAudio(p: Player) =
   for i, f in found:
     p.h.command("audio-add", f, if i == 0: "select" else: "auto", f.extractFilename)
 
+proc coverTrack(p: Player): int =
+  ## The track id of the audio file's cover to show, 0 for none (or a
+  ## video): of the pictures inside it the front cover (mpv takes the
+  ## first, often the back or a booklet page), else the first one; else a
+  ## picture beside it (mpv's cover-art-whitelist).
+  var inside, beside: seq[int]
+  for i in 0 ..< p.h.getInt("track-list/count"):
+    let t = "track-list/" & $i & "/"
+    if p.h.getStr(t & "type") != "video": continue
+    if not p.h.getFlag(t & "albumart"): return 0
+    let id = p.h.getInt(t & "id")
+    if p.h.getFlag(t & "external"): beside.add id else: inside.add id
+  if inside.len > 1 and not p.path.contains("://"):
+    let types = pictureTypes(p.path)
+    if types.len == inside.len and FrontCover in types:
+      return inside[types.find(FrontCover)]
+  if inside.len > 0: inside[0]
+  elif beside.len > 0: beside[0]
+  else: 0
+
+proc pickCover(p: Player) =
+  ## File-local: a vid set at runtime would hold for the files opened next.
+  let id = p.coverTrack
+  if id != 0: p.h.setProp("file-local-options/vid", $id)
+
+proc showCover*(p: Player, on: bool) =
+  ## Shows or hides an audio file's cover, now and for the files opened next.
+  p.h.setProp("audio-display", if on: "embedded-first" else: "no")
+  if not p.loaded: return
+  if on:
+    if p.h.getInt("vid") == 0: p.pickCover()
+  elif p.coverTrack != 0: p.h.setProp("file-local-options/vid", "no")
+
+proc setCoverNames*(p: Player, names: openArray[string]) =
+  ## The pictures beside an audio file taken as its cover when it has none
+  ## (names without the extension, any letter case), the first found first.
+  p.h.command("change-list", "cover-art-whitelist", "clr", "")
+  for n in names: p.h.command("change-list", "cover-art-whitelist", "append", n)
+
 proc pollEvents*(p: Player): bool =
   ## Drains the mpv event queue. Returns true if anything changed.
   if p.linkHold != 0 and epochTime() >= p.linkHoldUntil:
@@ -474,6 +538,9 @@ proc pollEvents*(p: Player): bool =
       p.opening = false
       p.justLoaded = true
       p.loadedRestarts = p.restarts
+      if p.keepTime and p.openSeek >= 0:
+        inc p.jumps
+        p.h.commandAsync("seek", formatFloat(p.openSeek, ffDecimal, 3), "absolute", "exact")
       p.keepTime = false
       p.loadError = ""
       p.eofHandled = false
@@ -486,6 +553,12 @@ proc pollEvents*(p: Player): bool =
     of evPlaybackRestart: inc p.restarts
     of evHook:
       let e = cast[ptr MpvEventHook](ev.data)
+      if ev.replyUserdata == CoverHook:
+        # Tracks found, none picked yet: the cover's picked before mpv
+        # shows another (and the window fits that one).
+        if not p.hidden and p.h.getStr("audio-display") != "no": p.pickCover()
+        discard mpv_hook_continue(p.h, e.id)
+        continue
       p.releaseLink()
       let at = p.linkAvailableAt()
       if at > epochTime():
@@ -529,6 +602,7 @@ proc load*(p: Player, path: string, start = 0.0, threadless = false, opts = "",
   p.stopped = false
   p.eofReached = false
   p.eofHandled = false
+  p.holdTime = false
   p.timePos = start
   p.duration = fullDuration
   p.loadError = ""
@@ -536,6 +610,9 @@ proc load*(p: Player, path: string, start = 0.0, threadless = false, opts = "",
   p.streamError = ""
   p.opening = true
   p.keepTime = false
+  p.openSeek = -1
+  p.endPaused = false
+  p.sought = -1
   p.buffered.setLen 0
   p.cacheAhead = -1
   p.buffering = false
@@ -563,6 +640,7 @@ proc reopen*(p: Player, threadless: bool) =
   p.threadless = threadless
   p.h.setProp("demuxer-thread", if threadless: "no" else: "yes")
   p.releaseLink()
+  p.holdTime = false
   p.eofReached = false
   p.eofHandled = false
   inc p.jumps
@@ -661,19 +739,34 @@ proc pastPart(p: Player, t: float): bool =
   result = p.partEnd > 0 and (t > p.partEnd - 0.5 or t < p.partStart - 0.05)
   if result: p.beyond = clamp(t, 0, max(p.duration - 1, 0))
 
+proc noteSeek(p: Player, t: float) =
+  ## A seek to t: noted (sought), unless it's to the end anyway. Back from the
+  ## end mpv paused itself at, playing goes on.
+  p.sought = if t < p.duration - 5: max(t, 0) else: -1
+  if p.endPaused and p.eofReached and t < p.duration - 0.5:
+    p.h.setProp("pause", false)
+  if t < p.duration - 0.5: p.endPaused = false
+
 proc seek*(p: Player, t: float, exact = true) =
   if not p.loaded or p.pastPart(t): return
+  p.noteSeek(t)
+  if p.opening and p.keepTime:  # mpv has no file to seek in yet
+    p.openSeek = max(t, 0)
+    p.timePos = p.openSeek
+    return
   inc p.jumps
   p.h.commandAsync("seek", formatFloat(max(t, 0), ffDecimal, 3), "absolute",
     if exact: "exact" else: "keyframes")
 
 proc seekRelative*(p: Player, d: float) =
   if p.pastPart(p.timePos + d): return
+  p.noteSeek(p.timePos + d)
   inc p.jumps
   p.h.commandAsync("seek", $d, "relative")
 
 proc seekPercent*(p: Player, percent: float) =
   if p.pastPart(p.duration * percent / 100): return
+  p.noteSeek(p.duration * percent / 100)
   inc p.jumps
   p.h.commandAsync("seek", $percent, "absolute-percent")
 
@@ -711,10 +804,19 @@ proc setVolume*(p: Player, v: float) =
   p.volume = clamp(v, 0, 200)
   p.h.setProp("volume", p.volume)
 
+proc refreshTracks*(p: Player) =
+  ## track-list as it is now, not as last observed (that of the file before,
+  ## just after a load).
+  p.parseTracks(p.h.getNode("track-list"))
+
 proc selectedTrack*(p: Player, kind: string): int =
   for t in p.tracks:
     if t.kind == kind and t.selected: return t.id
   0
+
+proc loadedFile*(t: Track): bool =
+  ## A track from a file of its own, not the link's (the hook adds it by URL).
+  t.external and not t.file.contains("://")
 
 proc urlLang(url: string): string =
   ## A caption link's lang= parameter (YouTube's timedtext), else "".
@@ -822,14 +924,33 @@ proc request*(pv: Preview, path: string, t: float) =
     pv.path = path
     pv.hasFrame = false
     pv.busy = true
+    pv.opening = true
     pv.shown = -1
     pv.h.commandAsync("loadfile", path, "replace", "-1",
       "start=" & formatFloat(t, ffDecimal, 2))
+  pv.wantedImage = ""
   pv.wanted = t
   if not pv.busy and abs(pv.wanted - pv.shown) > 0.05:
     pv.busy = true
     pv.shown = pv.wanted
     pv.h.commandAsync("seek", formatFloat(t, ffDecimal, 2), "absolute", "keyframes")
+
+proc showImage*(pv: Preview, path, crop: string) =
+  ## Ask for a part of an image (crop: a video-crop value), coalesced like
+  ## request. The last one stays up until it's in.
+  if pv == nil: return
+  (pv.wantedImage, pv.wantedCrop) = (path, crop)
+  if pv.busy: return
+  if path != pv.path:
+    if path.parentDir != pv.path.parentDir: pv.hasFrame = false  # another video's
+    pv.path = path
+    pv.crop = crop
+    pv.busy = true
+    pv.opening = true
+    pv.h.commandAsync("loadfile", path, "replace", "-1", "video-crop=" & crop)
+  elif crop != pv.crop:
+    pv.crop = crop
+    pv.h.setProp("video-crop", crop)
 
 proc pollEvents*(pv: Preview) =
   if pv == nil: return
@@ -837,15 +958,21 @@ proc pollEvents*(pv: Preview) =
     let ev = mpv_wait_event(pv.h, 0)
     if ev.eventId == evNone: break
     case ev.eventId
+    of evStartFile:
+      pv.opening = false
     of evPlaybackRestart:
       pv.busy = false
       pv.hasFrame = true
-      if pv.shown < 0: pv.shown = pv.wanted
-      if abs(pv.wanted - pv.shown) > 0.05:
-        let t = pv.wanted
-        pv.request(pv.path, t)
+      if pv.wantedImage.len > 0:
+        pv.showImage(pv.wantedImage, pv.wantedCrop)
+      else:
+        if pv.shown < 0: pv.shown = pv.wanted
+        if abs(pv.wanted - pv.shown) > 0.05:
+          let t = pv.wanted
+          pv.request(pv.path, t)
     of evEndFile:
-      pv.busy = false
+      # The file before the one opening doesn't count.
+      if not pv.opening: pv.busy = false
     else: discard
 
 proc forget*(pv: Preview) =
@@ -853,8 +980,10 @@ proc forget*(pv: Preview) =
   if pv == nil or pv.path.len == 0: return
   pv.h.commandAsync("stop")
   pv.path = ""
+  pv.wantedImage = ""
   pv.hasFrame = false
   pv.busy = false
+  pv.opening = false
 
 # --- folder navigation -----------------------------------------------------
 
@@ -891,6 +1020,9 @@ type
   MediaInfo* = object
     duration*: float          ## seconds, 0 when unknown
     width*, height*: int      ## first real video track, 0 for audio only
+    audioBitrate*: float      ## bits per second, 0 when unknown
+    title*, artist*, album*: string  ## from the tags, "" when absent
+    track*, year*: int        ## from the tags, 0 when absent
 
   Prober* = ref object
     ## Headless, paused mpv with null outputs, for the playlist's columns and
@@ -915,6 +1047,51 @@ proc newProber*(): Prober =
     mpv_terminate_destroy(h)
     return nil
   Prober(h: h)
+
+proc leadingInt(s: string): int =
+  ## "3/12" -> 3; 0 when s doesn't start with a number.
+  for c in s:
+    if c notin Digits or result > 99_999: break
+    result = result * 10 + ord(c) - ord('0')
+
+proc yearOf(date: string): int =
+  ## The first four digits in a row: "2019-05-01", "05/01/2019"; 0 without any.
+  for i in 0 .. date.len - 4:
+    if date[i .. i + 3].allCharsInSet(Digits): return date[i .. i + 3].parseInt
+
+proc readTags(info: var MediaInfo, tags: JsonNode) =
+  ## mpv keeps each format's own key names: "title" here, "TITLE" there,
+  ## and Matroska's track number is PART_NUMBER.
+  if tags.kind != JObject: return
+  var albumArtist = ""
+  for k, v in tags:
+    let s = v.getStr.strip
+    case k.toLowerAscii
+    of "title": info.title = s
+    of "artist": info.artist = s
+    of "album_artist", "albumartist": albumArtist = s
+    of "album": info.album = s
+    of "track", "tracknumber", "part_number": info.track = s.leadingInt
+    of "date", "year":
+      if info.year == 0: info.year = s.yearOf
+    else: discard
+  if info.artist.len == 0: info.artist = albumArtist
+
+proc audioBitrate(h: MpvHandle, tracks: JsonNode, video: bool): float =
+  ## The first audio track's, as the file states it; else, with nothing but
+  ## audio in there, the average over the whole file.
+  for t in tracks:
+    if t{"type"}.getStr != "audio": continue
+    result = t{"demux-bitrate"}.getFloat
+    if result <= 0 and t.hasKey("metadata"):
+      for k, v in t["metadata"].pairs:
+        if k.toLowerAscii == "bps":
+          try: result = v.getStr.parseFloat except ValueError: discard
+    if result <= 0 and not video:
+      let size = h.getInt("file-size", -1)
+      let dur = h.getFloat("duration")
+      if size > 0 and dur > 0: result = size.float * 8 / dur
+    return
 
 proc start*(pr: Prober, path: string, timeout = 3.0) =
   ## Begins probing path; poll until it returns true, then read `info`.
@@ -944,6 +1121,8 @@ proc poll*(pr: Prober, wait = 0.0): bool =
             pr.info.width = t{"demux-w"}.getInt
             pr.info.height = t{"demux-h"}.getInt
             break
+        pr.info.audioBitrate = pr.h.audioBitrate(tracks, pr.info.width > 0)
+      pr.info.readTags(pr.h.getNode("metadata"))
       break
     of evEndFile:
       if cast[ptr MpvEventEndFile](ev.data).reason == efError: break

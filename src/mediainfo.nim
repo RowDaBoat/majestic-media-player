@@ -108,7 +108,7 @@ proc fmtClock(t: float): string =
   let ms = int(round(t * 1000))
   &"{ms div 3_600_000:02}:{ms div 60_000 mod 60:02}:{ms div 1000 mod 60:02}.{ms mod 1000:03}"
 
-proc fmtBitrate(bps: float): string =
+proc fmtBitrate*(bps: float): string =
   let kbps = bps / 1000
   if kbps >= 10_000: formatFloat(kbps / 1000, ffDecimal, 1) & " Mb/s"
   else: thousands(int64(round(kbps))) & " kb/s"

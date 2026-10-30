@@ -209,6 +209,56 @@ proc gradient*(ui: Ui, r: Rect, tl, tr, br, bl: ColorRGBX) =
   ui.sk.drawTriangle([p0, p1, p2], [uv, uv, uv], [tl, tr, br])
   ui.sk.drawTriangle([p0, p2, p3], [uv, uv, uv], [tl, br, bl])
 
+proc blend*(a, b: ColorRGBX, t: float32): ColorRGBX =
+  ## a at t = 0, b at t = 1 (premultiplied).
+  proc ch(x, y: uint8): uint8 = uint8(x.float32 + (y.float32 - x.float32) * clamp(t, 0, 1))
+  rgbx(ch(a.r, b.r), ch(a.g, b.g), ch(a.b, b.b), ch(a.a, b.a))
+
+proc pill*(ui: Ui, r: Rect, top, bottom: ColorRGBX, feather = 0'f32) =
+  ## Upright r with round ends, its color blended from top to bottom. The edge
+  ## fades out across feather (0: one window pixel, which antialiases it).
+  const ArcSteps = 8
+  let f = if feather > 0: feather else: 1 / ui.scale
+  let e = ui.sk.atlas.entries[WhiteTileKey]
+  let uv = vec2(e.x.float32 + e.width.float32 / 2, e.y.float32 + e.height.float32 / 2)
+  let radius = min(r.w, r.h) / 2
+  let (inner, outer) = (max(0'f32, radius - f / 2), radius + f / 2)
+  let center = r.xy + r.wh / 2
+  var solid, faded: array[2 * (ArcSteps + 1), Vec2]
+  for i in 0 .. ArcSteps:
+    let angle = PI.float32 * i.float32 / ArcSteps
+    let d = vec2(cos(angle), sin(angle))
+    # The bottom end sweeps right to left, the top one on from there.
+    let (lo, hi) = (vec2(center.x, r.y + r.h - radius), vec2(center.x, r.y + radius))
+    solid[i] = lo + d * inner
+    faded[i] = lo + d * outer
+    solid[i + ArcSteps + 1] = hi - d * inner
+    faded[i + ArcSteps + 1] = hi - d * outer
+  proc shade(p: Vec2): ColorRGBX = blend(top, bottom, (p.y - r.y) / max(r.h, 1))
+  let clear = rgbx(0, 0, 0, 0)
+  for i in 0 .. solid.high:
+    let j = (i + 1) mod solid.len
+    let (a, b) = (solid[i], solid[j])
+    ui.sk.drawTriangle([center, a, b], [uv, uv, uv], [shade(center), shade(a), shade(b)])
+    ui.sk.drawTriangle([a, faded[i], faded[j]], [uv, uv, uv], [shade(a), clear, clear])
+    ui.sk.drawTriangle([a, faded[j], b], [uv, uv, uv], [shade(a), clear, shade(b)])
+
+proc stripes*(ui: Ui, r: Rect, color: ColorRGBX, period = 8'f32, width = 4'f32) =
+  ## r crossed by 45-degree stripes. Stripes keep their place when the rect only
+  ## changes width, so one rect can fill up over another.
+  let e = ui.sk.atlas.entries[WhiteTileKey]
+  let uv = vec2(e.x.float32 + e.width.float32 / 2, e.y.float32 + e.height.float32 / 2)
+  let (lo, hi) = (r.x, r.x + r.w)
+  var x = r.x - r.h - width
+  while x < hi:
+    let p0 = vec2(clamp(x + r.h, lo, hi), r.y)
+    let p1 = vec2(clamp(x + r.h + width, lo, hi), r.y)
+    let p2 = vec2(clamp(x + width, lo, hi), r.y + r.h)
+    let p3 = vec2(clamp(x, lo, hi), r.y + r.h)
+    ui.sk.drawTriangle([p0, p1, p2], [uv, uv, uv], [color, color, color])
+    ui.sk.drawTriangle([p0, p2, p3], [uv, uv, uv], [color, color, color])
+    x += period
+
 proc border*(ui: Ui, r: Rect, color: ColorRGBX, t = 1'f32) =
   ui.sk.drawRect(r.xy, vec2(r.w, t), color)
   ui.sk.drawRect(vec2(r.x, r.y + r.h - t), vec2(r.w, t), color)
@@ -687,6 +737,191 @@ proc textField*(ui: Ui, id: string, r: Rect, text: var string,
     ui.textIn(placeholder, rect(inner.x, r.y, inner.w + 4000, r.h), colTextDisabled)
   ui.sk.popClipRect()
 
+proc textArea*(ui: Ui, id: string, r: Rect, text: var string,
+               placeholder = ""): set[EditEvent] =
+  ## Multiline text input, one item per line: Enter starts a new line; Tab,
+  ## Escape or a click elsewhere ends editing (eeCommitted). Selects and
+  ## edits as textField does, Up/Down move between lines, Home/End go to
+  ## the line's ends (with Ctrl, the text's). The wheel scrolls lines that
+  ## don't fit.
+  const lineH = 20'f32
+  let w = ui.window
+  let hov = ui.hover(r)
+  let pad = 7'f32
+  let inner = rect(r.x + pad, r.y + 4, r.w - pad * 2, r.h - 8)
+  proc lineStart(text: string, i: int): int =
+    result = min(i, text.len)
+    while result > 0 and text[result - 1] != '\n': dec result
+  proc lineEnd(text: string, i: int): int =
+    result = i
+    while result < text.len and text[result] != '\n': inc result
+  proc lineOf(text: string, i: int): int = text[0 ..< min(i, text.len)].count('\n')
+  proc lineAt(text: string, n: int): int =
+    ## Where line n starts (the last line's start past the end).
+    var k = 0
+    while k < n:
+      let e = lineEnd(text, result)
+      if e >= text.len: break
+      result = e + 1
+      inc k
+  proc colIndex(text: string, a: int, x: float32, nearest = true): int =
+    ## The character boundary in the line starting at a nearest to the
+    ## offset x from its left (or with nearest off, where the character
+    ## under x starts).
+    let e = lineEnd(text, a)
+    result = a
+    while result < e:
+      let j = nextRune(text, result)
+      let edge = if nearest: (ui.textSize(text[a ..< result]).x + ui.textSize(text[a ..< j]).x) / 2
+                 else: ui.textSize(text[a ..< j]).x
+      if x < edge: break
+      result = j
+  proc hitIndex(text: string, p: Vec2, nearest = true): int =
+    let n = max(0, int(floor((p.y - inner.y + ui.fieldScroll) / lineH)))
+    colIndex(text, lineAt(text, n), p.x - inner.x, nearest)
+  proc caretX(text: string, i: int): float32 = ui.textSize(text[lineStart(text, i) ..< i]).x
+  let maxScroll = max(0'f32, (text.count('\n') + 1).float32 * lineH - inner.h)
+  discard ui.tabStop(id, r, edit = true)
+  if ui.focusId == id and ui.focusFresh:
+    ui.focusFresh = false
+    ui.fieldScroll = 0
+    ui.selAnchor = 0
+    ui.caret = text.len
+    result.incl eeFocused
+  if ui.focusId == id and w.buttonPressed[MouseLeft] and not hov:
+    ui.focusId = ""
+    result.incl eeCommitted
+  if hov and ui.pressed():
+    ui.consumeClick()
+    ui.navId = id
+    ui.activeId = id
+    if ui.focusId != id:
+      ui.focusId = id
+      ui.fieldScroll = 0
+      result.incl eeFocused
+    ui.dragFrom = hitIndex(text, ui.mouse)
+    ui.dragX = ui.mouse.x
+    let clicks = ui.countClick(id)
+    if clicks == 2:
+      ui.dragFrom = hitIndex(text, ui.mouse, false)  # the word drags start from
+      (ui.selAnchor, ui.caret) = wordAround(text.classes, ui.dragFrom)
+    elif clicks >= 3:
+      ui.selAnchor = 0
+      ui.caret = text.len
+    else:
+      if not w.shiftDown or eeFocused in result: ui.selAnchor = ui.dragFrom
+      ui.caret = ui.dragFrom
+  let focused = ui.focusId == id
+  if focused and ui.activeId == id and ui.down() and ui.clickCount == 2:
+    (ui.selAnchor, ui.caret) = wordDrag(text.classes,
+      ui.dragFrom, hitIndex(text, ui.mouse, false))
+  elif focused and ui.activeId == id and ui.down() and ui.clickCount == 1:
+    ui.caret = hitIndex(text, ui.mouse)
+  if hov and ui.focusId == id and maxScroll > 0 and ui.scroll() != 0:
+    ui.fieldScroll = clamp(ui.fieldScroll + ui.wheelNotches * lineH, 0, maxScroll)
+    ui.scrollConsumed = true
+  var moved = false
+  if focused:
+    ui.caret = clamp(ui.caret, 0, text.len)
+    ui.selAnchor = clamp(ui.selAnchor, 0, text.len)
+    let ctrl = w.buttonDown[KeyLeftControl] or w.buttonDown[KeyRightControl]
+    let shift = w.shiftDown
+    let (s0, s1) = (min(ui.selAnchor, ui.caret), max(ui.selAnchor, ui.caret))
+    proc deleteSelection(text: var string) =
+      text.delete(s0 ..< s1)
+      ui.caret = s0
+      ui.selAnchor = s0
+    if ctrl and w.buttonPressed[KeyA]:
+      ui.selAnchor = 0
+      ui.caret = text.len
+    if ctrl and (w.buttonPressed[KeyC] or w.buttonPressed[KeyX]) and s1 > s0:
+      setClipboardString(text[s0 ..< s1])
+      if w.buttonPressed[KeyX]:
+        deleteSelection(text)
+        result.incl eeChanged
+    var ins = ""
+    for ch in ui.typed:  # drop control characters such as Tab
+      if ch.ord >= 0x20 and ch.ord != 0x7f: ins.add ch
+    if w.buttonPressed[KeyEnter] or w.buttonPressed[NumpadEnter]: ins.add '\n'
+    if ctrl and w.buttonPressed[KeyV]:
+      ins.add getClipboardString().multiReplace(("\r", ""), ("\t", " "))
+    if ins.len > 0:
+      if ui.caret != ui.selAnchor: deleteSelection(text)
+      text.insert(ins, ui.caret)
+      ui.caret += ins.len
+      ui.selAnchor = ui.caret
+      result.incl eeChanged
+      moved = true
+    if (w.buttonPressed[KeyBackspace] or w.buttonPressed[KeyDelete]) and
+       ui.caret != ui.selAnchor:
+      deleteSelection(text)
+      result.incl eeChanged
+      moved = true
+    elif w.buttonPressed[KeyBackspace] and ui.caret > 0:
+      let a = if ctrl: wordLeft(text.classes, ui.caret) else: prevRune(text, ui.caret)
+      text.delete(a ..< ui.caret)
+      ui.caret = a
+      ui.selAnchor = a
+      result.incl eeChanged
+      moved = true
+    elif w.buttonPressed[KeyDelete] and ui.caret < text.len:
+      text.delete(ui.caret ..< nextRune(text, ui.caret))
+      result.incl eeChanged
+      moved = true
+    var move = -1
+    let (lo, hi) = (min(ui.selAnchor, ui.caret), max(ui.selAnchor, ui.caret))
+    if w.buttonPressed[KeyLeft]:
+      move = if ctrl: wordLeft(text.classes, ui.caret)
+             elif shift or lo == hi: prevRune(text, ui.caret) else: lo
+    if w.buttonPressed[KeyRight]:
+      move = if ctrl: wordRight(text.classes, ui.caret)
+             elif shift or lo == hi: nextRune(text, ui.caret) else: hi
+    if w.buttonPressed[KeyUp] or w.buttonPressed[KeyDown]:
+      let n = lineOf(text, ui.caret) + (if w.buttonPressed[KeyUp]: -1 else: 1)
+      move = if n < 0: 0
+             elif n > text.count('\n'): text.len
+             else: colIndex(text, lineAt(text, n), caretX(text, ui.caret))
+    if w.buttonPressed[KeyHome]: move = if ctrl: 0 else: lineStart(text, ui.caret)
+    if w.buttonPressed[KeyEnd]: move = if ctrl: text.len else: lineEnd(text, ui.caret)
+    if move >= 0:
+      ui.caret = move
+      if not shift: ui.selAnchor = move
+      moved = true
+    if w.buttonPressed[KeyTab] or w.buttonPressed[KeyEscape]:
+      ui.focusId = ""
+      result.incl eeCommitted
+  ui.rect(r, colBackground)
+  ui.border(r, if focused: colAccent elif hov: colTextDim else: colBorder)
+  ui.sk.pushClipRect(inner)
+  if focused:
+    # Keep the caret's line in view after it moved.
+    let cy = lineOf(text, ui.caret).float32 * lineH
+    if moved or ui.activeId == id:
+      if cy + lineH - ui.fieldScroll > inner.h: ui.fieldScroll = cy + lineH - inner.h
+      if cy < ui.fieldScroll: ui.fieldScroll = cy
+    ui.fieldScroll = clamp(ui.fieldScroll, 0, max(0'f32, (text.count('\n') + 1).float32 * lineH - inner.h))
+  let scroll = if focused: ui.fieldScroll else: 0
+  if text.len == 0 and not focused:
+    ui.textIn(placeholder, rect(inner.x, inner.y, inner.w + 4000, lineH), colTextDisabled)
+  var a = 0
+  var n = 0
+  let (s0, s1) = (min(ui.selAnchor, ui.caret), max(ui.selAnchor, ui.caret))
+  while a <= text.len:
+    let e = lineEnd(text, a)
+    let y = inner.y + n.float32 * lineH - scroll
+    if y + lineH >= inner.y and y < inner.y + inner.h:
+      if focused and s1 > s0 and s0 <= e and s1 >= a:
+        let x0 = ui.textSize(text[a ..< max(a, s0)]).x
+        # A selection running past the line's end shows a sliver for the newline.
+        let x1 = ui.textSize(text[a ..< min(e, s1)]).x + (if s1 > e: 6'f32 else: 0)
+        ui.rect(rect(inner.x + x0, y + 1, x1 - x0, lineH - 2), colAccentDim)
+      ui.textIn(text[a ..< e], rect(inner.x, y, inner.w + 4000, lineH), colText)
+      if focused and ui.caret >= a and ui.caret <= e:
+        ui.rect(rect(inner.x + caretX(text, ui.caret), y + 3, 1, lineH - 6), colAccent)
+    a = e + 1
+    inc n
+  ui.sk.popClipRect()
+
 proc evalMath*(s: string): float =
   ## Basic arithmetic typed into a number field: + - * / and parentheses,
   ## as in 24*3+12/2. Raises ValueError on anything else.
@@ -820,3 +1055,31 @@ proc parseTime*(s: string): float =
     if not (v >= 0 and v < Inf) or (i < parts.high and v != floor(v)):
       raise newException(ValueError, "bad field: " & f)
     result = result * 60 + v
+
+proc timeField*(ui: Ui, id: string, r: Rect, text: var string, value: var float,
+                step: float, lo = 0.0, hi = Inf, dur = -1.0): bool =
+  ## A timestamp typed as parseTime reads it, taken on Enter or unfocus;
+  ## scrolling over it, or Up/Down while typing in it, steps it by step (a
+  ## frame), like numberField. text is shown as fmtTime(millis) with dur.
+  ## Returns true when value changed.
+  let ev = ui.textField(id, r, text)
+  var delta = 0.0
+  if ui.focusId == id:
+    if ui.window.buttonPressed[KeyUp]: delta = step
+    if ui.window.buttonPressed[KeyDown]: delta = -step
+  elif ui.hover(r) and ui.scroll() != 0:
+    delta = if ui.scroll() < 0: step else: -step
+    ui.scrollConsumed = true
+  if eeCommitted notin ev and delta == 0: return
+  # Steps go from what was typed, when it reads as a time.
+  var v = value
+  try: v = parseTime(text)
+  except ValueError: discard
+  v = clamp(v + delta, lo, hi)
+  if v != value:
+    value = v
+    result = true
+  text = fmtTime(value, true, dur)
+  if delta != 0 and ui.focusId == id:
+    ui.selAnchor = 0
+    ui.caret = text.len

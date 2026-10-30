@@ -6,7 +6,8 @@ import std/[os, strutils, strformat, times, math, osproc, unicode, sequtils, alg
 import silky, vmath, bumpy, chroma, pixie, opengl, jsony
 import mpv, videogl, xwin, config, dialogs, theme, ui, menutree, player, icons, debugscript,
   options, instance, playlists, peers, cmdlines, runlog, mediainfo, inhibit, spherical, keymap,
-  rectedit, syncdlg, ytdlp, websave, mediasave, mkvtoolnix, updater, ytthumb
+  rectedit, syncdlg, ytdlp, websave, mediasave, mkvtoolnix, updater, ytthumb, ytboard, srv3,
+  netprobe
 from std/uri import encodeUrl, decodeUrl, parseUri, decodeQuery, UriParseError
 
 const
@@ -32,12 +33,32 @@ const
   EqSettle = 0.4            ## seconds after an equalizer change it's set for good
   PlaylistRowH = 26'f32
   PlaylistHeaderH = 24'f32  ## column headers
+  PlaylistIconW = 28'f32    ## the first column's room for the playing icon
+  PlaylistMinTextW = 60'f32 ## narrowest a text column gets
+  PlaylistColumnDrag = 4'f32  ## pixels a press moves to drag its column, not sort by it
+  # An empty sample: a text column, which shares the width the others leave.
+  PlaylistFields: array[PlaylistField, tuple[label, sample: string]] = [
+    pfName: ("Name", ""),
+    pfFilename: ("Filename", ""),
+    pfDuration: ("Duration", "00:00:00"),
+    pfSize: ("Size", "999.9 MB"),
+    pfDimensions: ("Dimensions", "3840×2160"),
+    pfAudioBitrate: ("Audio bitrate", "9 999 kb/s"),
+    pfTrack: ("Track number", "999"),
+    pfArtist: ("Artist", ""),
+    pfYear: ("Year", "9999"),
+    pfAlbum: ("Album", "")]
   PlaylistGripW = 5'f32     ## draggable left edge of the playlist
   RunLogHeaderH = 28'f32
   RunLogRowH = 18'f32
   RunLogGripH = 5'f32       ## draggable bottom edge of the run log
   RunLogBarW = 10'f32       ## its scroll bar
   RunLogWheelRows = 4       ## lines scrolled per mouse wheel step
+  PlaylistWheelRows = 2     ## playlist entries scrolled per mouse wheel step
+  PlaylistFollowPage = 0.6'f32  ## of the list's height, when playback reaches its bottom
+  PlaylistBarW = 14'f32     ## the playlist's scroll bar gutter
+  PlaylistBarThin = 4'f32   ## its thumb's width at rest
+  PlaylistBarWide = 10'f32  ## and with the pointer on it
   SphereFov = 75'f32        ## 360° video: vertical field of view a file opens with
   SphereFovStep = 5'f32     ## degrees per Ctrl+Wheel notch
   SphereTextureMax = 8192   ## cap on the equirectangular texture's longer side
@@ -58,14 +79,6 @@ type
 
   ContextMenu = enum
     cmVideo, cmTime, cmStatus, cmSeekBar, cmPlaylist, cmPlaylistColumns, cmRepeat, cmRunLog, cmQuality  ## where the right-click menu was opened
-
-  PlaylistSort = enum
-    psName, psDuration, psDimensions, psSize
-
-  PlaylistColumn = object
-    label: string
-    w: float32
-    sort: PlaylistSort
 
   PointerShape = enum
     ptArrow, ptHidden, ptResize, ptResizeV, ptResizeNWSE, ptResizeNESW, ptCross, ptMove,
@@ -98,6 +111,11 @@ type
     lfStepping  ## stepping it through to B, a frame taken each step
     lfDone      ## all of the loop's frames taken
     lfFailed    ## couldn't (no memory, stuck): the plain way for this loop
+
+  StepFramesState = enum
+    sfParked    ## the standby waits where it stopped
+    sfSeeking   ## going to where the next frames start
+    sfStepping  ## stepping through them, a frame taken each step
 
   LoopFrame = object
     t: float                  ## its time
@@ -180,15 +198,51 @@ type
     lfClockSet: bool          ## it has been put where the playing player is
     lfJumps: int              ## the playing player's jumps, as last seen
     lfDue: bool               ## a frame to draw, or to take, right away
+    sfOn: bool                ## paused where step frames can serve
+    sfState: StepFramesState
+    sfKey: string             ## the file, size and look its frames are for
+    sfPath: string            ## the file the standby has open for them
+    sfFrames: seq[LoopFrame]  ## consecutive frames around the position, in order
+    sfFill: seq[LoopFrame]    ## frames being taken to go before those
+    sfBefore: bool            ## they go before (else after, as they're taken)
+    sfShow: int = -1          ## the frame to show, -1 for the player's own
+    sfOwed: int               ## steps waiting for frames, negative going back
+    sfAtStart: bool           ## the first frame is the file's
+    sfAtEnd: bool             ## the last one is
+    sfStart: float            ## where the standby was sent
+    sfStop: float             ## the time the frames being taken go up to
+    sfAbort: bool             ## the position left them: stop taking them
+    sfParkT: float = -1       ## the frame the standby stopped at, if a kept one's
+    sfAsked: int              ## the standby's restarts when it was sent
+    sfAskedAt: float          ## when the last seek or step was asked for
+    sfLastT: float            ## its time at the frame last taken
+    sfPending: bool           ## it has a new frame to take
+    sfUpdated: bool           ## it gave a frame since it was last sent on
+    sfSlot: LoopFrame         ## the frame being taken, until it settles
+    sfSlotOpen: bool
+    sfSettleAt: float         ## when it was last rendered
+    sfJumps: int              ## the player's jumps, as last seen
+    sfMovedAt: float          ## when it last paused or was sent elsewhere
+    sfWanted: float           ## when stepping last seemed likely
+    sfPlainAt: float          ## when it last stepped the plain way
     preview: Preview
     cfg: Config
     playlist: seq[string]
     plIndex: int
     plSelected: int
+    plMarks: seq[int]         ## the whole selection, sorted, when more than plSelected
+    plFocused: bool           ## the playlist was clicked last: it takes its keys
+    plArrows: bool            ## clicked and the pointer has not left it since: Up/Down select
     plScroll: float32
     plReveal: bool            ## scroll the selected entry into view
+    plFollow: bool            ## as plReveal, paging on when it lands on the bottom row
+    plThumbFrom: (float32, float32)      ## pointer y and scroll when the thumb drag began
+    plBarLift: float32        ## scroll bar's eased hover: 0 thin and grey, 1 wide and lit
+    plBarAt: float            ## when plBarLift last eased
     prober: Prober            ## created on the first sort that needs it
     mediaInfo: Table[string, MediaInfo]  ## probe results, for columns and sorting
+    plColumnFrom: tuple[index: int, x: float32, moved: bool]  ## the header pressed, while "plcolumn" is active
+    plDurSeconds: bool        ## the Duration column in plain seconds: nothing lasts over a minute
     fileSizes: Table[string, int64]      ## -1 for streams and unreadable files
     plResizeFrom: (float32, float32)     ## pointer x and width when the drag began
     xf: VideoTransform
@@ -205,6 +259,9 @@ type
     atlas: SilkyAtlas
     cfgBefore: Config         ## config when Options opened, restored on Cancel
     settingsKey: string       ## player-facing settings last pushed to mpv
+    coverSynced: bool         ## the cover settings below were pushed to mpv
+    coverShown: bool          ## and what they were: Show Front Cover
+    coverNames: string        ## Options' folder picture names
     positions: Positions      ## remembered playback positions
     subScales: SubScales      ## remembered subtitle sizes, per file
     bookmarks: Bookmarks      ## per-file bookmarks, shown on the seek bar
@@ -219,6 +276,8 @@ type
     renText: string
     renTimeText: string       ## the Time field
     renPlaceholder: string    ## its default label, shown when renText is empty
+    renOrigPos: float         ## playback position when opened, back to on Cancel
+    renSeeked: bool           ## Preview moved playback since it opened
     embWin: Window            ## Embed as MKV Chapters confirmation, created on first use
     embSk: Silky
     embUi: Ui
@@ -231,6 +290,7 @@ type
     thumb: ThumbJob           ## the YouTube link's thumbnail, for while no video track shows
     thumbTex: GLuint          ## it, uploaded
     thumbTexId: string        ## the video id thumbTex holds
+    board: BoardJob           ## the YouTube link's seek bar previews, fetched in the background
     upMode: UpdateMode
     upMsg: string             ## the Check for Updates window's text when it failed
     upWin: Window             ## the Check for Updates window, created on first use
@@ -337,10 +397,21 @@ type
     saveSrc: string           ## the file or link File > Save asked where to save
     ytRetry: string           ## a link to open again at ytRetryAt
     ytRetryAt: float
+    ytRetryNet: bool          ## ytRetry is a dropped stream's: opened once the
+                              ## network answers (netUp), never while it doesn't
+    netProbe: NetProbe        ## asking the stream's host whether the network's there
+    netProbeAt: float         ## when the next probe may start
+    netUp: int                ## what the last probe found: 1 up, -1 down, 0 not known
+    netWasDown: bool          ## a probe found no network since the stream last played
+    netBackAt: float          ## when a probe found it back after that (0: it isn't)
     ytHooked: string          ## the yt-dlp mpv opens links with, "" until there is one
     ytCaps: YtJob             ## the open link's automatic captions being looked up
     ytCaptions: Table[string, seq[tuple[url, title, lang: string]]]  ## and found, by link
+    ytStyling: StyledJob      ## the link's styled subtitles being fetched
+    ytStyled: Table[string, seq[StyledTrack]]  ## and made into ASS, by link
     ytQualities: Table[string, tuple[video, audio: seq[Quality]]]  ## a link's formats, found alike
+    ytBoards: Table[string, Storyboard]  ## a link's storyboard, found alike
+    ytLang: Table[string, string]  ## a link's dub picked in Audio Track (not its own language)
     ytPick: Table[string, tuple[video, audio: string]]  ## formats picked in the quality
                               ## menu, by link ("": as Options > Online picks)
     qualityRect: Rect         ## the controls' quality button, as last drawn
@@ -367,6 +438,9 @@ type
     ytInfoLinks: seq[string]  ## the links it's looking up
     ytInfoTried: HashSet[string]  ## links looked up, found or not
     linkTitles: Table[string, string]  ## links' titles, for the playlist's rows
+    linkInfos: LinkInfos      ## links' metadata as the media cache keeps it
+    linkInfosChanged: bool    ## not written yet (saveLinkInfos)
+    linkInfosRead: HashSet[string]  ## playlist entries given theirs (readLinkInfos)
     ytMode: YtMode
     ytMsg: string             ## the yt-dlp window's text while busy or failed
     ytWin: Window             ## the yt-dlp window, created on first use
@@ -415,8 +489,13 @@ type
     seekDragging: bool
     seekDragT: float
     seekRect: Rect            ## seek bar as last drawn
+    seekSpan: float           ## seconds the seek bar's width stands for
+    padLen: float             ## the delay under way after a short file; 0 none
+    padAt: float              ## when it began, or while held the seconds it has run
+    padHeld: bool             ## paused during the delay
     ctxSeekT: float           ## seek bar time the context menu was opened at
     ctxBookmark: int          ## bookmark under the pointer then, else -1
+    ctxColumn: PlaylistField  ## playlist column header right-clicked
     ctxOnMarker: bool         ## a chapter or bookmark was under the pointer then
     ctxMarkerT: float         ## and its time
     # A-B loop; marks last only for the current file
@@ -747,6 +826,8 @@ proc followTarget(a: App): tuple[t: float, run: bool] =
   elif a.followLoop: (floorMod(rel, dur), a.clock.playing)
   else: (dur, false)
 
+proc stepPlayer(a: App, forward: bool)
+
 proc slaveFrame(a: App, forward: bool) =
   ## Slave: a frame step of the group. It pauses the master; our file steps
   ## too when within reach, and the master's next tick sets the exact time.
@@ -757,7 +838,7 @@ proc slaveFrame(a: App, forward: bool) =
   let rel = a.masterNow - a.followOffset
   if a.player.loaded and rel >= 0 and (rel < a.player.duration or a.followLoop):
     a.player.stopped = false
-    a.player.frameStep(forward)
+    a.stepPlayer(forward)
 
 proc slaveDo(a: App, fields: varargs[string]): bool =
   ## Slave: a playback control used here goes to the group, in master time,
@@ -838,6 +919,11 @@ proc savePosition(a: App) =
     a.positions.del(p.path)
   a.positions.save()
 
+proc listedLinks(a: App): seq[string] =
+  ## The playlist's YouTube links fully listed: their videos are its entries,
+  ## not to be added again next run.
+  a.playlist.filterIt(it in a.ytListed and not (a.ytList.running and a.ytList.url == it))
+
 proc rememberState(a: App) =
   ## Copies the state kept between runs (volume, window, pan/rotate/scale,
   ## playlist) into the config.
@@ -855,9 +941,11 @@ proc rememberState(a: App) =
     a.cfg.playlistTitles.clear()
     for f in a.playlist:
       if f in a.linkTitles: a.cfg.playlistTitles[f] = a.linkTitles[f]
+    a.cfg.playlistListed = a.listedLinks
   else:
     (a.cfg.playlist, a.cfg.playlistIndex) = (newSeq[string](), -1)
     a.cfg.playlistTitles.clear()
+    a.cfg.playlistListed.setLen 0
   discard a.cfg.reloadRecent()  # another player's changes
   proc titles(a: App): Table[string, string] =
     for r in a.cfg.recentFiles:
@@ -914,14 +1002,14 @@ proc linkStart(url: string): float =
 proc streamOpts(a: App, url: string): seq[string] =
   ## A link's stream, once its subtitles are saved: those, not the yt-dlp
   ## hook's (the same, numbered alike in its saved part and the stream).
-  let s = a.saved.getOrDefault(url)
+  let s = a.saved.lookup(url)
   if s.subsDone and s.subs.len > 0: result.add "sub-files=" & quoted(s.subs.join($PathSep))
 
 proc ytdlRaw(a: App, url: string): string =
   ## The yt-dlp hook's options for a link (all of them: per file, they stand
   ## in for the player's): no subtitles once they're saved (streamOpts), and
   ## the browser it signs in with when it asked to.
-  let subsDone = a.saved.getOrDefault(url).subsDone
+  let subsDone = a.saved.lookup(url).subsDone
   let cookies = a.ytCookies.getOrDefault(url)
   if not subsDone and cookies.len == 0: return
   var raw = @["sub-langs=" & quoted(if subsDone: "none" else: YtdlSubLangs), "no-playlist="]
@@ -933,15 +1021,24 @@ proc qualitiesOf(a: App, url: string): tuple[known: bool, video, audio: seq[Qual
   if url in a.ytQualities:
     let q = a.ytQualities[url]
     return (true, q.video, q.audio)
-  let s = a.saved.getOrDefault(url)
-  if s.videoQ.len > 0 or s.audioQ.len > 0: (true, s.videoQ, s.audioQ)
+  let s = a.saved.lookup(url)
+  if s.videoOffers.len > 0 or s.audioOffers.len > 0: (true, s.videoOffers, s.audioOffers)
   else: (false, newSeq[Quality](), newSeq[Quality]())
 
-proc wants(a: App, url: string): tuple[video, audio: string] =
-  ## What the link streams in, video and audio, each: a format id; "~<lock>"
-  ## for a locked quality while its formats aren't known; "" for Auto. The
-  ## quality menu's picks come first ("auto": Auto), then its locks: video by
-  ## label, audio by rank (AudioRanks).
+proc audioRows(a: App, url: string): seq[Quality] =
+  ## The link's audio qualities in the language it plays in, as the quality
+  ## menu lists them: its own unless a dub is picked (and still offered).
+  let all = a.qualitiesOf(url).audio
+  if all.len == 0: return
+  let lang = a.ytLang.getOrDefault(url, all[0].lang)
+  result = all.filterIt(it.lang == lang)
+  if result.len == 0: result = all.filterIt(it.lang == all[0].lang)
+
+proc chosen(a: App, url: string): tuple[video, audio: string] =
+  ## What the quality menu has for the link, video and audio, each: a format
+  ## id; "~<lock>" for a locked quality while its formats aren't known; "" for
+  ## Auto. The menu's picks come first ("auto": Auto), then its locks: video
+  ## by label, audio by rank (AudioRanks).
   let pick = a.ytPick.getOrDefault(url)
   let q = a.qualitiesOf(url)
   proc one(p, lock: string, list: seq[Quality], video: bool): string =
@@ -958,7 +1055,18 @@ proc wants(a: App, url: string): tuple[video, audio: string] =
       let row = rankRow(lock, list.len)
       if row >= 0: list[row].id else: ""
   (one(pick.video, a.cfg.streamLockVideo, q.video, true),
-   one(pick.audio, a.cfg.streamLockAudio, q.audio, false))
+   one(pick.audio, a.cfg.streamLockAudio, a.audioRows(url), false))
+
+proc wants(a: App, url: string): tuple[video, audio: string] =
+  ## What the link streams in (chosen). Auto's audio is left to Options >
+  ## Online but for language: yt-dlp knows no dub was picked, and its "wa" is
+  ## any language's, so those are found among the language's own.
+  result = a.chosen(url)
+  let rows = a.audioRows(url)
+  if result.audio.len > 0 or rows.len == 0: return
+  let small = a.cfg.streamSmallAudio or a.cfg.streamQuality == sqLowest
+  if small and audioLanguages(a.qualitiesOf(url).audio).len > 1: result.audio = rows[^1].id
+  elif url in a.ytLang: result.audio = rows[0].id
 
 proc picked(a: App, url: string): bool =
   ## The link doesn't stream in Auto, Auto (a pick or a lock).
@@ -968,7 +1076,7 @@ proc picked(a: App, url: string): bool =
 proc autoParts(a: App, url: string): tuple[video, audio: string] =
   ## Auto's video and audio format ids for the link, as each last played; "" unknown.
   result = a.ytAutoParts.getOrDefault(url)
-  let s = a.saved.getOrDefault(url)
+  let s = a.saved.lookup(url)
   if result.video.len == 0: result.video = s.autoVideo
   if result.audio.len == 0: result.audio = s.autoAudio
   let full = s.auto.split('+')
@@ -980,7 +1088,7 @@ proc linkFormat(a: App, url: string): string =
   ## The format ids the link's stream comes in, as picked or locked (Auto's
   ## as it last came to); "" while unknown.
   let w = a.wants(url)
-  if not a.picked(url): return a.ytAuto.getOrDefault(url, a.saved.getOrDefault(url).auto)
+  if not a.picked(url): return a.ytAuto.getOrDefault(url, a.saved.lookup(url).auto)
   if w.video.startsWith("~") or w.audio.startsWith("~"): return ""
   if w.video.len == 0 and a.cfg.streamQuality == sqAudioOnly: return w.audio
   let auto = a.autoParts(url)
@@ -993,10 +1101,12 @@ proc streamFormat(a: App, url: string): string =
   let w = a.wants(url)
   pickSpec(a.cfg, w.video, w.audio)
 
+proc entry(a: App, url: string): var Saved = a.saved.mgetOrPut(url.linkKey, Saved())
+
 proc savedIn(a: App, url: string): Saved =
   ## What's saved of the link in the format it streams in (linkFormat).
   let f = a.linkFormat(url)
-  result = a.saved.getOrDefault(url).inFormat(f)
+  result = a.saved.lookup(url).inFormat(f)
   if f.len == 0 and a.picked(url): result.segs.setLen 0  # not knowing which
 
 proc withRaw(a: App, url, opts: string): string =
@@ -1008,7 +1118,7 @@ proc withRaw(a: App, url, opts: string): string =
 proc savedFile(a: App, url: string): string =
   ## The media cache's file holding all of the link, in the quality saves
   ## download (saveFormat); "" when none does.
-  if a.cfg.streamOnSave: a.savedIn(url).wholeFile else: a.saved.getOrDefault(url).wholeFile
+  if a.cfg.streamOnSave: a.savedIn(url).wholeFile else: a.saved.lookup(url).wholeFile
 
 proc saveFormat(a: App, url: string): string =
   ## yt-dlp's -f for File > Save and command lines: as the link streams, or the best.
@@ -1016,16 +1126,17 @@ proc saveFormat(a: App, url: string): string =
 
 proc streamLink(a: App, url: string, start: float, opts: string) =
   ## Streams a link (mpv's yt-dlp hook), noting how, to try again should it fail.
+  let args = a.withRaw(url, opts)  # first: opts may be streamArgs' own (a retry)
   a.ytWatch = true
   a.streamArgs = (url, start, opts)
   a.streamPos = start
-  a.player.load(url, start, false, a.withRaw(url, opts))
+  a.player.load(url, start, false, args)
 
 proc playSaved(a: App, url: string, start: float, part: tuple[start, stop: float],
                extra: seq[string] = @[]) =
   ## Plays a link's saved `part` (savedIn) from `start`, the stream to go on
   ## past it; `extra`: more per-file options.
-  a.saved[url].used = epochTime()
+  a.entry(url).used = epochTime()
   let s = a.savedIn(url)
   a.playFormat[url] = a.linkFormat(url)
   var opts = extra
@@ -1040,37 +1151,29 @@ proc playSaved(a: App, url: string, start: float, part: tuple[start, stop: float
 
 proc handoffOff(a: App)
 
-proc youtubeId(url: string): string =
-  ## The video id of a YouTube link (watch?v=, youtu.be/, shorts/, live/,
-  ## embed/), "" for anything else.
-  let u = try: url.parseUri except UriParseError: return ""
-  var host = u.hostname.toLowerAscii
-  for pre in ["www.", "m.", "music."]:
-    if host.startsWith(pre): host = host[pre.len .. ^1]
-  let parts = u.path.split('/').filterIt(it.len > 0)
-  if host == "youtu.be":
-    if parts.len > 0: result = parts[0]
-  elif host in ["youtube.com", "youtube-nocookie.com"]:
-    if parts.len == 1 and parts[0] == "watch":
-      for (k, v) in u.query.decodeQuery:
-        if k == "v": result = v
-    elif parts.len >= 2 and parts[0] in ["shorts", "live", "embed", "v"]:
-      result = parts[1]
-  if not result.allCharsInSet(Letters + Digits + {'-', '_'}): result = ""
-
 proc youtubeList(url: string): string =
   ## The playlist id of a YouTube link (playlist?list=, or a video's with
   ## &list=), "" for anything else.
   let u = try: url.parseUri except UriParseError: return ""
-  var host = u.hostname.toLowerAscii
-  for pre in ["www.", "m.", "music."]:
-    if host.startsWith(pre): host = host[pre.len .. ^1]
-  if host notin ["youtube.com", "youtu.be"]: return
+  if u.youtubeHost notin ["youtube.com", "youtu.be"]: return
   for (k, v) in u.query.decodeQuery:
     if k == "list": result = v
   if not result.allCharsInSet(Letters + Digits + {'-', '_'}): result = ""
 
 proc showYtdlp(a: App, mode: YtMode, msg = "")
+
+proc selectOnly(a: App, i: int) =
+  a.plSelected = i
+  a.plMarks.setLen 0
+
+proc plSelection(a: App): seq[int] =
+  ## The selected entries, in playlist order.
+  if a.plSelected notin 0 ..< a.playlist.len: return
+  if a.plMarks.len == 0: @[a.plSelected]
+  else: a.plMarks.filterIt(it < a.playlist.len)
+
+proc plIsSelected(a: App, i: int): bool =
+  if a.plMarks.len == 0: i == a.plSelected else: a.plMarks.binarySearch(i) >= 0
 
 proc listYoutube(a: App, i: int): bool =
   ## Entry i is a YouTube playlist's link, or a video's with its list= id, not
@@ -1082,7 +1185,7 @@ proc listYoutube(a: App, i: int): bool =
   result = link.youtubeId.len == 0
   if result:
     a.plIndex = i
-    a.plSelected = i
+    a.selectOnly(i)
   let exe = findYtdlp(a.cfg.ytdlp)
   if exe.len == 0:
     # A video streams (and asks for yt-dlp on its own); a playlist asks here.
@@ -1105,7 +1208,9 @@ proc playIndex(a: App, i: int, start = -1.0) =
   if a.listYoutube(i): return
   a.savePosition()
   a.plIndex = i
-  a.plSelected = i
+  if a.cfg.playlistCursorFollows:
+    a.selectOnly(i)
+    a.plFollow = true
   let path = a.playlist[i]
   if not a.cfg.rememberTransform: a.xf = VideoTransform()
   a.resumedAt =
@@ -1122,6 +1227,7 @@ proc playIndex(a: App, i: int, start = -1.0) =
   a.ytRetry = ""
   a.ytTries = 0
   a.dropTries = 0
+  a.netWasDown = false
   a.ytCookieTried.setLen 0
   a.stopOnLoad = false
   a.handoffOff()
@@ -1147,7 +1253,8 @@ proc expandPaths(paths: seq[string]): seq[string] =
   ## Files and URLs as given; directories become their media files.
   for p in paths:
     if dirExists(p): result.add mediaFilesIn(p, isMediaFile)
-    elif fileExists(p) or p.contains("://"): result.add p
+    elif p.contains("://"): result.add p.withoutTracking
+    elif fileExists(p): result.add p
 
 proc openPaths(a: App, paths: seq[string]) =
   if a.editLocked: return
@@ -1156,6 +1263,7 @@ proc openPaths(a: App, paths: seq[string]) =
     a.osd("Nothing playable found")
     return
   a.playlist = files
+  for f in files: a.ytListed.excl f  # opened anew: its videos aren't in here
   a.plScroll = 0
   a.playIndex(0)
 
@@ -1169,7 +1277,7 @@ proc saveResume(a: App) =
     hasLoopA: a.hasLoopA, hasLoopB: a.hasLoopB, abLoop: a.abLoop,
     windowX: a.cfg.windowX, windowY: a.cfg.windowY, windowW: a.cfg.windowW,
     windowH: a.cfg.windowH, maximized: a.window.maximized, fullscreen: a.fullscreen,
-    transform: a.cfg.transform)
+    transform: a.cfg.transform, listed: a.listedLinks)
   for f in a.playlist:
     if f in a.linkTitles: r.titles[f] = a.linkTitles[f]
   # A link's captions come back by themselves (addCaptions).
@@ -1184,6 +1292,7 @@ proc resumeState(a: App, r: ResumeState) =
   ## once it opens).
   a.playlist = r.playlist.filterIt(fileExists(it) or it.contains("://"))
   a.linkTitles = r.titles
+  a.ytListed = r.listed.toHashSet
   if r.fullscreen: a.setFullscreen(true)
   let at = if r.index in 0 ..< r.playlist.len: a.playlist.find(r.playlist[r.index]) else: -1
   if at < 0:
@@ -1203,7 +1312,7 @@ proc closeFile(a: App) =
   a.preview.forget()
   a.playlist.setLen 0
   a.plIndex = -1
-  a.plSelected = -1
+  a.selectOnly(-1)
   a.updateTitle()
 
 proc onWayland(): bool =
@@ -1320,7 +1429,20 @@ proc reopenLast(a: App): bool =
       a.openPaths(@[r])
       return true
 
+proc padRunning(a: App): bool = a.padLen > 0 and not a.padHeld
+
+proc padElapsed(a: App): float =
+  if a.padHeld: a.padAt else: now() - a.padAt
+
+proc padHold(a: App, on: bool) =
+  if on != a.padHeld:
+    a.padAt = now() - a.padAt
+    a.padHeld = on
+
 proc play(a: App) =
+  if a.padLen > 0:
+    a.padHold(false)
+    return
   if a.reopenLast(): return
   if a.slaveDo("play"): return
   let restart = a.player.eofReached  # Play at the end starts over
@@ -1329,6 +1451,9 @@ proc play(a: App) =
   a.syncSend("play")
 
 proc pause(a: App) =
+  if a.padLen > 0:
+    a.padHold(true)
+    return
   if a.slaveDo("pause", $a.masterNow): return
   a.player.pause()
   a.syncSend("pause", $a.player.timePos)
@@ -1341,12 +1466,15 @@ proc stop(a: App) =
 proc togglePlay(a: App) =
   let p = a.player
   if not p.loaded: return
-  if p.stopped or p.eofReached or p.paused: a.play() else: a.pause()
+  if a.padLen > 0: a.padHold(not a.padHeld)
+  elif p.stopped or p.eofReached or p.paused: a.play()
+  else: a.pause()
 
 proc playPause(a: App) =
   if not a.reopenLast(): a.togglePlay()
 
 proc seekTo(a: App, t: float, exact = true) =
+  if a.padLen > 0 and t >= a.player.duration: return  # already there, waiting
   if a.slaveDo("seek", $(t + a.followOffset), $exact): return
   a.player.stopped = false
   a.player.seek(a.clampTime(t), exact)
@@ -1394,37 +1522,105 @@ proc addToPlaylist(a: App, paths: seq[string], at = -1) =
   a.playlist.insert(files, first)
   if a.plIndex >= first: a.plIndex += files.len
   if a.plSelected >= first: a.plSelected += files.len
+  for m in a.plMarks.mitems:
+    if m >= first: m += files.len
   if not a.player.loaded: a.playIndex(first)
   else: a.osd(if files.len == 1: "Added to playlist" else: &"Added {files.len} files to playlist")
 
 proc removeSelected(a: App) =
   if a.editLocked: return
-  if a.plSelected < 0 or a.plSelected >= a.playlist.len: return
-  a.playlist.delete(a.plSelected)
-  if a.plIndex == a.plSelected: a.plIndex = -1
-  elif a.plIndex > a.plSelected: dec a.plIndex
-  a.plSelected = min(a.plSelected, a.playlist.len - 1)
+  let sel = a.plSelection
+  if sel.len == 0: return
+  for i in countdown(sel.high, 0): a.playlist.delete(sel[i])
+  if a.plIndex in sel: a.plIndex = -1
+  else: a.plIndex -= sel.countIt(it < a.plIndex)
+  a.selectOnly(min(sel[0], a.playlist.len - 1))
 
 proc reorderPlaylist(a: App, order: seq[int]) =
   ## order[new position] = old index; the playing and selected entries follow.
   if a.editLocked: return
   let old = a.playlist
   var cur, sel = -1
+  var marks: seq[int]
   for i, j in order:
     a.playlist[i] = old[j]
     if j == a.plIndex: cur = i
     if j == a.plSelected: sel = i
+    if a.plMarks.binarySearch(j) >= 0: marks.add i
   a.plIndex = cur
   a.plSelected = sel
+  a.plMarks = marks
   a.plReveal = true
 
-proc moveSelected(a: App, to: int) =
-  let i = a.plSelected
-  if i < 0 or i >= a.playlist.len: return
-  var order = toSeq(0 ..< a.playlist.len)
-  order.delete(i)
-  order.insert(i, clamp(to, 0, order.len))
+type PlaylistMove = enum pmTop, pmUp, pmDown, pmBottom
+
+proc canMove(a: App, up: bool): bool =
+  ## Whether the selection is not already a block at that end.
+  let sel = a.plSelection
+  sel.len > 0 and (if up: sel[^1] != sel.high else: sel[0] != a.playlist.len - sel.len)
+
+proc moveSelected(a: App, move: PlaylistMove) =
+  ## The selected entries, in their order, one step or to an end; a block
+  ## already at the edge stays put while the rest catch up.
+  let sel = a.plSelection
+  if sel.len == 0: return
+  let n = a.playlist.len
+  var picked = newSeq[bool](n)
+  for i in sel: picked[i] = true
+  var order = toSeq(0 ..< n)
+  case move
+  of pmTop: order = sel & order.filterIt(not picked[it])
+  of pmBottom: order = order.filterIt(not picked[it]) & sel
+  of pmUp:
+    for i in 1 ..< n:
+      if picked[order[i]] and not picked[order[i - 1]]: swap(order[i], order[i - 1])
+  of pmDown:
+    for i in countdown(n - 2, 0):
+      if picked[order[i]] and not picked[order[i + 1]]: swap(order[i], order[i + 1])
   a.reorderPlaylist(order)
+
+proc duplicateSelected(a: App) =
+  ## Copies of the selected entries go right after the last one and become
+  ## the selection.
+  if a.editLocked: return
+  let sel = a.plSelection
+  if sel.len == 0: return
+  let at = sel[^1] + 1
+  a.playlist.insert(sel.mapIt(a.playlist[it]), at)
+  if a.plIndex >= at: a.plIndex += sel.len
+  a.plSelected = at + max(0, sel.find(a.plSelected))
+  a.plMarks = if sel.len > 1: toSeq(at ..< at + sel.len) else: @[]
+  a.plReveal = true
+
+proc selectAll(a: App) =
+  if a.playlist.len == 0: return
+  if a.plSelected notin 0 ..< a.playlist.len: a.plSelected = 0
+  a.plMarks = toSeq(0 ..< a.playlist.len)
+
+proc playlistKeys(a: App): bool =
+  ## Ctrl+A, Ctrl+D and Ctrl+Shift+Up/Down/Home/End while the playlist has
+  ## the focus, and Up/Down while the pointer stays where it clicked (plArrows);
+  ## true when one was taken.
+  let w = a.window
+  let pressed = w.buttonPressed
+  if a.plArrows and a.cfg.showPlaylist and not a.playlistLocked and a.playlist.len > 0 and
+      not (w.ctrl or w.alt or w.shiftDown) and (pressed[KeyUp] or pressed[KeyDown]):
+    let step = if pressed[KeyUp]: -1 else: 1
+    a.selectOnly(clamp(a.plSelected + step, 0, a.playlist.high))
+    a.plReveal = true
+    return true
+  if not (a.plFocused and a.cfg.showPlaylist) or a.playlistLocked or not w.ctrl or w.alt:
+    return
+  result = true
+  if w.shiftDown:
+    if pressed[KeyUp]: a.moveSelected(pmUp)
+    elif pressed[KeyDown]: a.moveSelected(pmDown)
+    elif pressed[KeyHome]: a.moveSelected(pmTop)
+    elif pressed[KeyEnd]: a.moveSelected(pmBottom)
+    else: result = false
+  elif pressed[KeyA]: a.selectAll()
+  elif pressed[KeyD]: a.duplicateSelected()
+  else: result = false
 
 proc probeInfo(a: App, path: string): MediaInfo =
   ## Duration and video size, probed once per file (streams are not probed).
@@ -1460,18 +1656,51 @@ proc probeNext(a: App, visible: Slice[int]) =
   if a.prober == nil: a.prober = newProber()
   if a.prober != nil: a.prober.start(next)
 
+proc noteLink(a: App, url: string, title = "", m = MediaInfo(), looked = false) =
+  ## Keeps what was found out about a link in the media cache.
+  let e = a.linkInfos.mgetOrPut(url.linkKey, LinkInfo()).addr
+  if title.len > 0: e.title = title
+  if m.duration > 0: e.duration = m.duration
+  if m.width > 0 and m.height > 0: (e.width, e.height) = (m.width, m.height)
+  if m.audioBitrate > 0: e.audioBitrate = m.audioBitrate
+  e.looked = e.looked or looked
+  e.noted = epochTime()
+  a.linkInfosChanged = true
+
+proc saveLinkInfos(a: App) =
+  if a.linkInfosChanged:
+    a.linkInfos.save()
+    a.linkInfosChanged = false
+
+proc readLinkInfos(a: App) =
+  ## Gives new playlist entries what the media cache has of their links, by
+  ## video id however they're spelled; those it has all of aren't looked up.
+  for p in a.playlist:
+    if a.linkInfosRead.containsOrIncl(p) or not p.isWebLink: continue
+    let (c, s) = (a.linkInfos.lookup(p), a.saved.lookup(p))
+    let title = if c.title.len > 0: c.title else: s.title
+    if title.len > 0 and p notin a.linkTitles: a.linkTitles[p] = title
+    let m = a.mediaInfo.mgetOrPut(p, MediaInfo()).addr
+    if m.duration <= 0: m.duration = if c.duration > 0: c.duration else: s.duration
+    if m.width == 0: (m.width, m.height) = (c.width, c.height)
+    if m.audioBitrate == 0: m.audioBitrate = c.audioBitrate
+    if c.looked and m.duration > 0 and p in a.linkTitles: a.ytInfoTried.incl p
+
 proc infoNext(a: App, visible: Slice[int]) =
-  ## Starts looking up the durations and sizes of the YouTube videos the
-  ## playlist columns lack (a playlist's listing has durations only), a few
-  ## at a time, visible rows first.
+  ## Starts looking up the titles, durations and sizes of the YouTube videos
+  ## the playlist columns lack (a playlist's listing has no sizes), a few at
+  ## a time, visible rows first.
   const Batch = 8
   if a.ytInfo.running: return
-  let wantSize = a.cfg.playlistShowDimensions
+  a.readLinkInfos()
+  let wantSize = pfDimensions in a.cfg.playlistColumns
+  let wantBitrate = pfAudioBitrate in a.cfg.playlistColumns
   var links: seq[string]
   let need = proc (p: string): bool =
     if p in a.ytInfoTried or p in links or p.youtubeId.len == 0: return false
     let m = a.mediaInfo.getOrDefault(p)
-    m.duration <= 0 or (wantSize and m.width == 0)
+    m.duration <= 0 or p notin a.linkTitles or (wantSize and m.width == 0) or
+      (wantBitrate and m.audioBitrate == 0)
   for i in visible:
     if links.len < Batch and need(a.playlist[i]): links.add a.playlist[i]
   for p in a.playlist:
@@ -1484,16 +1713,19 @@ proc infoNext(a: App, visible: Slice[int]) =
   a.ytInfo = videoInfos(exe, links, a.ytCookies.getOrDefault(links[0]))
 
 proc pollYtInfo(a: App) =
-  ## Collects the durations and sizes found so far and redraws to show them.
+  ## Collects what was found so far, keeps it and redraws to show it.
   let j = a.ytInfo
   if j == nil or not j.poll(): return
   a.dirtyUntil = max(a.dirtyUntil, now() + 0.05)
-  for (id, dur, w, h) in j.infos:
+  for (id, dur, w, h, abr, title) in j.infos:
     for p in a.ytInfoLinks:
       if p.youtubeId != id: continue
       var m = a.mediaInfo.mgetOrPut(p, MediaInfo()).addr
       if dur > 0: m.duration = dur
       if w > 0 and h > 0: (m.width, m.height) = (w, h)
+      if abr > 0: m.audioBitrate = abr
+      if title.len > 0 and p notin a.linkTitles: a.linkTitles[p] = title
+      a.noteLink(p, title, m[], looked = true)
   j.infos.setLen 0
   if not j.running: a.ytInfo = nil
 
@@ -1505,25 +1737,42 @@ proc pollProbe(a: App) =
     a.mediaInfo[path] = a.prober.info
     a.dirtyUntil = max(a.dirtyUntil, now() + 0.05)
 
-proc sortPlaylist(a: App, by: PlaylistSort) =
+proc rowName(a: App, path: string): string =
+  ## A playlist row's name: a link's title when known, else the file's.
+  if a.ytList.running and a.ytList.url == path and path.youtubeId.len == 0:
+    "Loading playlist..."
+  elif path in a.linkTitles: a.linkTitles[path]
+  elif path.isWebLink and a.saved.lookup(path).title.len > 0: a.saved.lookup(path).title
+  elif a.mediaInfo.getOrDefault(path).title.len > 0: a.mediaInfo[path].title
+  else: path.extractFilename
+
+proc sortPlaylist(a: App, by: PlaylistField) =
   ## Sorts ascending, or descending when already in ascending order.
   if a.editLocked: return
   let n = a.playlist.len
   if n < 2: return
   var keys = newSeq[(float, float)](n)
+  var names = newSeq[string](n)
   for i, p in a.playlist:
     case by
-    of psName: discard
-    of psDuration: keys[i] = (a.probeInfo(p).duration, 0.0)
-    of psDimensions:
+    of pfFilename: names[i] = p.extractFilename
+    of pfSize: keys[i] = (a.fileSize(p).float, 0.0)
+    of pfName, pfDuration, pfDimensions, pfAudioBitrate, pfTrack, pfArtist, pfYear, pfAlbum:
       let m = a.probeInfo(p)
-      keys[i] = (float(m.width * m.height), m.width.float)
-    of psSize:
-      keys[i] = (a.fileSize(p).float, 0.0)
-  if by in {psDuration, psDimensions}: a.prober.finish()
-  let names = a.playlist.mapIt(it.extractFilename)
+      case by
+      of pfName: names[i] = a.rowName(p)
+      of pfArtist: names[i] = m.artist
+      of pfAlbum: names[i] = m.album
+      of pfDuration: keys[i] = (m.duration, 0.0)
+      of pfDimensions: keys[i] = (float(m.width * m.height), m.width.float)
+      of pfAudioBitrate: keys[i] = (m.audioBitrate, 0.0)
+      of pfTrack: keys[i] = (m.track.float, 0.0)
+      of pfYear: keys[i] = (m.year.float, 0.0)
+      else: discard
+  if by notin {pfFilename, pfSize}: a.prober.finish()
+  let byName = by in {pfName, pfFilename, pfArtist, pfAlbum}
   let byKey = proc (i, j: int): int =
-    if by == psName: naturalCmp(names[i], names[j]) else: cmp(keys[i], keys[j])
+    if byName: naturalCmp(names[i], names[j]) else: cmp(keys[i], keys[j])
   let ascending = (0 ..< n - 1).toSeq.allIt(byKey(it, it + 1) <= 0)
   var order = toSeq(0 ..< n)
   order.sort(byKey, if ascending: Descending else: Ascending)
@@ -1534,7 +1783,7 @@ proc clearPlaylist(a: App) =
   if a.editLocked: return
   a.playlist.setLen 0
   a.plIndex = -1
-  a.plSelected = -1
+  a.selectOnly(-1)
   a.plScroll = 0
 
 proc randomizePlaylist(a: App) =
@@ -1628,8 +1877,36 @@ proc afterEof(a: App) =
   else:
     a.runAfterPlayback()
 
+proc shortAudioPad(a: App): float =
+  ## Seconds of silence owed after this file: it is a very short audio file
+  ## (Options > Audio Files) and the end of it goes on to another item.
+  let p = a.player
+  if not a.cfg.shortAudioDelay or not p.loaded or p.hasRealVideo or p.duration <= 0 or
+     p.duration * 1000 >= a.cfg.shortAudioMs: return
+  if p.partEnd > 0 or a.pingPongFile or a.abLoop or a.playlistLocked: return
+  if a.cfg.repeatForever and a.cfg.repeatMode == rmFile: return  # mpv loops it: no end
+  let next = a.cfg.repeatForever and a.playlist.len > 0 or a.plIndex + 1 < a.playlist.len or
+    a.afterPlayback == apNextInFolder and a.folderNeighbor(1).len > 0
+  if next: a.cfg.shortAudioMs / 1000 else: 0
+
+proc tickPad(a: App) =
+  ## The delay after a short file: over, or called off by leaving the end.
+  if a.padLen == 0: return
+  let p = a.player
+  if not (p.loaded and p.eofReached and not p.stopped):
+    # Sought away: mpv paused itself at the end, the delay was still playing.
+    if p.loaded and not p.stopped and not p.opening and not a.padHeld:
+      p.h.setProp("pause", false)
+    a.padLen = 0
+    a.padHeld = false
+  elif a.padElapsed >= a.padLen:
+    a.padLen = 0
+    a.afterEof()
+  else: a.dirtyUntil = max(a.dirtyUntil, now() + 0.05)  # the stripes filling
+
 proc handleEof(a: App) =
   let p = a.player
+  a.tickPad()
   if not (p.loaded and p.eofReached and not p.eofHandled and not p.stopped): return
   p.eofHandled = true
   if p.partEnd > 0:  # the end of a link's saved part: the stream goes on
@@ -1641,7 +1918,10 @@ proc handleEof(a: App) =
     return
   # A synchronized player's file may be shorter than the master's: it waits at
   # the end (clamped) until the group seeks back.
-  if not a.playlistLocked: a.afterEof()
+  if a.playlistLocked: return
+  a.padLen = a.shortAudioPad
+  if a.padLen > 0: a.padAt = now()
+  else: a.afterEof()
 
 proc volumeStep(a: App, up: bool) =
   ## Soft cap 100, hard cap 200: the volume step (default 5) below the soft
@@ -1666,9 +1946,20 @@ proc changeRate(a: App, dir: float) =
   a.syncSend("speed", $s)
   a.osd(&"Speed: {s:.2f}x")
 
+proc pickLang(a: App, url, lang: string)
+
 proc cycleTrack(a: App, kind: string, up: bool) =
   if a.player.loaded:
     if kind == "aid":
+      # a link's languages are its audio tracks
+      let langs = audioLanguages(a.qualitiesOf(a.player.path).audio)
+      if a.player.path.isWebLink and langs.len > 1:
+        let rows = a.audioRows(a.player.path)
+        let cur = langs.mapIt(it.lang).find(rows[0].lang)
+        let next = langs[(cur + (if up: 1 else: -1) + langs.len) mod langs.len]
+        a.pickLang(a.player.path, next.lang)
+        a.osd("Audio: " & next.langName)
+        return
       # audio cycles through its tracks only, never landing on "no"
       var ids: seq[int]
       for t in a.player.tracks:
@@ -1701,7 +1992,7 @@ proc frameStep(a: App, forward: bool) =
     a.slaveFrame(forward)
     return
   a.player.stopped = false
-  a.player.frameStep(forward)
+  a.stepPlayer(forward)
   a.syncSend("frame", $forward)
 
 proc seekRelative(a: App, d: float) =
@@ -1955,18 +2246,23 @@ proc syncEqualizer(a: App) =
     if p != nil: p.setEqualizer(on, gains, live)
   if not live and a.eqUnsaved.len > 0: a.saveEqualizer()
 
+proc frameRate(a: App, path: string): float =
+  ## The frame rate of the current file's video track, when path is that
+  ## file; 0 when unknown.
+  if path != a.player.path: return
+  for tr in a.player.tracks:
+    if tr.kind == "video" and tr.selected and not tr.albumArt and tr.fps > 0: return tr.fps
+
 proc snapToFrame(a: App, path: string, t: float): float =
   ## Time t on the nearest frame of the current file's video track, when
   ## path is that file and its frame rate is known.
   let p = a.player
   result = if p.duration > 0 and path == p.path: clamp(t, 0, p.duration) else: max(t, 0)
-  if path != p.path: return
-  for tr in p.tracks:
-    if tr.kind == "video" and tr.selected and not tr.albumArt and tr.fps > 0:
-      # The last frame starts before the end, so past it round down.
-      result = round(result * tr.fps) / tr.fps
-      if p.duration > 0 and result > p.duration: result = floor(p.duration * tr.fps) / tr.fps
-      return
+  let fps = a.frameRate(path)
+  if fps > 0:
+    # The last frame starts before the end, so past it round down.
+    result = round(result * fps) / fps
+    if p.duration > 0 and result > p.duration: result = floor(p.duration * fps) / fps
 
 proc xfChanged(a: App, msg: string) =
   a.osd(msg)
@@ -2054,7 +2350,7 @@ proc joined(a: App) =
   ## file follows the master from where it is.
   a.playlist.setLen 0
   a.plIndex = -1
-  a.plSelected = -1
+  a.selectOnly(-1)
   a.plScroll = 0
   a.clock = MasterClock()
   a.followRunning = a.player.playing
@@ -2880,6 +3176,329 @@ proc loopFrames(a: App) =
     a.lfShow = want
     a.lfDue = true
 
+# --- step frames ------------------------------------------------------------
+# Going back a frame is a seek: mpv decodes from the keyframe before it, on
+# every press, however many frames that is. While paused, the standby takes
+# the frames around the position instead, as for a short loop, so a step
+# either way just shows another texture at once. The player follows with a
+# seek (they coalesce), to be there on playing or stepping past them. More
+# frames are taken, out of the way, before stepping gets to the edge of those
+# kept. Anything they can't serve steps the plain way.
+
+const
+  StepBack = 120      ## frames taken at a time before the position, at most
+  StepAhead = 30      ## and after it
+  StepMargin = 30     ## more are taken this close to an edge
+  StepMin = 16        ## fewer than this fit in memory: not worth it
+  StepSettle = 0.004  ## seconds without an update for a frame to be final
+  StepPause = 0.15    ## how long the position must stay put to take frames
+  StepIdle = 30.0     ## seconds without a step until they're let go
+  StepPlain = 0.25    ## a plain step unpauses the player for about this long
+
+proc stepFramesMax(a: App): int =
+  a.loopFramesMax div max(a.lfSize[0] * a.lfSize[1] * 4, 1)
+
+proc stepDur(a: App): float =
+  let fps = a.frameRate(a.player.path)
+  if fps > 0: 1 / fps else: 1 / 30
+
+proc stepIndex(a: App, t: float): int =
+  ## The kept frame showing at time t; -1 outside them.
+  result = -1
+  if a.sfFrames.len == 0 or t > a.sfFrames[^1].t + a.stepDur / 2: return
+  for i, f in a.sfFrames:
+    if f.t > t + 0.0005: break
+    result = i
+
+proc stepRelease(a: App) =
+  ## The player's own picture and time again.
+  if a.sfShow >= 0: a.lfDue = true
+  a.sfShow = -1
+  a.sfOwed = 0
+  a.player.holdTime = false
+
+proc stepFramesOff(a: App) =
+  ## Frees them (in the next GL pass). The standby stays open, for the next
+  ## ones, unless caught in the middle: a seek during a step lands anywhere.
+  a.stepRelease()
+  if a.sfState != sfParked: a.sfPath = ""
+  if a.sfSlotOpen:
+    a.sfSlotOpen = false
+    a.lfTrash.add a.sfSlot
+  a.lfTrash.add a.sfFrames
+  a.lfTrash.add a.sfFill
+  a.sfFrames.setLen 0
+  a.sfFill.setLen 0
+  a.sfState = sfParked
+  a.sfAbort = false
+  a.sfAtStart = false
+  a.sfAtEnd = false
+  a.sfParkT = -1
+
+proc stepFramesFailed(a: App) =
+  ## The plain way, until the next step asks for them again.
+  a.stepFramesOff()
+  a.sfWanted = 0
+  a.sfPath = ""
+
+proc stepShow(a: App, i: int) =
+  let p = a.player
+  a.sfShow = i
+  a.lfDue = true
+  p.holdTime = true
+  p.timePos = a.sfFrames[i].t
+  p.seek(p.timePos)
+  a.sfJumps = p.jumps
+
+proc payStepsOwed(a: App) =
+  while a.sfOwed != 0:
+    let d = sgn(a.sfOwed)
+    let j = a.stepIndex(a.player.timePos) + d
+    if j >= 0 and j < a.sfFrames.len:
+      a.stepShow(j)
+      a.sfOwed -= d
+    else:
+      if (if d < 0: a.sfAtStart else: a.sfAtEnd): a.sfOwed = 0
+      return
+
+proc stepFromFrames(a: App, forward: bool): bool =
+  ## A step among the kept frames; false to step the plain way.
+  let p = a.player
+  a.sfWanted = now()
+  if not a.sfOn or not p.paused: return false
+  let d = if forward: 1 else: -1
+  if a.sfOwed != 0:
+    a.sfOwed += d
+    return true
+  let i = a.stepIndex(p.timePos)
+  if i < 0: return false
+  if i + d < 0 or i + d >= a.sfFrames.len:
+    if not (if forward: a.sfAtEnd else: a.sfAtStart): a.sfOwed = d
+    return true
+  a.stepShow(i + d)
+  true
+
+proc stepPlayer(a: App, forward: bool) =
+  if not a.stepFromFrames(forward):
+    a.player.frameStep(forward)
+    a.sfJumps = a.player.jumps
+    a.sfPlainAt = now()
+
+proc stepFill(a: App, start, stop: float, before: bool) =
+  ## Sends the standby to take the frames from `start` up to `stop`.
+  let (p, sb) = (a.player, a.standby)
+  (a.sfStart, a.sfStop, a.sfBefore) = (max(start, 0), stop, before)
+  a.sfAsked = sb.restarts
+  a.sfAskedAt = now()
+  a.sfPending = false
+  a.sfUpdated = false
+  a.sfState = sfSeeking
+  if a.sfPath == p.path and sb.loaded and sb.path == p.path:
+    sb.h.commandAsync("seek", formatFloat(a.sfStart, ffDecimal, 6), "absolute", "exact")
+    return
+  # As for loop frames: looking like the playing player, the rest off.
+  a.sfPath = p.path
+  a.mirrorStandby()
+  for (k, v) in [("aid", "no"), ("osd-level", "0"), ("ab-loop-a", "no"),
+                 ("ab-loop-b", "no"), ("loop-file", "no"), ("mute", "yes"),
+                 ("pause", "yes"), ("speed", "100")]:  # a step waits out the frame's time
+    sb.h.setProp(k, v)
+  sb.stopped = false
+  sb.path = p.path
+  sb.loaded = false
+  sb.loadError = ""
+  sb.sphere = p.sphere
+  sb.h.commandAsync("loadfile", p.path, "replace", "-1",
+    "start=" & formatFloat(a.sfStart, ffDecimal, 6))
+
+proc stepOn(a: App) =
+  ## Has the standby step to the next frame.
+  a.sfState = sfStepping
+  a.sfUpdated = false
+  a.standby.h.commandAsync("frame-step")
+  a.sfAskedAt = now()
+
+proc stepTrim(a: App) =
+  ## Back within memory, letting go of the frames furthest from the position.
+  while a.sfFrames.len > a.stepFramesMax:
+    if a.stepIndex(a.player.timePos) >= a.sfFrames.len div 2:
+      a.lfTrash.add a.sfFrames[0]
+      a.sfFrames.delete(0)
+      a.sfAtStart = false
+      if a.sfShow >= 0: dec a.sfShow
+    else:
+      a.lfTrash.add a.sfFrames.pop()
+      a.sfAtEnd = false
+      a.sfParkT = -1
+
+proc stepFillDone(a: App) =
+  ## The standby stops where it is, its frames joining the ones kept.
+  let sb = a.standby
+  a.sfState = sfParked
+  a.sfParkT = sb.timePos
+  if a.sfAbort:
+    a.sfAbort = false
+    a.lfTrash.add a.sfFill
+    a.sfFill.setLen 0
+    return
+  if a.sfBefore:
+    if a.sfFill.len == 0: a.sfAtStart = true
+    if a.sfShow >= 0: a.sfShow += a.sfFill.len
+    a.sfFrames = a.sfFill & a.sfFrames
+    a.sfFill.setLen 0
+    a.stepTrim()
+  a.payStepsOwed()
+
+proc keepStepFrame(a: App, f: LoopFrame) =
+  if a.sfStart <= 0: a.sfAtStart = true
+  if a.sfBefore:
+    a.sfFill.add f
+    if a.sfFill.len > a.stepFramesMax:
+      a.lfTrash.add a.sfFill[0]
+      a.sfFill.delete(0)
+  elif a.sfFrames.len == 0 or f.t > a.sfFrames[^1].t + 0.0005:
+    a.sfFrames.add f
+    a.stepTrim()
+    a.payStepsOwed()
+  else: a.lfTrash.add f
+
+proc takeStepFrame(a: App, tw, th: int): bool =
+  ## One go at the standby's frame, as takeLoopFrames; true if it's waiting
+  ## for mpv, nothing else to do for now.
+  let sb = a.standby
+  discard sb.pollEvents()
+  if (mpv_render_context_update(sb.render) and MpvRenderUpdateFrame) != 0:
+    a.sfPending = true
+    a.sfUpdated = true
+  if a.sfSlotOpen:
+    if a.sfPending:
+      a.sfPending = false
+      sb.render.render(a.sfSlot.target, untimed = true)
+      mpv_render_context_report_swap(sb.render)
+      a.sfSettleAt = now()
+    elif now() - a.sfSettleAt > StepSettle:
+      a.sfSlotOpen = false
+      a.sfLastT = a.sfSlot.t
+      let t = a.sfSlot.t
+      a.keepStepFrame(a.sfSlot)
+      if not a.sfBefore and t >= a.sfStop - 0.0005: a.stepFillDone()
+      else: a.stepOn()
+    return true
+  if a.sfState == sfStepping and sb.eofReached and sb.timePos == a.sfLastT:
+    a.sfAtEnd = true
+    a.stepFillDone()
+    return true
+  # The time and the frame both new, whichever came first: the time alone
+  # would have the last frame taken for this one.
+  let fresh = a.sfUpdated and (if a.sfState == sfSeeking:
+                sb.loaded and sb.restarts > a.sfAsked and sb.timePos >= a.sfStart - 0.001
+              else: sb.timePos != a.sfLastT)
+  if not fresh:
+    if a.sfPending:  # as for loop frames: mpv waits for it to be rendered
+      a.sfPending = false
+      sb.target.ensureSize(tw, th)
+      sb.render.render(sb.target, untimed = true)
+      mpv_render_context_report_swap(sb.render)
+    return true
+  sb.justLoaded = false
+  let t = sb.timePos
+  if a.sfAbort or a.sfBefore and t >= a.sfStop - 0.0005:
+    a.stepFillDone()
+    return true
+  for _ in 1 .. 8:  # errors from before, not to be taken for this one's
+    if glGetError() == GL_NO_ERROR: break
+  a.sfSlot = LoopFrame(t: t)
+  a.sfSlot.target.ensureSize(tw, th)
+  if glGetError() == GL_OUT_OF_MEMORY:
+    a.lfTrash.add a.sfSlot
+    a.stepFramesFailed()
+    return true
+  a.sfPending = false
+  sb.render.render(a.sfSlot.target, untimed = true)
+  mpv_render_context_report_swap(sb.render)
+  a.sfSlotOpen = true
+  a.sfSettleAt = now()
+  true
+
+proc takeStepFrames(a: App, tw, th: int) =
+  ## GL pass: takes frames for a few milliseconds, mpv being quicker at
+  ## stepping than the window is at drawing.
+  let until = now() + 0.005
+  while a.sfState != sfParked and a.takeStepFrame(tw, th) and now() < until: discard
+
+proc stepFrames(a: App) =
+  ## Keeps the frames around a paused position taken.
+  let (p, sb) = (a.player, a.standby)
+  let (la, lb) = a.loopRegion
+  if a.sbState != sbOff or a.lfState != lfOff: a.sfPath = ""
+  let need = sb != nil and not cpuWanted and lb <= la and a.sbState == sbOff and
+    a.lfState == lfOff and p.loaded and not p.stopped and not p.backward and
+    (p.paused or now() - a.sfPlainAt < StepPlain) and
+    p.hasRealVideo and not p.isSpherical and p.path.len > 0 and
+    not p.path.contains("://") and a.lfSize[0] > 1 and a.stepFramesMax >= StepMin
+  if not need:
+    if a.sfOn:
+      a.sfOn = false
+      let open = a.sfPath.len > 0
+      a.stepFramesOff()
+      if open:  # its decoder's memory, not to be held on to while playing
+        sb.close()
+        a.sfPath = ""
+    return
+  if not a.sfOn:
+    a.sfOn = true
+    a.sfWanted = now()
+    a.sfMovedAt = now()
+    a.sfJumps = p.jumps
+  var key = p.path & "\n" & $a.lfSize & "\n" & $a.loopFramesMax
+  for name in LoopFrameLook: key.add "\n" & p.props.getOrDefault(name)
+  if key != a.sfKey:
+    a.stepFramesOff()
+    a.sfKey = key
+    a.sfPath = ""
+    a.sfMovedAt = now()
+  if p.jumps != a.sfJumps:  # sent elsewhere
+    a.sfJumps = p.jumps
+    a.sfMovedAt = now()
+    a.stepRelease()
+  if a.sfState != sfParked:
+    discard sb.pollEvents()
+    a.dirtyUntil = max(a.dirtyUntil, now() + 0.05)  # GL passes to take them in
+    if sb.loadError.len > 0 or now() - a.sfAskedAt > 3:
+      a.stepFramesFailed()
+    elif a.stepIndex(p.timePos) < 0 and
+         (p.timePos < a.sfStart or p.timePos > a.sfStop + a.stepDur):
+      a.sfAbort = true
+    return
+  if a.sfWanted == 0 or now() - a.sfWanted > StepIdle:
+    if a.sfFrames.len > 0:
+      a.stepFramesOff()
+      if sb.loaded:
+        sb.close()
+        a.sfPath = ""
+    return
+  let
+    t = p.timePos
+    d = a.stepDur
+    i = a.stepIndex(t)
+    most = a.stepFramesMax
+    back = min(StepBack, most * 2 div 3)
+    ahead = min(StepAhead, most div 4)
+    margin = min(StepMargin, most div 3)
+  if i < 0:
+    if not p.seeking and now() - a.sfMovedAt >= StepPause:
+      a.stepFramesOff()
+      a.stepFill(t - back.float * d, t + ahead.float * d, false)
+  elif i < margin and not a.sfAtStart:
+    let first = a.sfFrames[0].t
+    a.stepFill(first - back.float * d, first, true)
+  elif a.sfFrames.len - 1 - i < margin and not a.sfAtEnd:
+    let last = a.sfFrames[^1].t
+    if a.sfParkT == last:  # already there
+      (a.sfBefore, a.sfStop, a.sfLastT) = (false, last + ahead.float * d, last)
+      a.stepOn()
+    else: a.stepFill(last + d / 4, last + ahead.float * d, false)
+
 # --- synchronize: Properties window ---------------------------------------
 
 proc syncInstances(a: App): seq[SyncInstance] =
@@ -2969,7 +3588,7 @@ proc saveMedia(a: App) =
     return
   a.saveSrc = p.path
   if p.path.isWebLink:
-    var title = a.linkTitles.getOrDefault(p.path, a.saved.getOrDefault(p.path).title)
+    var title = a.linkTitles.getOrDefault(p.path, a.saved.lookup(p.path).title)
     if title.len == 0: title = p.h.getStr("media-title")
     if title.len == 0 or title == p.path: title = p.path.youtubeId
     a.ask(dkSaveFile, "savemedia", "Save", a.startDir / safeName(title) & ".mkv",
@@ -2982,17 +3601,24 @@ proc saveMedia(a: App) =
 proc startSave(a: App, dest: string) =
   let src = a.saveSrc
   var d = dest
+  var note = ""
   if src.isWebLink:
     let whole = a.savedFile(src)
+    # As fetched by now: a save doesn't wait for them, only an .mkv holds them.
+    var styled = a.ytStyled.getOrDefault(src).filterIt(fileExists(it.path))
+    if d.splitFile.ext.toLowerAscii == ".mp4" and styled.len > 0:
+      styled.setLen 0
+      note = "plain subtitles: an .mp4 can't hold styled ones"
     if whole.len > 0:  # the media cache holds all of it
       if d.splitFile.ext.len == 0: d.add whole.splitFile.ext
-      a.saveJob = copying(whole, d)
+      a.saveJob = copying(whole, d, styled)
     elif findYtdlp(a.cfg.ytdlp).len == 0:
       a.osd("Saving links needs yt-dlp")
       return
     else:
       a.saveJob = downloading(findYtdlp(a.cfg.ytdlp), src, d, a.ytCookies.getOrDefault(src),
-        a.saveFormat(src))
+        a.saveFormat(src), styled)
+    a.saveJob.warning = note
   else:
     if d.splitFile.ext.len == 0: d.add src.splitFile.ext
     a.saveJob = copying(src, d)
@@ -3005,7 +3631,9 @@ proc pollSave(a: App) =
   a.dirtyUntil = max(a.dirtyUntil, now() + 0.05)  # the status bar's progress
   if j.done:
     a.saveJob = nil
-    if j.error.len == 0: a.osd("Saved: " & j.dest.extractFilename)
+    if j.error.len == 0:
+      a.osd("Saved: " & j.dest.extractFilename &
+        (if j.warning.len > 0: " (" & j.warning & ")" else: ""))
     else: a.osd("Save failed: " & j.error)
 
 proc cancelSave(a: App) =
@@ -3189,6 +3817,10 @@ proc langList(s: string): string =
   ## "eng, jpn" or "eng jpn" -> "eng,jpn" (mpv's list syntax).
   s.multiReplace((";", ","), (" ", ",")).split(',').filterIt(it.len > 0).join(",")
 
+proc coverNameList(s: string): seq[string] =
+  ## Options' folder picture names, one per line, as mpv takes them.
+  s.splitLines.mapIt(it.strip).filterIt(it.len > 0)
+
 proc subPathList(s: string): string =
   ## "Subs; ~/subs" -> "Subs:/home/me/subs" (mpv's path-list syntax).
   s.split(';').mapIt(it.strip.expandTilde).filterIt(it.len > 0).join(":")
@@ -3212,6 +3844,15 @@ proc syncSettings(a: App) =
     &"{c.subPaths}|{c.titleFullPath}|{c.titleUseMediaTitle}|{c.subFont}|{c.subBold}|{c.subItalic}|" &
     &"{c.subSize}|{c.subSpacing}|{c.subLineSpacing}|{c.subColor}|{c.subOpacity}|{c.subOutlineSize}|{c.subOutlineColor}|" &
     &"{c.subOutlineOpacity}|{c.subShadowOffset}|{c.subShadowColor}|{c.subShadowOpacity}|{c.subStyleAss}"
+  # The cover's apart: showing or hiding it picks the video track, which
+  # other settings changing mustn't do again.
+  if not a.coverSynced or c.coverNames != a.coverNames:
+    a.coverNames = c.coverNames
+    a.player.setCoverNames(coverNameList(c.coverNames))
+  if not a.coverSynced or c.showCover != a.coverShown:
+    a.coverShown = c.showCover
+    a.player.showCover(c.showCover)
+  a.coverSynced = true
   if key == a.settingsKey: return
   a.settingsKey = key
   a.applyOsd()
@@ -3254,8 +3895,11 @@ proc closeOptions(a: App, ok: bool) =
     if (if dir.len > 0: dir else: defaultSaveDir()) != saveDir():
       a.recordEnd()
       a.handoffOff()
+      a.saveLinkInfos()
       setSaveDir(dir)
       a.saved = loadSaveIndex()
+      a.linkInfos = loadLinkInfos()
+      a.linkInfosRead.clear()
     a.pruneSaved()
     a.hookYtdlp()  # another yt-dlp chosen: mpv opens links with it
   else:
@@ -3341,6 +3985,12 @@ proc applyUiScale(a: App) =
     a.showDialog(a.pickWin, ivec2(sw, sh))
   a.dirtyUntil = now() + 0.5
 
+proc previewBookmark(a: App) =
+  ## With Preview checked, playback jumps to the bookmark being edited.
+  if not a.cfg.bookmarkPreview or not a.player.loaded or a.renPath != a.player.path: return
+  a.seekTo(a.renTime)
+  a.renSeeked = true
+
 proc showRename(a: App, i: int) =
   ## Opens the Edit Bookmark dialog for the current file's bookmark i.
   let marks = a.fileBookmarks
@@ -3352,6 +4002,9 @@ proc showRename(a: App, i: int) =
   a.renTimeText = fmtTime(a.renTime, true, a.player.duration)
   a.renText = marks[i].name
   a.renPlaceholder = marks[i].label(i)
+  a.renOrigPos = a.player.timePos
+  a.renSeeked = false
+  a.previewBookmark()
   if a.renWin == nil:
     (a.renWin, a.renSk, a.renUi) = a.newDialogWindow("Edit Bookmark", RenameSize)
   # Type right away, the caret after the current name.
@@ -3366,6 +4019,8 @@ proc closeRename(a: App, keep = false) =
   if not keep and a.renTime != a.renOrigTime:
     discard a.moveBookmark(a.renPath, a.renTime, a.renOrigTime)
     a.renTime = a.renOrigTime
+  # Playback too, when Preview moved it.
+  if not keep and a.renSeeked and a.renPath == a.player.path: a.seekTo(a.renOrigPos)
   a.renUi.focusId = ""
   a.overlay = ovNone
   if a.renWin.visible:
@@ -3634,21 +4289,37 @@ proc execute(a: App, c: CommandLine, picks = initTable[string, string]()) =
   var path = if a.player.loaded: a.player.path else: ""
   # A link: tools like ffmpeg can't open its page, so its file cards get a
   # file on disk, the saved one when all of it is, else one downloaded first.
-  var fetch, fetchErr = ""
+  # With two timestamps or more (From and To), only the span between them is
+  # downloaded, and the timestamps become times of that clip.
+  var fetch, fetchErr, timeFix = ""
   if path.isWebLink and c.parts.anyIt(it.card and it.kind == ckReference and it.content == "file"):
     let local = a.savedFile(path)
     if local.len > 0: path = local
     elif findYtdlp(a.cfg.ytdlp).len == 0: fetchErr = "Opening links needs yt-dlp"
     else:
+      var times: seq[float]
+      for p in c.parts.runCards:
+        if p.isTimestamp and p.name in picks:
+          try: times.add parseTime(picks[p.name])
+          except ValueError: discard
       let tmp = getTempDir() / &"majestic-{getCurrentProcessId()}-{int64(epochTime() * 1000)}"
       let file = tmp / "media.mkv"
+      let (exe, cookies, format) = (findYtdlp(a.cfg.ytdlp), a.ytCookies.getOrDefault(path),
+        a.saveFormat(path))
       fetch = "trap " & quoteShellPosix("rm -rf " & quoteShellPosix(tmp)) & " EXIT\n" &
-        "mkdir -p " & quoteShellPosix(tmp) & " || exit\n" &
-        "echo " & quoteShellPosix("Downloading " & path) & "\n" &
-        downloadScript(findYtdlp(a.cfg.ytdlp), path, file, a.ytCookies.getOrDefault(path),
-          a.saveFormat(path))
+        "mkdir -p " & quoteShellPosix(tmp) & " || exit\n"
+      if times.len >= 2 and times.max > times.min:
+        const Margin = 1.0  # seconds kept around the span
+        let (lo, hi) = (max(0.0, times.min - Margin), times.max + Margin)
+        fetch.add "echo " & quoteShellPosix(&"Downloading {fmtTime(lo, millis = true)}-" &
+            &"{fmtTime(hi, millis = true)} of {path}") & "\n" &
+          sectionScript(exe, path, file, lo, hi, cookies, format)
+        timeFix = "mmp_clip"
+      else:
+        fetch.add "echo " & quoteShellPosix("Downloading " & path) & "\n" &
+          downloadScript(exe, path, file, cookies, format)
       path = file
-  var (script, err) = c.parts.compose(path, picks)
+  var (script, err) = c.parts.compose(path, picks, timeFix)
   if fetchErr.len > 0: err = fetchErr
   script = fetch & script
   let dir = a.runDir
@@ -3781,7 +4452,7 @@ proc ytOpen(a: App, url: string, delay = 0.0) =
   ## Streams url again (from where it was tried), unless another entry has
   ## been opened meanwhile.
   if delay > 0:
-    (a.ytRetry, a.ytRetryAt) = (url, now() + delay)
+    (a.ytRetry, a.ytRetryAt, a.ytRetryNet) = (url, now() + delay, false)
   elif url.len > 0 and a.ytCurrentLink == url:
     if a.streamArgs.url == url: a.streamLink(url, a.streamArgs.start, a.streamArgs.opts)
     else: a.playIndex(a.plIndex)
@@ -3843,9 +4514,14 @@ proc closeYtdlp(a: App) =
 const
   StreamTries = 2     ## a link's stream is tried again at once this many times
   StallTimeout = 20.0 ## a stream waiting this long for data without any is dropped
+  StallProbe = 2.0    ## one waiting this long has the network probed
+  ResumeGrace = 3.0   ## once it's back, mpv's own reconnecting gets this long
+                      ## (seconds) to bring the stream back before it's reopened
+  ProbeEvery = 1.0    ## seconds between network probes
   DropDelays = [0.0, 2, 4, 8, 15, 15, 15, 15, 15, 15]
     ## a dropped stream is reopened after each of these in turn (seconds),
-    ## the network maybe still coming back
+    ## the network maybe still coming back; at once when it answers again
+    ## after it didn't, never while it doesn't
 
 proc ytSignIn(a: App, url: string): bool =
   ## The link asked to sign in (or the browser yt-dlp signed in with didn't
@@ -3898,8 +4574,21 @@ proc reconnect(a: App, url: string) =
     a.ytFailed(url)
     return
   a.osd("Connection lost, reconnecting...", OsdError)
-  a.ytOpen(url, DropDelays[a.dropTries])
+  (a.ytRetry, a.ytRetryAt, a.ytRetryNet) = (url, now() + DropDelays[a.dropTries], true)
+  (a.netUp, a.netBackAt) = (0, 0.0)  # what it is now, not what it was
   inc a.dropTries
+
+proc probeNet(a: App, url: string) =
+  ## Keeps asking url's host whether the network's there (netUp).
+  if a.netProbe.poll():
+    a.netUp = if a.netProbe.up: 1 else: -1
+    if a.netUp < 0: (a.netWasDown, a.netBackAt) = (true, 0.0)
+    elif a.netWasDown and a.netBackAt == 0: a.netBackAt = now()
+  if a.netProbe.running or now() < a.netProbeAt: return
+  a.netProbeAt = now() + ProbeEvery
+  a.netProbe = probeHost(url)
+  if a.netProbe == nil and a.ytRetryNet:
+    a.ytRetryNet = false  # no curl: reopened after the delays alone
 
 proc ytInstall(a: App, msg: string) =
   a.ytJob = install()
@@ -3918,6 +4607,68 @@ proc addCaptions(a: App, url: string) =
   for c in a.ytCaptions.getOrDefault(url):
     a.player.h.commandAsync("sub-add", c.url, "auto", c.title, c.lang)
 
+proc addStyled(a: App, url: string) =
+  ## A link's styled subtitles, in the place of its plain ones in that language
+  ## (the automatic captions, in the same language, are something else; saved
+  ## files have their language in their name alone).
+  let p = a.player
+  p.refreshTracks()
+  for t in a.ytStyled.getOrDefault(url):
+    var (plain, selected, styled) = (0, false, false)
+    for old in p.tracks:
+      if old.kind != "sub" or not old.external or old.title.endsWith(" (automatic)") or
+         old.lang != t.lang and not old.file.splitFile.name.endsWith("." & t.lang): continue
+      if old.file.endsWith(".ass"): styled = true
+      else: (plain, selected) = (old.id, old.selected)
+    if styled: continue
+    if plain != 0: p.h.command("sub-remove", $plain)
+    # Not async: each would land whenever it's parsed, out of order in the menu.
+    p.h.command("sub-add", t.path, if selected: "select" else: "auto", t.title, t.lang)
+
+proc styleSaved(a: App, url: string) =
+  ## A saved link's subtitles, styled from now on where they can be.
+  if not a.saved.lookup(url).subsDone: return
+  for t in a.ytStyled.getOrDefault(url):
+    for f in a.entry(url).subs.mitems:
+      if f.endsWith(".ass") or not f.splitFile.name.endsWith("." & t.lang): continue
+      try:
+        copyFile(t.path, f.changeFileExt("ass"))
+        removeFile(f)
+        f = f.changeFileExt("ass")
+      except OSError, IOError: discard
+  a.saved.save()
+
+proc hookSubs(p: Player): seq[SubLink] =
+  ## The subtitles mpv's yt-dlp hook found, as srv3: there from the start,
+  ## where the lookup (captions) takes its time.
+  for t in p.tracks:
+    if t.kind == "sub" and t.external and "fmt=srt" in t.file and
+       not t.title.endsWith(" (automatic)"):
+      # Wrapped in an edl:// until it's first read.
+      let link = t.file[max(t.file.find("https://"), 0) .. ^1]
+      result.add (link.replace("fmt=srt", "fmt=srv3"), t.title, t.lang)
+
+proc startStyling(a: App, url: string) =
+  ## A link's styled subtitles: those found before, else the hook's.
+  let p = a.player
+  p.refreshTracks()
+  if url in a.ytStyled: a.addStyled(url)
+  elif a.ytStyling == nil or a.ytStyling.link != url:
+    a.ytStyling.cancel()
+    a.ytStyling = fetchStyled(url, p.hookSubs)
+
+proc pollStyled(a: App) =
+  let wasLoading = a.ytStyling.loading
+  let finished = a.ytStyling.poll()
+  if finished or a.ytStyling.loading != wasLoading:
+    a.dirtyUntil = max(a.dirtyUntil, now() + 0.1)  # the status bar's note
+  if not finished: return
+  let j = a.ytStyling
+  a.ytStyling = nil
+  a.ytStyled[j.link] = j.done
+  a.styleSaved(j.link)
+  if a.player.path == j.link and a.player.loaded: a.addStyled(j.link)
+
 proc pollYtList(a: App) =
   ## A YouTube playlist's videos, as yt-dlp finds them: those before the
   ## link's own video go before it, the rest after (a playlist alone: the
@@ -3932,6 +4683,7 @@ proc pollYtList(a: App) =
     inc a.ytListUsed
     let url = "https://www.youtube.com/watch?v=" & vid
     if dur > 0: a.mediaInfo.mgetOrPut(url, MediaInfo()).duration = dur
+    a.noteLink(url, title, MediaInfo(duration: dur))
     let at = a.playlist.find(if a.ytListLast.len > 0: a.ytListLast else: link)
     if at < 0 or a.playlistLocked:  # gone from the playlist meanwhile
       j.stop()
@@ -3947,10 +4699,15 @@ proc pollYtList(a: App) =
       a.ytListLast = url
       a.playIndex(at)
       continue
+    if url in a.playlist:  # brought back from a previous run, or listed before
+      if a.ytListLast.len > 0: a.ytListLast = url
+      continue
     let pos = if a.ytListLast.len > 0: at + 1 else: at
     a.playlist.insert(url, pos)
     if a.plIndex >= pos: inc a.plIndex
     if a.plSelected >= pos: inc a.plSelected
+    for m in a.plMarks.mitems:
+      if m >= pos: inc m
     if a.ytListLast.len > 0: a.ytListLast = url
   if j.running: return
   a.ytList = nil
@@ -3960,10 +4717,27 @@ proc pollYtList(a: App) =
   elif a.ytListUsed > 1 or id.len == 0:
     a.osd(&"Playlist: {a.ytListUsed} videos")
 
+proc goOnline(a: App, t: float, stopped = false)
+
+var traceAt = 0.0
 proc pollYtdlp(a: App) =
   let p = a.player
+  if existsEnv("MMP_TRACE") and now() - traceAt >= 0.5:
+    traceAt = now()
+    stderr.writeLine "TRACE ", formatFloat(epochTime(), ffDecimal, 2), " pos=", formatFloat(p.timePos, ffDecimal, 1),
+      " buf=", p.buffering, " ahead=", formatFloat(p.cacheAhead, ffDecimal, 1), " retry=", a.ytRetry.len > 0,
+      " net=", a.netUp, " drops=", a.dropTries, " opening=", p.opening
   a.pollYtList()
+  a.pollStyled()
   a.pollYtInfo()
+  a.readLinkInfos()
+  if not a.ytList.running and not a.ytInfo.running: a.saveLinkInfos()
+  if a.ytRetry.len > 0 and a.ytRetryNet:
+    a.probeNet(a.ytRetry)
+    # The network back after it was gone: at once. Gone: not yet, yt-dlp
+    # would only hang on it (and the stream wait for that once it's back).
+    if a.netUp > 0 and a.netWasDown: a.ytRetryAt = now()
+    elif a.netUp <= 0: a.ytRetryAt = max(a.ytRetryAt, now() + 0.1)
   if a.ytRetry.len > 0 and now() >= a.ytRetryAt:
     let url = a.ytRetry
     a.ytRetry = ""
@@ -3977,24 +4751,39 @@ proc pollYtdlp(a: App) =
   # from where it last played. So does one whose connection dropped (the
   # system slept, the network went away): mpv takes that for the stream's
   # end, well before the video's, or waits on it for data that never comes.
-  if p.loaded and p.source.len == 0 and p.path.isWebLink and p.path == a.streamArgs.url:
+  if p.loaded and p.source.len == 0 and p.path.isWebLink and p.path == a.streamArgs.url and
+      a.ytRetry.len == 0:  # not while it waits to reopen
+    # A seek that failed (the stream refused it, say): mpv goes to the end and
+    # pauses, which isn't the video over. The stream opens again at the spot.
+    if p.sought >= 0 and not p.seeking and (p.paused or p.eofReached) and
+       p.timePos >= p.duration - 1:
+      let t = p.sought
+      a.recordEnd()
+      a.goOnline(t)
+      return
     if not p.eofReached:
-      a.streamPos = p.timePos
+      a.streamPos = if p.sought >= 0: p.sought else: p.timePos
       # Played on fine since it was opened: tries count from here.
       if p.timePos > a.streamArgs.start + 30: a.ytTries = 0
-      if p.timePos > a.streamArgs.start + 5: a.dropTries = 0
+      if p.timePos > a.streamArgs.start + 5: (a.dropTries, a.netWasDown) = (0, false)
     let cutShort = p.eofReached and p.duration > 0 and p.timePos < p.duration - 5
     var stalled = false
     if (p.buffering or p.seeking) and not p.paused:
       if a.stallAt == 0 or p.cacheAhead > a.stallAhead + 0.5:
-        (a.stallAt, a.stallAhead) = (now(), p.cacheAhead)
-      stalled = now() - a.stallAt > StallTimeout
+        (a.stallAt, a.stallAhead, a.netUp, a.netBackAt) = (now(), p.cacheAhead, 0, 0.0)
+      # Waiting a while: the network asked whether it's there. Back after it
+      # was gone, mpv may reconnect by itself (the quickest); when it
+      # doesn't soon (its connection hung on the gone network), it's reopened.
+      if now() - a.stallAt > StallProbe: a.probeNet(p.path)
+      stalled = now() - a.stallAt > StallTimeout or
+        a.netBackAt > 0 and now() - a.netBackAt > ResumeGrace
     else: a.stallAt = 0
     if stalled or p.eofReached and not p.eofHandled and (p.streamError.len > 0 or cutShort):
       p.eofHandled = true
       a.stallAt = 0
       p.loadError =
         if p.streamError.len > 0: p.streamError
+        elif stalled and a.netBackAt > 0: "the network came back, the stream didn't"
         elif stalled: "no data for " & $int(StallTimeout) & " s"
         else: "the connection dropped"
       a.streamArgs.start = a.streamPos
@@ -4003,7 +4792,9 @@ proc pollYtdlp(a: App) =
   let link = a.ytCurrentLink
   if p.justLoaded and link.isWebLink:
     let mt = p.h.getStr("media-title")
-    if mt.len > 0 and mt != link: a.linkTitles[link] = mt
+    if mt.len > 0 and mt != link:
+      a.linkTitles[link] = mt
+      a.noteLink(link, mt)
   # The formats its stream came in (a saved part's are noted as it opens).
   if p.justLoaded and link.isWebLink and p.path == link and p.source.len == 0:
     let f = p.hookFormat
@@ -4011,8 +4802,8 @@ proc pollYtdlp(a: App) =
     let w = a.wants(link)
     if f.len > 0 and not a.picked(link):
       a.ytAuto[link] = f
-      if link in a.saved and a.saved[link].auto != f:
-        a.saved[link].setAuto(f)
+      if link.linkKey in a.saved and a.entry(link).auto != f:
+        a.entry(link).setAuto(f)
         a.saved.save()
     # Auto's video or audio, whichever played in Auto (yt-dlp picks each
     # alike whatever the other is).
@@ -4022,10 +4813,11 @@ proc pollYtdlp(a: App) =
       if w.video.len == 0: ap.video = parts[0]
       if w.audio.len == 0: ap.audio = parts[1]
       a.ytAutoParts[link] = ap
-      if link in a.saved and (a.saved[link].autoVideo, a.saved[link].autoAudio) != ap:
-        (a.saved[link].autoVideo, a.saved[link].autoAudio) = ap
+      if link.linkKey in a.saved and (a.entry(link).autoVideo, a.entry(link).autoAudio) != ap:
+        (a.entry(link).autoVideo, a.entry(link).autoAudio) = ap
         a.saved.save()
   if p.justLoaded and not a.reopening and link.isWebLink and findYtdlp(a.cfg.ytdlp).len > 0:
+    a.startStyling(link)
     if link in a.ytCaptions: a.addCaptions(link)
     elif not a.ytCaps.running:
       a.ytCaps = captions(findYtdlp(a.cfg.ytdlp), link, a.ytCookies.getOrDefault(link))
@@ -4034,9 +4826,13 @@ proc pollYtdlp(a: App) =
     a.ytCaps = nil
     if j.code == 0:
       a.ytCaptions[j.url] = j.originalCaptions
+      # A saved link has no hook subtitles to go by.
+      if j.url notin a.ytStyled and not a.ytStyling.running:
+        a.ytStyling = fetchStyled(j.url, j.styledSubs)
       a.ytQualities[j.url] = j.qualities
-      if j.url in a.saved:
-        (a.saved[j.url].videoQ, a.saved[j.url].audioQ) = j.qualities
+      a.ytBoards[j.url] = j.storyboard
+      if j.url.linkKey in a.saved:
+        (a.entry(j.url).videoOffers, a.entry(j.url).audioOffers) = j.qualities
         a.saved.save()
       # A lock it opened without knowing them (the middle audio row) now
       # knows what it stands for: in it, once (the formats are found once).
@@ -4232,9 +5028,9 @@ proc rendererNote(): string =
   if restartedOnto() == "gpu": "GPU memory is free again: rendering on the GPU"
   elif not cpuWanted: ""
   elif not softwareGl: "Software rendering unavailable: decoding on the CPU only"
+  elif not startedLow: (if restartedOnto() == "cpu": "Rendering on the CPU" else: "")  # Always CPU
   elif restartedOnto() == "cpu": "GPU out of memory: rendering on the CPU"
-  elif startedLow: "GPU memory is full: rendering on the CPU until it frees up"
-  else: ""
+  else: "GPU memory is full: rendering on the CPU until it frees up"
 
 # --- online videos kept on disk ----------------------------------------------
 # A link streaming is saved as it plays, a file for each stretch read without
@@ -4246,8 +5042,6 @@ const
   HandoffLead = 30.0    ## the stream opens this long before the saved part ends, media seconds
   HandoffMargin = 0.5   ## and takes over this long before its end
   RecordMin = 2.0       ## a stream's new part worth saving, seconds
-
-proc entry(a: App, url: string): var Saved = a.saved.mgetOrPut(url, Saved())
 
 proc webLimits(a: App): Limits =
   Limits(hours: (if a.cfg.webKeepOn: a.cfg.webKeepHours.float else: 0),
@@ -4268,25 +5062,35 @@ proc trackOpts(a: App, url: string): seq[string] =
   let p = a.player
   let aid = p.selectedTrack("audio")
   result.add "aid=" & (if aid == 0: "no" else: $aid)
-  if a.saved.getOrDefault(url).subsDone:  # numbered alike only then
-    let sid = p.selectedTrack("sub")
+  if a.saved.lookup(url).subsDone:  # numbered alike only then
+    var sid = p.selectedTrack("sub")
+    for t in p.tracks:  # but for a styled track put in later (addStyled)
+      if t.id == sid and t.file.endsWith(".ass"):
+        for i, f in a.saved.lookup(url).subs:
+          if f.splitFile.name.endsWith("." & t.lang): sid = i + 1
     result.add "sid=" & (if sid == 0: "no" else: $sid)
+
+proc holdFrame(a: App)
 
 proc goOnline(a: App, t: float, stopped = false) =
   ## From a link's saved part to its stream at t, the same tracks chosen
-  ## (`stopped`: there, stopped).
+  ## (`stopped`: there, stopped). As with another quality, the frame, the
+  ## window and the seek bar stay up meanwhile.
   let p = a.player
   a.handoffOff()
   let url = p.path
+  let dur = p.duration
   var opts = a.streamOpts(url) & a.trackOpts(url)
   if t <= 0: opts.add "start=0"  # not the link's own (t=...)
   if stopped: opts.add "pause=yes"
+  if not stopped: a.holdFrame()
+  a.qualitySwitch = true
   a.stopOnLoad = stopped
   a.ytTries = 0
   a.dropTries = 0
   a.streamLink(url, t, opts.join(","))
-
-proc holdFrame(a: App)
+  p.duration = max(p.duration, dur)
+  p.keepTime = true
 
 proc switchQuality(a: App, url: string) =
   ## The link playing goes on in the quality it wants now (wants) from where
@@ -4326,6 +5130,26 @@ proc pickQuality(a: App, url: string, video, audio: string) =
   a.ytPick[url] = (video, audio)
   a.switchQuality(url)
 
+proc pickLang(a: App, url, lang: string) =
+  ## Audio Track's pick of a link's languages: the link goes on in it, in the
+  ## row of its qualities the one picked was in (Auto stays Auto), heard even
+  ## if its audio was off.
+  let p = a.player
+  let all = a.qualitiesOf(url).audio
+  if p.path != url or all.len == 0: return
+  let row = a.audioRows(url).mapIt(it.id).find(a.ytPick.getOrDefault(url).audio)
+  if lang == all[0].lang: a.ytLang.del(url) else: a.ytLang[url] = lang
+  if row >= 0:
+    let rows = a.audioRows(url)
+    a.ytPick[url].audio = rows[min(row, rows.high)].id
+  if p.selectedTrack("audio") == 0:
+    for t in p.tracks.mitems:
+      if t.kind == "audio":
+        t.selected = true  # as mpv says soon: the link may reopen before it does
+        a.setTrack("aid", t.id)
+        break
+  a.switchQuality(url)
+
 proc webHandoff(a: App) =
   ## While a link's saved part plays: the standby opens the stream a little
   ## before the part ends, to take over there (standbyStep, takeOver).
@@ -4359,7 +5183,7 @@ proc recordEnd(a: App) =
   # A dump that failed (mpv couldn't write a track) leaves a file that would
   # play without it, if at all: the link streams again next time instead.
   if a.player.dumpFailed or a.rec.stop - a.rec.start < 1:
-    if a.player.dumpFailed and url in a.saved:  # written now and then (recordStep)
+    if a.player.dumpFailed and url.linkKey in a.saved:  # written now and then (recordStep)
       a.entry(url).segs.keepItIf(it.file != a.rec.file)
       a.saved.save()
     try: removeFile(a.rec.file)
@@ -4410,8 +5234,8 @@ proc recordStep(a: App) =
   let format = a.playFormat.getOrDefault(link)
   if format.len == 0 and a.picked(link): return
   # Worth it once it reaches past what's saved there in that quality.
-  let c = a.saved.getOrDefault(link).inFormat(
-    if format.len > 0: format else: a.saved.getOrDefault(link).auto).chainAt(cur[0])
+  let c = a.saved.lookup(link).inFormat(
+    if format.len > 0: format else: a.saved.lookup(link).auto).chainAt(cur[0])
   let have = if c.stop > c.start: c.stop else: cur[0]
   if cur[1] >= have + RecordMin:
     let r = cur
@@ -4428,7 +5252,7 @@ proc recordStep(a: App) =
     if link in a.ytAutoParts:
       (a.entry(link).autoVideo, a.entry(link).autoAudio) = a.ytAutoParts[link]
     if link in a.ytQualities:
-      (a.entry(link).videoQ, a.entry(link).audioQ) = a.ytQualities[link]
+      (a.entry(link).videoOffers, a.entry(link).audioOffers) = a.ytQualities[link]
     let title = p.h.getStr("media-title")
     if title.len > 0 and title != link: a.entry(link).title = title
     if a.entry(link).chapters.len == 0 and p.chapters.len > 0:
@@ -4458,13 +5282,14 @@ proc pollWebSave(a: App) =
       a.entry(j.url).subs = j.subs
       a.entry(j.url).subsDone = true
       a.saved.save()
+      a.styleSaved(j.url)
 
 proc dropSaved(a: App, urls: seq[string]) =
   ## Deletes links' saved files (Options > Playback > Media Cache); one playing from
   ## them goes on streaming.
   let p = a.player
-  if a.recUrl in urls: a.recordEnd()
-  if p.partEnd > 0 and p.path in urls: a.goOnline(p.posNow, p.stopped)
+  if a.recUrl.len > 0 and a.recUrl.linkKey in urls: a.recordEnd()
+  if p.partEnd > 0 and p.path.linkKey in urls: a.goOnline(p.posNow, p.stopped)
   a.saved.drop(urls)
 
 proc refreshWebInfo(a: App) =
@@ -4515,7 +5340,7 @@ proc recentName(a: App, path: string): string =
   ## An Open Recent entry's name: "title [id]" for a link.
   if not path.isWebLink: return path.extractFilename
   var title = a.linkTitles.getOrDefault(path, a.cfg.recentTitles.getOrDefault(path))
-  if title.len == 0: title = a.saved.getOrDefault(path).title
+  if title.len == 0: title = a.saved.lookup(path).title
   var id = path.youtubeId
   if id.len == 0: id = path.youtubeList
   if title.len == 0: return path
@@ -4667,7 +5492,7 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
 
   # Play
   let play = root.sub("Play")
-  play.item(if p.playing: "Pause" else: "Play", k(kaPlayPause),
+  play.item(if p.playing or a.padRunning: "Pause" else: "Play", k(kaPlayPause),
     enabled = loaded or a.cfg.recentFiles.len > 0,
     action = proc () = a.playPause())
   play.item("Stop", k(kaStop), enabled = loaded, action = proc () = a.stop())
@@ -4695,14 +5520,29 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
   play.sep()
   var trackMenus: seq[MenuNode]
   let selectTrack = proc (pt: (string, int)) = a.setTrack(pt[0], pt[1])
+  let selectLang = proc (lang: string) =
+    a.pickLang(a.player.path, lang)
   for (title, kind, prop) in [("Audio Track", "audio", "aid"),
                               ("Subtitle Track", "sub", "sid"),
                               ("Video Track", "video", "vid")]:
     let m = play.sub(title, enabled = loaded)
     trackMenus.add m
-    m.radio("None", "", p.selectedTrack(kind) == 0, action = bindAct(selectTrack, (prop, 0)))
+    # A link's languages stand for its one audio track: it comes in one at a
+    # time. Audio loaded from a file is listed still.
+    let langs = if kind == "audio" and p.path.isWebLink: audioLanguages(a.qualitiesOf(p.path).audio)
+                else: @[]
+    let dubbed = langs.len > 1
+    let opening = dubbed and not p.tracks.anyIt(it.kind == "audio")  # in another one, perhaps
+    m.radio("None", "", p.selectedTrack(kind) == 0 and not opening,
+      action = bindAct(selectTrack, (prop, 0)))
+    if dubbed:
+      let lang = a.audioRows(p.path)[0].lang
+      let heard = opening or p.tracks.anyIt(it.kind == "audio" and it.selected and not it.loadedFile)
+      for l in langs:
+        m.radio(if l.langName.len > 0: l.langName else: "Unknown", "", heard and l.lang == lang,
+          action = bindAct(selectLang, l.lang))
     for t in p.tracks:
-      if t.kind == kind:
+      if t.kind == kind and (not dubbed or t.loadedFile):
         m.radio(t.trackLabel, "", t.selected, action = bindAct(selectTrack, (prop, t.id)))
   play.sep()
   let vol = play.sub("Volume")
@@ -4801,6 +5641,15 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
 
   # Right-click menu, built from the bar's nodes.
   let ctx = newMenuRoot()
+  # Only for audio files: not links (YouTube's have a thumbnail item of their
+  # own) nor videos, even with their video track turned off.
+  if loaded and not a.player.path.contains("://") and
+     not p.tracks.anyIt(it.kind == "video" and not it.albumArt):
+    ctx.check("Show Front Cover", checked = a.cfg.showCover, action = proc () =
+      a.cfg.showCover = not a.cfg.showCover
+      a.cfg.save()
+      a.syncSettings())
+    ctx.sep()
   # Items about the opened link, in one group.
   let isYoutube = a.plIndex in 0 ..< a.playlist.len and a.playlist[a.plIndex].youtubeId.len > 0
   if loaded and a.player.path.contains("://"):
@@ -4868,6 +5717,13 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
     let i = a.ctxBookmark
     let on = i >= 0 and i < a.fileBookmarks.len
     let (t, bt) = (a.ctxSeekT, if on: a.fileBookmarks[i].time else: 0.0)
+    if a.plIndex in 0 ..< a.playlist.len and a.playlist[a.plIndex].youtubeId.len > 0:
+      # Not at Options > Online's Lowest Quality, which downloads no thumbnails.
+      sb.check("Preview YouTube Videos", checked = a.cfg.ytSeekPreview,
+        enabled = a.cfg.seekPreview and a.cfg.streamQuality != sqLowest, action = proc () =
+          a.cfg.ytSeekPreview = not a.cfg.ytSeekPreview
+          a.cfg.save())
+      sb.sep()
     sb.item("Add Bookmark", enabled = loaded and not on, action = proc () = a.addBookmark(t))
     sb.item("Edit Bookmark...", enabled = on, action = proc () = a.showRename(i))
     sb.item("Remove Bookmark", enabled = on, action = proc () = a.removeBookmark(bt))
@@ -4896,7 +5752,7 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
     let q = newMenuRoot()
     q.columns = true
     let url = a.player.path
-    let w = a.wants(url)
+    let w = a.chosen(url)
     let found = a.qualitiesOf(url)
     let looking = not found.known and a.ytCaps.running and a.ytCaps.url == url
     let pickVideo = proc (id: string) =
@@ -4906,7 +5762,7 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
     # Locking picks it for this link too; unlocking keeps this link as it is.
     let lockVideo = proc (x: Quality) =  # x.label: what's locked
       if a.cfg.streamLockVideo == x.label:
-        let cur = a.wants(url).video
+        let cur = a.chosen(url).video
         if not cur.startsWith("~"):
           a.ytPick.mgetOrPut(url, ("", "")).video = if cur.len > 0: cur else: "auto"
         a.cfg.streamLockVideo = ""
@@ -4914,11 +5770,12 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
         pickVideo(x.id)
         a.cfg.streamLockVideo = x.label
       a.cfg.save()
-    let rows = found.audio.len
+    let audio = a.audioRows(url)
+    let rows = audio.len
     let lockAudio = proc (x: Quality) =  # x.label: "auto" or a rank
       let lk = a.cfg.streamLockAudio
       if lk == x.label or lk in AudioRanks and rankRow(lk, rows) == rankRow(x.label, rows):
-        let cur = a.wants(url).audio
+        let cur = a.chosen(url).audio
         if not cur.startsWith("~"):
           a.ytPick.mgetOrPut(url, ("", "")).audio = if cur.len > 0: cur else: "auto"
         a.cfg.streamLockAudio = ""
@@ -4928,15 +5785,15 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
       a.cfg.save()
     let vc = q.column("Video")
     vc.radio("Auto", checked = w.video.len == 0, action = bindAct(pickVideo, "auto"),
-      lock = bindAct(lockVideo, ("auto", "auto")), locked = a.cfg.streamLockVideo == "auto")
+      lock = bindAct(lockVideo, ("auto", "auto", "", "")), locked = a.cfg.streamLockVideo == "auto")
     for x in found.video:
       vc.radio(x.label, checked = w.video == x.id, action = bindAct(pickVideo, x.id),
         lock = bindAct(lockVideo, x), locked = a.cfg.streamLockVideo == x.label)
     if looking: vc.item("...", enabled = false)
     let ac = q.column("Audio")
     ac.radio("Auto", checked = w.audio.len == 0, action = bindAct(pickAudio, "auto"),
-      lock = bindAct(lockAudio, ("auto", "auto")), locked = a.cfg.streamLockAudio == "auto")
-    for i, x in found.audio:
+      lock = bindAct(lockAudio, ("auto", "auto", "", "")), locked = a.cfg.streamLockAudio == "auto")
+    for i, x in audio:
       # Only the rows a rank stands for take a lock, so it sits where it means.
       var rank = ""
       for r in ["highest", "lowest", "mid"]:  # two rows: the second is the lowest
@@ -4944,7 +5801,7 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
       if rank.len > 0:
         let lk = a.cfg.streamLockAudio
         ac.radio(x.label, checked = w.audio == x.id, action = bindAct(pickAudio, x.id),
-          lock = bindAct(lockAudio, (x.id, rank)),
+          lock = bindAct(lockAudio, (x.id, rank, "", "")),
           locked = lk in AudioRanks and rankRow(lk, rows) == i)
       else:
         ac.radio(x.label, checked = w.audio == x.id, action = bindAct(pickAudio, x.id))
@@ -4965,11 +5822,10 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
   of cmPlaylist:
     let pl = newMenuRoot()
     let n = a.playlist.len
-    let sel = a.plSelected
-    let hasSel = sel >= 0 and sel < n
+    let hasSel = a.plSelection.len > 0
     let edit = not locked
     if hasSel:
-      let path = a.playlist[sel]
+      let path = a.playlist[a.plSelected]
       pl.item("Open Containing Directory", enabled = not path.contains("://"),
         action = proc () = a.showInFolder(path))
       pl.sep()
@@ -4979,17 +5835,21 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
           filterName = "Media files"))
     pl.item("Remove Media File", k(kaRemoveFromPlaylist), enabled = hasSel and edit, action = proc () =
       a.removeSelected())
+    pl.item("Duplicate", "Ctrl+D", enabled = hasSel and edit, action = proc () =
+      a.duplicateSelected())
     pl.sep()
-    let sortBy = proc (by: PlaylistSort) = a.sortPlaylist(by)
-    for (label, by) in [("Sort by A-Z", psName), ("Sort by Duration", psDuration),
-                        ("Sort by Dimensions", psDimensions), ("Sort by Size", psSize)]:
+    let sortBy = proc (by: PlaylistField) = a.sortPlaylist(by)
+    for (label, by) in [("Sort by A-Z", pfName), ("Sort by Duration", pfDuration),
+                        ("Sort by Dimensions", pfDimensions), ("Sort by Size", pfSize)]:
       pl.item(label, enabled = n > 1 and edit, action = bindAct(sortBy, by))
     pl.sep()
-    let moveTo = proc (i: int) = a.moveSelected(i)
-    pl.item("Move to Top", enabled = hasSel and sel > 0 and edit, action = bindAct(moveTo, 0))
-    pl.item("Move Up", enabled = hasSel and sel > 0 and edit, action = bindAct(moveTo, sel - 1))
-    pl.item("Move Down", enabled = hasSel and sel < n - 1 and edit, action = bindAct(moveTo, sel + 1))
-    pl.item("Move to Bottom", enabled = hasSel and sel < n - 1 and edit, action = bindAct(moveTo, n - 1))
+    let moveTo = proc (m: PlaylistMove) = a.moveSelected(m)
+    let up = a.canMove(true) and edit
+    let down = a.canMove(false) and edit
+    pl.item("Move to Top", "Ctrl+Shift+Home", enabled = up, action = bindAct(moveTo, pmTop))
+    pl.item("Move Up", "Ctrl+Shift+Up", enabled = up, action = bindAct(moveTo, pmUp))
+    pl.item("Move Down", "Ctrl+Shift+Down", enabled = down, action = bindAct(moveTo, pmDown))
+    pl.item("Move to Bottom", "Ctrl+Shift+End", enabled = down, action = bindAct(moveTo, pmBottom))
     pl.sep()
     pl.item("Randomize", enabled = n > 1 and edit, action = proc () = a.randomizePlaylist())
     pl.sep()
@@ -4997,13 +5857,26 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
     pl.item("Load Playlist...", enabled = edit, action = proc () = a.loadPlaylistDialog())
     pl.sep()
     pl.item("Clear", enabled = n > 0 and edit, action = proc () = a.clearPlaylist())
+    pl.sep()
+    pl.check("Cursor follows playback", checked = a.cfg.playlistCursorFollows, action = proc () =
+      a.cfg.playlistCursorFollows = not a.cfg.playlistCursorFollows)
     (root, pl)
   of cmPlaylistColumns:
     let cols = newMenuRoot()
-    cols.check("Size", checked = a.cfg.playlistShowSize, action = proc () =
-      a.cfg.playlistShowSize = not a.cfg.playlistShowSize)
-    cols.check("Dimensions", checked = a.cfg.playlistShowDimensions, action = proc () =
-      a.cfg.playlistShowDimensions = not a.cfg.playlistShowDimensions)
+    if a.ctxColumn == pfDuration:
+      cols.check("Show milliseconds", checked = a.cfg.playlistShowMillis, action = proc () =
+        a.cfg.playlistShowMillis = not a.cfg.playlistShowMillis
+        a.cfg.save())
+      cols.sep()
+    let toggle = proc (f: PlaylistField) =
+      let at = a.cfg.playlistColumns.find(f)
+      if at >= 0: a.cfg.playlistColumns.delete(at)
+      else: a.cfg.playlistColumns.add f
+    let shown = a.cfg.playlistColumns
+    for f in PlaylistField:
+      # The last column left stays: the header is what brings the others back.
+      cols.check(PlaylistFields[f].label, checked = f in shown,
+        enabled = f notin shown or shown.len > 1, action = bindAct(toggle, f))
     (root, cols)
 
 # --- keyboard ---------------------------------------------------------------
@@ -5393,6 +6266,7 @@ proc handleKeys(a: App) =
       setClipboardString(sel)
       a.osd("Copied the selected text")
       return
+  if a.playlistKeys(): return
 
   let (ok, act) = a.cfg.pressedAction(w)
   if ok: a.runAction(act)
@@ -5445,7 +6319,7 @@ proc updateOsdApart(a: App) =
   while mpv_wait_event(l.h, 0).eventId != evNone: discard  # nothing to act on
   let p = a.player
   let apart = p.hasVideo and not p.stopped and not p.isSpherical and
-    (a.xf != VideoTransform() or a.lfOn)  # loop frames hold no OSD
+    (a.xf != VideoTransform() or a.lfOn or a.sfShow >= 0)  # loop and step frames hold no OSD
   if apart != a.osdApart:
     a.osdApart = apart
     a.osdStatus = ""
@@ -5497,10 +6371,11 @@ proc drawOsdLayer(a: App, area: Rect, fb: IVec2) =
   a.quad.draw(a.osdLayer.target.tex, rectCorners(r.xy, r.wh), fb.vec2, premul = true)
 
 proc zoomAt(a: App, area: Rect, at: Vec2, notches: float32) =
-  ## Ctrl+Wheel: zooms by the Resize step per notch (up = in), keeping the
-  ## point under the cursor in place. `area` and `at` are window pixels.
-  ## Zooming out stops once the (rotated) frame touches the window from
-  ## inside, and the pan shrinks so the frame ends up centered there.
+  ## Ctrl+Wheel: zooms by the Resize step per notch (up = in). Zooming in
+  ## keeps the point under the cursor in place; zooming out keeps the window
+  ## center's. `area` and `at` are window pixels. Zooming out stops once the
+  ## (rotated) frame touches the window from inside, and the pan shrinks so
+  ## the frame ends up centered there.
   let step = 1 + a.cfg.sizeStep.float32 / 100
   var z = clamp(a.xf.zoom * pow(step, -notches), 0.05, 50)
   let c = area.xy + area.wh / 2
@@ -5517,11 +6392,16 @@ proc zoomAt(a: App, area: Rect, at: Vec2, notches: float32) =
     if z <= floorZ:
       z = floorZ
       if a.xf.zoom == z and a.xf.pan == vec2(0, 0): return
-    # Pull the pan toward the center in step with the zoom so the frame
-    # lands centered exactly when it reaches the touching size.
+    # Anchored at the window center (a cursor anchor slides the picture
+    # sideways while it shrinks), with an edge that reaches the window's
+    # staying on it. Never less than a pull in step with the zoom, so the
+    # frame lands centered exactly when it reaches the touching size.
     let t = if a.xf.zoom > floorZ: (z - floorZ) / (a.xf.zoom - floorZ) else: 0'f32
     let k = z / a.xf.zoom
-    a.xf.pan = (at + (c + a.xf.pan - at) * k - c) * t
+    let lim = vec2(max(0'f32, bw * k - area.w) / 2, max(0'f32, bh * k - area.h) / 2)
+    for i in 0 .. 1:
+      let p = a.xf.pan[i]
+      a.xf.pan[i] = sgn(p).float32 * min(abs(p * k), max(lim[i], abs(p * t)))
   else:
     let k = z / a.xf.zoom
     a.xf.pan = at + (c + a.xf.pan - at) * k - c
@@ -5822,6 +6702,35 @@ proc pollThumbnail(a: App) =
   elif a.thumb.poll():
     a.dirtyUntil = max(a.dirtyUntil, now() + 0.1)
 
+proc wantedBoard(a: App): string =
+  ## The YouTube video id whose storyboard the seek bar previews, "" for none:
+  ## a link playing, unless turned off or at Options > Online's Lowest Quality.
+  ## Files have their frames (a link saved plays from one).
+  if not a.cfg.seekPreview or not a.cfg.ytSeekPreview or a.cfg.streamQuality == sqLowest: return
+  let p = a.player
+  if a.preview == nil or not p.loaded or not p.path.contains("://"): return
+  a.ytCurrentLink.youtubeId
+
+proc shownBoard(a: App): BoardJob =
+  ## The storyboard the seek bar previews now, nil for none.
+  let id = a.wantedBoard
+  if id.len > 0 and a.board != nil and a.board.id == id: a.board else: nil
+
+proc pollBoard(a: App) =
+  let id = a.wantedBoard
+  if id.len == 0:
+    if a.board != nil:  # turned off meanwhile: no more downloading
+      a.board.cancel()
+      a.board = nil
+    return
+  if a.board == nil or a.board.id != id:
+    let sb = a.ytBoards.getOrDefault(a.ytCurrentLink)
+    if sb.sheets.len > 0:
+      a.board.cancel()
+      a.board = fetchBoard(id, sb)
+  elif a.board.poll():
+    a.dirtyUntil = max(a.dirtyUntil, now() + 0.1)
+
 proc drawThumbnail(a: App, area: Rect, fb: IVec2) =
   ## The thumbnail, fit in the frame.
   if not a.thumbShown: return
@@ -5882,6 +6791,7 @@ proc drawVideo(a: App, area: Rect, fb: IVec2) =
     a.player.render.render(a.player.target)
   a.renderStandby()
   a.takeLoopFrames(tw, th)
+  a.takeStepFrames(tw, th)
   a.renderOsdLayer(area)
   glEnable(GL_SCISSOR_TEST)
   glScissor(GLint(area.x), GLint(fb.y.float32 - area.y - area.h), GLsizei(area.w), GLsizei(area.h))
@@ -5895,6 +6805,9 @@ proc drawVideo(a: App, area: Rect, fb: IVec2) =
   let tex = if a.lfShow >= 0 and a.lfShow < a.lfFrames.len and
                 a.lfFrames[a.lfShow].target.w == tw and a.lfFrames[a.lfShow].target.h == th:
               a.lfFrames[a.lfShow].target.tex
+            elif a.sfShow >= 0 and a.sfShow < a.sfFrames.len and
+                 a.sfFrames[a.sfShow].target.w == tw and a.sfFrames[a.sfShow].target.h == th:
+              a.sfFrames[a.sfShow].target.tex
             else: a.player.target.tex
   a.videoCorners = transformedCorners(center + shift, quadSize, a.xf.rotation)
   a.quad.draw(tex, a.videoCorners, fb.vec2)
@@ -5917,13 +6830,13 @@ proc drawPreview(a: App, fb: IVec2) =
 proc seekBarContext(a: App, pos: Vec2) =
   ## Opens the seek bar's context menu for the point pos on it.
   let r = a.seekRect
-  let (x0, w, dur) = (r.x + 12, r.w - 24, a.player.duration)
+  let (x0, w, dur, span) = (r.x + 12, r.w - 24, a.player.duration, a.seekSpan)
   if dur <= 0 or not a.player.loaded: return
-  a.ctxSeekT = clamp((pos.x - x0) / w, 0, 1) * dur
+  a.ctxSeekT = min(clamp((pos.x - x0) / w, 0, 1) * span, dur)
   a.ctxBookmark = -1
   var best = max(a.cfg.snapDistance, 4)
   for i, b in a.fileBookmarks:
-    let d = abs(x0 + w * (b.time / dur) - pos.x)
+    let d = abs(x0 + w * (b.time / span) - pos.x)
     if d <= best:
       best = d
       a.ctxBookmark = i
@@ -5935,13 +6848,29 @@ proc seekBarContext(a: App, pos: Vec2) =
   if a.hasLoopA: times.add a.loopA
   if a.hasLoopB: times.add a.loopB
   for mt in times:
-    let d = abs(x0 + w * (mt / dur) - pos.x)
+    let d = abs(x0 + w * (mt / span) - pos.x)
     if d < best or (d <= best and not a.ctxOnMarker):
       best = d
       a.ctxOnMarker = true
       a.ctxMarkerT = mt
   a.ctxMenu = cmSeekBar
   a.menus.openContext(pos)
+
+const SkipMin = 0.25  ## a hole in a link's download worth showing, seconds
+
+proc heldRanges(a: App): seq[(float, float)] =
+  ## What's at hand of what's playing, in order and joined: mpv's cache and,
+  ## for a link, what's been saved of it in the quality it plays in.
+  let p = a.player
+  var spans = p.buffered
+  if p.path.isWebLink:
+    for g in a.savedIn(p.path).segs: spans.add (g.start, g.stop)
+    if a.recUrl == p.path: spans.add (a.rec.start, a.rec.stop)
+  spans.sort(proc (x, y: (float, float)): int = cmp(x[0], y[0]))
+  for s in spans:
+    if result.len > 0 and s[0] <= result[^1][1] + SkipMin:
+      result[^1][1] = max(result[^1][1], s[1])
+    else: result.add s
 
 proc seekBar(a: App, r: Rect) =
   let ui = a.ui
@@ -5952,30 +6881,62 @@ proc seekBar(a: App, r: Rect) =
   let w = r.w - 24
   let cy = r.y + r.h / 2
   let dur = p.duration
+  # A short file's delay takes up the bar past its end.
+  let pad = if a.padLen > 0: a.padLen else: a.shortAudioPad
+  let span = dur + pad
+  a.seekSpan = span
   let active = a.seekDragging
   # The bar spans the window's width, so leaving it sideways leaves the window
   # too, and Windy keeps reporting the last pointer position from inside it.
   let mouseIn = ui.fakeMouse.x >= 0 or a.window.mouseInside
   let hov = (ui.hover(r) and mouseIn or active) and dur > 0 and p.loaded
   let th = if hov: 6'f32 else: 4'f32
-  ui.rect(rect(x0, cy - th / 2, w, th), colTrack)
+  let endX = if span > 0: round(x0 + w * (dur / span)) else: x0 + w
+  ui.rect(rect(x0, cy - th / 2, endX - x0, th), colTrack)
+  let held = a.heldRanges
   if dur > 0 and p.loaded:
     # What has been read ahead, beneath the played part.
-    for (bs, be) in p.buffered:
-      let bx = x0 + w * clamp(bs / dur, 0, 1)
-      ui.rect(rect(bx, cy - th / 2, x0 + w * clamp(be / dur, 0, 1) - bx, th), colBuffered)
-  let cur = if active: a.seekDragT else: p.timePos
-  let frac = if dur > 0: clamp(cur / dur, 0, 1) else: 0
-  ui.rect(rect(x0, cy - th / 2, w * frac, th), colAccent)
+    for (bs, be) in held:
+      let bx = x0 + w * clamp(bs / span, 0, 1)
+      ui.rect(rect(bx, cy - th / 2, x0 + w * clamp(be / span, 0, 1) - bx, th), colBuffered)
+  let cur = if active: a.seekDragT
+            elif a.padLen > 0: dur + a.padElapsed
+            elif pad > 0 and p.eofReached: dur
+            else: p.timePos
+  let frac = if dur > 0: clamp(cur / span, 0, 1) else: 0
+  ui.rect(rect(x0, cy - th / 2, min(w * frac, endX - x0), th), colAccent)
+  if dur > 0 and p.loaded and p.path.isWebLink:
+    # What a link's download jumped over, up to as far as it got: stripes, in
+    # the played part's color left of the knob.
+    let reach = max(p.timePos, if held.len > 0: held[^1][1] else: 0)
+    var at = 0.0
+    for (bs, be) in held & @[(reach, reach)]:
+      if bs - at >= SkipMin:
+        let (lx, rx) = (x0 + w * clamp(at / span, 0, 1), x0 + w * clamp(bs / span, 0, 1))
+        let zone = rect(lx, cy - th / 2, rx - lx, th)
+        ui.rect(zone, colTrack)
+        ui.stripes(zone, colTextDisabled)
+        if x0 + w * frac > lx:
+          ui.stripes(rect(lx, zone.y, min(x0 + w * frac, rx) - lx, th), colAccent)
+      at = max(at, be)
+  if pad > 0 and dur > 0 and p.loaded:
+    # Past the "]" the audio has ended: stripes that fill as the delay runs.
+    let zone = rect(endX, cy - th / 2, x0 + w - endX, th)
+    ui.stripes(zone, colTextDisabled)
+    if x0 + w * frac > endX:
+      ui.stripes(rect(endX, zone.y, x0 + w * frac - endX, th), colAccent)
+    ui.rect(rect(endX - 1, cy - 7, 2, 14), colText)
+    ui.rect(rect(endX - 5, cy - 7, 4, 2), colText)
+    ui.rect(rect(endX - 5, cy + 5, 4, 2), colText)
 
   # A-B loop: the looped span when active, and each mark set.
   if dur > 0 and p.loaded:
     if a.abLoop and a.loopReady:
-      let (lx, rx) = (x0 + w * (a.loopA / dur), x0 + w * (a.loopB / dur))
+      let (lx, rx) = (x0 + w * (a.loopA / span), x0 + w * (a.loopB / span))
       ui.rect(rect(lx, cy + th / 2 + 2, rx - lx, 2), colLoop)
     for (has, lt) in [(a.hasLoopA, a.loopA), (a.hasLoopB, a.loopB)]:
       if has:
-        let lx = round(x0 + w * (lt / dur))
+        let lx = round(x0 + w * (lt / span))
         ui.rect(rect(lx - 1, cy - 9, 2, 18), colLoop)
 
   # Markers: chapters, bookmarks and loop marks, all snapped to. Loop marks
@@ -5996,11 +6957,11 @@ proc seekBar(a: App, r: Rect) =
   var t = 0.0
   var snapped = -1
   if hov or pinned:
-    t = clamp((mx - x0) / w, 0, 1) * dur
+    t = min(clamp((mx - x0) / w, 0, 1) * span, dur)
     if a.cfg.snapWithShift == a.window.shift:
       var best = a.cfg.snapDistance
       for i, m in markers:
-        let d = abs(x0 + w * (m[0] / dur) - mx)
+        let d = abs(x0 + w * (m[0] / span) - mx)
         if d <= best:
           best = d
           snapped = i
@@ -6008,7 +6969,7 @@ proc seekBar(a: App, r: Rect) =
 
   for i, m in markers:
     if dur <= 0: break
-    let mx = round(x0 + w * (m[0] / dur))
+    let mx = round(x0 + w * (m[0] / span))
     let hl = i == snapped
     if m[3] and not hl: continue
     ui.rect(rect(mx - (if hl: 1.5 else: 1), cy - (if hl: 8 else: 6), (if hl: 3 else: 2), (if hl: 16 else: 12)),
@@ -6059,6 +7020,18 @@ proc seekBar(a: App, r: Rect) =
       boxW = max(boxW, pw + 8)
       a.preview.request(p.path, t)
       a.preview.target.ensureSize(int(pw * ui.scale), int(imgH * ui.scale))
+    var haveFrame = wantPreview
+    let board = if wantPreview: nil else: a.shownBoard
+    if board != nil:
+      # Once its sheet is in; the fetching goes left to right.
+      let pw = 224'f32
+      imgH = round(pw * board.board.height.float32 / board.board.width.float32)
+      boxW = max(boxW, pw + 8)
+      let (sheet, crop) = board.tile(t)
+      haveFrame = sheet.len > 0
+      if haveFrame:
+        a.preview.showImage(sheet, crop)
+        a.preview.target.ensureSize(int(pw * ui.scale), int(imgH * ui.scale))
     let boxH = ts.y + 8 + (if imgH > 0: imgH + 4 else: 0)
     var bx = clamp(mx - boxW / 2, 4, ui.size.x - boxW - 4)
     let by = r.y - boxH - 6
@@ -6073,7 +7046,7 @@ proc seekBar(a: App, r: Rect) =
     ui.border(rect(bx, by, boxW, boxH), colBorder)
     if imgH > 0:
       let q = rect(bx + (boxW - 224) / 2, by + 4, 224, imgH)
-      if a.preview.hasFrame:
+      if haveFrame and a.preview.hasFrame:
         a.previewQuad = q
         a.showPreview = true
       else:
@@ -6150,8 +7123,8 @@ proc controls(a: App, r: Rect) =
   template divider() =
     ui.rect(rect(x + 4, y + 6, 1, bh - 12), colBorder)
     x += CtlSepW
-  btn("play", "play", "Play", p.loaded or a.cfg.recentFiles.len > 0, p.playing): a.play()
-  btn("pause", "pause", "Pause", p.loaded, p.loaded and p.paused and not p.stopped): a.pause()
+  btn("play", "play", "Play", p.loaded or a.cfg.recentFiles.len > 0, p.playing or a.padRunning): a.play()
+  btn("pause", "pause", "Pause", p.loaded, p.loaded and p.paused and not p.stopped and not a.padRunning): a.pause()
   btn("stop", "stop", "Stop", p.loaded, p.stopped): a.stop()
   if tier < 4:
     divider()
@@ -6248,6 +7221,12 @@ proc modifierHints(a: App): seq[seq[KeyHint]] =
     if hints.len > 0: result.add hints
   if logSel and mods == {kmCtrl} and not result.anyIt(it.anyIt(it[1] == "Copy Selected Text")):
     result.add @[("C", "Copy Selected Text")]
+  # The playlist's own keys while it has the focus (playlistKeys).
+  if a.plFocused and a.cfg.showPlaylist and not a.playlistLocked:
+    if mods == {kmCtrl}: result.add @[("A", "Select All Entries"), ("D", "Duplicate Entries")]
+    elif mods == {kmCtrl, kmShift}:
+      result.add @[("Up/Down", "Move Entries"), ("Home/End", "Move Entries To Top/Bottom")]
+  let plShown = a.cfg.showPlaylist and not a.playlistLocked and a.playlist.len > 0
   var mouse: seq[KeyHint]
   if mods == {kmCtrl}:
     if a.player.isSpherical:
@@ -6255,6 +7234,7 @@ proc modifierHints(a: App): seq[seq[KeyHint]] =
       mouse = @[("Wheel", "Field Of View"),
         ("Drag", if a.cfg.sphereDragMovesWindow: "Look Around" else: "Move Window")]
     else: mouse = @[("Wheel", "Zoom At Cursor"), ("Drag", "Pan Zoomed Video")]
+    if plShown: mouse.add ("LMB", "Toggle Playlist Entry")
   elif mods == {kmAlt}: mouse = @[("MDrag", "Rotate Frame"), ("MMB", "Reset Rotation")]
   elif mods == {kmAlt, kmShift}: mouse = @[("MDrag", "Rotate In " & rot & " Steps")]
   elif mods == {kmCtrl, kmAlt}: mouse = @[("MDrag", "Rotate Around Cursor")]
@@ -6263,6 +7243,7 @@ proc modifierHints(a: App): seq[seq[KeyHint]] =
   elif mods == {kmShift}:
     mouse = @[("Drag", if a.cfg.snapWithShift: "Seek Snapping To Markers" else: "Seek Without Snapping")]
     if a.cfg.showRunLog and a.runLog.len > 0: mouse.add ("LMB", "Extend Log Selection")
+    if plShown: mouse.add ("LMB", "Select Playlist Range")
   # Mouse shortcuts lead the bar, before any key group.
   if mouse.len > 0: result.insert(mouse, 0)
 
@@ -6371,7 +7352,7 @@ proc status(a: App, r: Rect) =
     elif p.opening: "Opening..."
     elif not p.loaded: "Stopped"
     elif p.stopped: "Stopped"
-    elif p.paused: "Paused"
+    elif p.paused and not a.padRunning: "Paused"
     elif p.buffering: "Buffering"
     else: "Playing"
   var sw = ui.textSize(state, FontSmall).x
@@ -6383,6 +7364,12 @@ proc status(a: App, r: Rect) =
     ui.textIn(ahead, ar, colTextDim, FontSmall)
     ui.tip(ar, "Buffered ahead")
     sw += ar.w + 4
+  if a.ytStyling.loading and a.ytStyling.link == p.path:
+    let note = "Loading styled subtitles"
+    let nr = rect(r.x + 30 + sw + 8, r.y, ui.textSize(note, FontSmall).x + 4, r.h)
+    ui.textIn(note, nr, colTextDim, FontSmall)
+    ui.tip(nr, "The plain subtitles are shown until they're in")
+    sw += nr.w + 4
   if a.saveJob.running:
     let pc = a.saveJob.progress
     let (done, total) = a.saveJob.bytes
@@ -6454,36 +7441,122 @@ proc fmtSize(bytes: int64): string =
     inc unit
   &"{v:.1f} " & ["KB", "MB", "GB", "TB"][unit]
 
-proc playlistColumns(a: App): seq[PlaylistColumn] =
-  ## The detail columns right of Filename, each as wide as its widest text.
+proc playlistCells(a: App, hdr: Rect): seq[(Rect, PlaylistField)] =
+  ## The shown columns, left to right. Each is as wide as its widest text,
+  ## except the text columns, which share what the others leave (with none
+  ## shown, the last column takes it).
   let ui = a.ui
-  let col = proc (label, sample: string, sort: PlaylistSort): PlaylistColumn =
-    PlaylistColumn(label: label, sort: sort,
-      w: max(ui.textSize(label, FontSmall).x, ui.textSize(sample, FontSmall).x) + 18)
-  result.add col("Duration", "00:00:00", psDuration)
-  if a.cfg.playlistShowSize: result.add col("Size", "999.9 MB", psSize)
-  if a.cfg.playlistShowDimensions: result.add col("Dimensions", "3840×2160", psDimensions)
+  let cols = a.cfg.playlistColumns
+  a.plDurSeconds = pfDuration in cols and
+    not a.playlist.anyIt(it in a.mediaInfo and a.mediaInfo[it].duration > 60)
+  var widths = newSeq[float32](cols.len)
+  var used = 0'f32
+  var shared = 0
+  for i, f in cols:
+    let (label, sample) = PlaylistFields[f]
+    if sample.len == 0: inc shared
+    else:
+      let longMillis = f == pfDuration and a.cfg.playlistShowMillis and not a.plDurSeconds
+      let text = if longMillis: sample & ".000" else: sample
+      widths[i] = max(ui.textSize(label, FontSmall).x, ui.textSize(text, FontSmall).x) + 18
+      if i == 0: widths[i] += PlaylistIconW
+      used += widths[i]
+  if shared == 0: widths[^1] += max(0'f32, hdr.w - used)
+  var x = hdr.x
+  for i, f in cols:
+    let w = if PlaylistFields[f].sample.len > 0: widths[i]
+            else: max(PlaylistMinTextW, (hdr.w - used) / shared.float32)
+    result.add (rect(x, hdr.y, w, hdr.h), f)
+    x += w
 
-proc cellText(a: App, path: string, by: PlaylistSort): string =
-  case by
-  of psName: path.extractFilename
-  of psDuration:
-    let d = a.mediaInfo.getOrDefault(path).duration
-    if d > 0: fmtTime(d, dur = d) else: ""
-  of psSize:
+proc cellText(a: App, path: string, field: PlaylistField): string =
+  let m = a.mediaInfo.getOrDefault(path)
+  case field
+  of pfName: a.rowName(path)
+  of pfFilename: path.extractFilename
+  of pfDuration:
+    let millis = a.cfg.playlistShowMillis
+    if m.duration <= 0: ""
+    elif a.plDurSeconds:
+      let ms = int(m.duration * 1000)
+      if millis: &"{ms div 1000}.{ms mod 1000:03}" else: $(ms div 1000)
+    else: fmtTime(m.duration, millis, m.duration)
+  of pfSize:
     let b = a.fileSize(path)
     if b >= 0: fmtSize(b) else: ""
-  of psDimensions:
-    let m = a.mediaInfo.getOrDefault(path)
+  of pfDimensions:
     if m.width > 0: &"{m.width}×{m.height}" else: ""
+  of pfAudioBitrate:
+    if m.audioBitrate > 0: fmtBitrate(m.audioBitrate) else: ""
+  of pfTrack:
+    if m.track > 0: $m.track else: ""
+  of pfArtist: m.artist
+  of pfYear:
+    if m.year > 0: $m.year else: ""
+  of pfAlbum: m.album
 
-proc rowName(a: App, path: string): string =
-  ## A playlist row's name: a link's title when known.
-  if a.ytList.running and a.ytList.url == path and path.youtubeId.len == 0:
-    "Loading playlist..."
-  elif path in a.linkTitles: a.linkTitles[path]
-  elif path.isWebLink and a.saved.getOrDefault(path).title.len > 0: a.saved[path].title
-  else: path.extractFilename
+proc playlistCell(a: App, s: string, cell: Rect, field: PlaylistField, first: bool,
+                  color: ColorRGBX, font: string) =
+  ## A column's text, in the header or a row: text columns start at its left
+  ## edge, past the playing icon in the first column; the others end at its right.
+  let ui = a.ui
+  if PlaylistFields[field].sample.len == 0:
+    let pad = if first: PlaylistIconW else: 9'f32
+    let w = cell.w - pad - 4
+    ui.textIn(ui.ellipsize(s, w, font), rect(cell.x + pad, cell.y, w, cell.h), color, font)
+  else:
+    ui.textIn(s, rect(cell.x, cell.y, cell.w - 9, cell.h), color, font, h = RightAlign)
+
+proc playlistBar(a: App, gutter: Rect): float32 =
+  ## Scroll bar beside the rows: drag the thumb, or click the track to jump
+  ## there. It widens and lights up under the pointer. The track marks the
+  ## selected rows and the playing one, inside the thumb while they're in view.
+  ## Returns the thumb's middle.
+  let ui = a.ui
+  let track = rect(gutter.x, gutter.y + 3, gutter.w, max(0'f32, gutter.h - 6))
+  let content = a.playlist.len.float32 * PlaylistRowH
+  let maxScroll = max(1'f32, content - gutter.h)
+  let thumbH = max(28'f32, track.h * gutter.h / content).min(track.h)
+  let span = track.h - thumbH
+  proc thumbY(scroll: float32): float32 = track.y + span * scroll / maxScroll
+  if ui.hover(gutter) and ui.pressed():
+    ui.consumeClick()
+    if span > 0 and not ui.hover(rect(track.x, thumbY(a.plScroll), track.w, thumbH)):
+      # Center the thumb on the pointer, then keep dragging from there.
+      a.plScroll = clamp((ui.mouse.y - track.y - thumbH / 2) / span * maxScroll, 0, maxScroll)
+    ui.activeId = "plscroll"
+    a.plThumbFrom = (ui.mouse.y, a.plScroll)
+  let dragging = ui.activeId == "plscroll"
+  if dragging and span > 0:
+    let (y0, s0) = a.plThumbFrom
+    a.plScroll = clamp(s0 + (ui.mouse.y - y0) / span * maxScroll, 0, maxScroll)
+
+  # The easing runs on the redraws that the pointer's movement already schedules.
+  let t = now()
+  let lift = if dragging or ui.hover(gutter): 1'f32
+             elif ui.hover(a.plListRect): 0.35'f32 else: 0'f32
+  a.plBarLift += (lift - a.plBarLift) * float32(1 - exp(-(t - a.plBarAt) * 16))
+  a.plBarAt = t
+  let w = PlaylistBarThin + (PlaylistBarWide - PlaylistBarThin) * a.plBarLift
+  let x = gutter.x + (gutter.w - w) / 2
+  proc rowY(i: int): float32 =
+    floor(track.y + track.h * (i.float32 + 0.5) / a.playlist.len.float32)
+
+  let groove = blend(colPanelRaised, colTrack, a.plBarLift)
+  ui.pill(rect(x, track.y, w, track.h), groove, groove)
+  var above = float32.low  # rows sharing a pixel row need just one mark
+  for i in a.plSelection:
+    let y = rowY(i)
+    if y != above: ui.rect(rect(x, y - 1, w, 2), colTextDim)
+    above = y
+  let thumb = rect(x, thumbY(a.plScroll), w, thumbH)
+  if dragging:
+    ui.pill(rect(x - 3, thumb.y - 3, w + 6, thumbH + 6), colAccentDim, colAccentDim, feather = 5)
+  ui.pill(thumb, blend(colTextDisabled, colAccentHover, a.plBarLift),
+    blend(colTextDisabled, colAccent, a.plBarLift))
+  if a.plIndex in 0 ..< a.playlist.len:
+    ui.rect(rect(x - 1, rowY(a.plIndex) - 1, w + 2, 2), blend(colAccent, colWhite, a.plBarLift))
+  thumb.y + thumbH / 2
 
 proc playlistPanel(a: App, r: Rect) =
   let ui = a.ui
@@ -6511,80 +7584,125 @@ proc playlistPanel(a: App, r: Rect) =
       colTextDim, FontSmall, h = CenterAlign)
     return
 
-  # Column headers: Filename takes what the detail columns leave.
+  # Column headers: a click sorts by the column, a drag moves it.
   let colHdr = rect(r.x + 1, r.y + 30, r.w - 1, PlaylistHeaderH)
-  var cells: seq[(Rect, PlaylistColumn)]
-  var x = colHdr.x + colHdr.w
-  for c in a.playlistColumns.reversed:
-    x -= c.w
-    cells.insert((rect(x, colHdr.y, c.w, colHdr.h), c), 0)
-  cells.insert((rect(colHdr.x, colHdr.y, max(0'f32, x - colHdr.x), colHdr.h),
-    PlaylistColumn(label: "Filename", sort: psName)), 0)
+  let list = rect(r.x + 1, colHdr.y + colHdr.h, r.w - 1, r.h - 30 - colHdr.h)
+  let rowH = PlaylistRowH
+  let maxScroll = max(0'f32, a.playlist.len.float32 * rowH - list.h)
+  # Only a list that overflows gives up its right edge to the scroll bar.
+  let barW = if maxScroll > 0: PlaylistBarW else: 0'f32
+  let rows = rect(list.x, list.y, list.w - barW, list.h)
+  let cells = a.playlistCells(rect(colHdr.x, colHdr.y, colHdr.w - barW, colHdr.h))
+  let dragging = ui.activeId == "plcolumn"
   ui.rect(colHdr, colPanelRaised)
   ui.sk.pushClipRect(colHdr)
-  for i, (cr, c) in cells:
-    if ui.hover(cr) and not ui.hover(grip):
+  for i, (cr, f) in cells:
+    let label = PlaylistFields[f].label
+    if dragging:
+      if i == a.plColumnFrom.index: ui.rect(cr, colPressed)
+    elif ui.hover(cr) and not ui.hover(grip):
       ui.rect(cr, colHover)
-      ui.tip(cr, "Sort by " & c.label)
+      ui.tip(cr, &"Sort by {label}. Drag to move the column")
       if ui.pressed():
         ui.consumeClick()
-        a.sortPlaylist(c.sort)
-    if i == 0:
-      ui.textIn(c.label, rect(cr.x + 28, cr.y, cr.w - 32, cr.h), colTextDim, FontSmall)
-    else:
-      ui.rect(rect(cr.x, cr.y + 4, 1, cr.h - 8), colBorder)
-      ui.textIn(c.label, rect(cr.x, cr.y, cr.w - 9, cr.h), colTextDim, FontSmall, h = RightAlign)
+        ui.activeId = "plcolumn"
+        a.plColumnFrom = (i, ui.mouse.x, false)
+    if i > 0: ui.rect(rect(cr.x, cr.y + 4, 1, cr.h - 8), colBorder)
+    a.playlistCell(label, cr, f, i == 0, colTextDim, FontSmall)
+  if ui.activeId == "plcolumn":
+    if abs(ui.mouse.x - a.plColumnFrom.x) >= PlaylistColumnDrag: a.plColumnFrom.moved = true
+    # The gap the column would drop into: past every column whose middle it passed.
+    let to = cells.countIt(ui.mouse.x > it[0].x + it[0].w / 2)
+    if a.plColumnFrom.moved:
+      let gap = if to < cells.len: cells[to][0].x else: cells[^1][0].x + cells[^1][0].w
+      ui.rect(rect(clamp(gap - 1, colHdr.x, colHdr.x + colHdr.w - 2), colHdr.y, 2, colHdr.h), colAccent)
+    if ui.released():
+      let from0 = a.plColumnFrom.index
+      if not a.plColumnFrom.moved: a.sortPlaylist(cells[from0][1])
+      else:
+        a.cfg.playlistColumns.delete(from0)
+        a.cfg.playlistColumns.insert(cells[from0][1], if to > from0: to - 1 else: to)
   ui.sk.popClipRect()
   ui.rect(rect(colHdr.x, colHdr.y + colHdr.h - 1, colHdr.w, 1), colBorder)
 
-  let list = rect(r.x + 1, colHdr.y + colHdr.h, r.w - 1, r.h - 30 - colHdr.h)
-  let rowH = PlaylistRowH
   a.plListRect = list
   if ui.hover(colHdr) and ui.released(MouseRight):
+    for (cr, f) in cells:
+      if ui.hover(cr): a.ctxColumn = f
     a.ctxMenu = cmPlaylistColumns
     a.menus.openContext(ui.mouse)
   elif ui.hover(r) and ui.released(MouseRight):
     # Right-click selects the row under the pointer (none below the last one).
+    # A row already in the selection keeps the selection for the menu.
     let i = int((ui.mouse.y - list.y + a.plScroll) / rowH)
-    a.plSelected = if ui.mouse.y >= list.y and i < a.playlist.len: i else: -1
+    if ui.mouse.y < list.y or i >= a.playlist.len: a.selectOnly(-1)
+    elif not a.plIsSelected(i): a.selectOnly(i)
     a.ctxMenu = cmPlaylist
     a.menus.openContext(ui.mouse)
   if a.playlist.len == 0:
     ui.textIn("Empty. Use File > Open File...", list, colTextDim, FontSmall, h = CenterAlign)
     return
-  let maxScroll = max(0'f32, a.playlist.len.float32 * rowH - list.h)
-  if a.plReveal:
+  if ui.activeId == "plscroll":  # the drag wins over playback moving on
     a.plReveal = false
+    a.plFollow = false
+  if a.plReveal or a.plFollow:
     if a.plSelected >= 0:
       let y = a.plSelected.float32 * rowH
       a.plScroll = clamp(a.plScroll, y + rowH - list.h, y)
+      # On the last whole row: page on, so that what plays next stays in view.
+      if a.plFollow and y + rowH * 2 > a.plScroll + list.h:
+        a.plScroll = clamp(a.plScroll + list.h * PlaylistFollowPage, y + rowH - list.h, y)
+    a.plReveal = false
+    a.plFollow = false
   if ui.hover(list) and ui.scroll() != 0:
-    a.plScroll += ui.scroll() * rowH * 3
+    a.plScroll += ui.wheelNotches * rowH * PlaylistWheelRows
     ui.scrollConsumed = true
   a.plScroll = clamp(a.plScroll, 0, maxScroll)
-  ui.sk.pushClipRect(list)
+  let thumbMid = if barW > 0: a.playlistBar(rect(rows.x + rows.w, list.y, barW, list.h)) else: 0'f32
+  ui.sk.pushClipRect(rows)
   let first = int(a.plScroll / rowH)
   let last = min(a.playlist.len, first + int(list.h / rowH) + 2) - 1
   for i in first .. last:
-    let row = rect(list.x, list.y + i.float32 * rowH - a.plScroll, list.w, rowH)
+    let row = rect(rows.x, rows.y + i.float32 * rowH - a.plScroll, rows.w, rowH)
     let hov = ui.hover(row) and ui.hover(list) and not ui.hover(grip)
-    if i == a.plSelected: ui.rect(row, colPressed)
+    if a.plIsSelected(i): ui.rect(row, colPressed)
     elif hov: ui.rect(row, colHover)
     let current = i == a.plIndex
     if current: ui.icon("play16", vec2(row.x + 14, row.y + rowH / 2), colAccent)
     let path = a.playlist[i]
-    let nameW = cells[0][0].w - 32
-    ui.textIn(ui.ellipsize(a.rowName(path), nameW), rect(row.x + 28, row.y, nameW, rowH),
-      if current: colAccent else: colText)
-    for (cr, c) in cells[1 .. ^1]:
-      ui.textIn(a.cellText(path, c.sort), rect(cr.x, row.y, cr.w - 9, rowH),
-        if current: colAccent else: colTextDim, FontSmall, h = RightAlign)
+    for j, (cr, f) in cells:
+      # Name and Filename read like the row's title, the rest as its details.
+      let title = f in {pfName, pfFilename}
+      a.playlistCell(a.cellText(path, f), rect(cr.x, row.y, cr.w, rowH), f, j == 0,
+        if current: colAccent elif title: colText else: colTextDim,
+        if title: FontMain else: FontSmall)
     if hov and ui.pressed():
-      a.plSelected = i
+      # Ctrl+click adds or drops a row, Shift+click selects up to it.
+      let w = a.window
+      let anchor = a.plSelected
+      if w.ctrl:
+        var sel = a.plSelection
+        let at = sel.find(i)
+        if at >= 0: sel.delete(at)
+        else: sel.insert(i, sel.lowerBound(i))
+        a.plSelected = if at < 0: i elif sel.len > 0: sel[min(at, sel.high)] else: -1
+        a.plMarks = sel
+      elif w.shiftDown and anchor in 0 ..< a.playlist.len:
+        a.plMarks = toSeq(min(anchor, i) .. max(anchor, i))
+      else: a.selectOnly(i)
       ui.consumeClick()
     if hov and a.window.buttonPressed[DoubleClick]:
       a.playIndex(i)
   ui.sk.popClipRect()
+  if ui.activeId == "plscroll":
+    # Which rows the thumb has reached, beside it.
+    let s = &"{first + 1}-{min(a.playlist.len, first + int(list.h / rowH))} of {a.playlist.len}"
+    let sz = ui.textSize(s, FontSmall) + vec2(14, 8)
+    let bubble = rect(max(r.x + 4, rows.x + rows.w - sz.x - 4),
+      clamp(thumbMid - sz.y / 2, list.y + 2, max(list.y + 2, list.y + list.h - sz.y - 2)), sz.x, sz.y)
+    ui.rect(bubble, colPopup)
+    ui.border(bubble, colBorder)
+    ui.textIn(s, bubble, colText, FontSmall, h = CenterAlign)
   a.probeNext(first .. last)
   a.infoNext(first .. last)
 
@@ -6865,7 +7983,7 @@ proc renderOptions(a: App, shot: string) =
   let size = w.size
   if size.x <= 0 or size.y <= 0: return
   # A text field being edited takes Escape itself.
-  let esc = w.buttonPressed[KeyEscape] and ui.focusId.len == 0
+  let esc = w.buttonPressed[KeyEscape] and ui.focusId.len == 0 and not a.optionsDlg.searching
   if not a.beginDialogDraw(w, a.optSk, size): return  # retried next frame
   ui.beginFrame()
   a.optSk.beginUi(w, size)
@@ -6915,6 +8033,9 @@ proc renderOptions(a: App, shot: string) =
   of prClearWeb:
     a.dropSaved(toSeq(a.saved.keys))
     a.saved.removeStray(initDuration())
+    a.linkInfos.clear()
+    a.linkInfosChanged = true
+    a.saveLinkInfos()
     a.optionsDlg.webPicked = @[]
     a.refreshWebInfo()
   of prDeleteWeb:
@@ -6926,10 +8047,22 @@ proc renderOptions(a: App, shot: string) =
     # Let KDE's service cache notice the new defaults right away.
     if findExe("kbuildsycoca6").len > 0: a.spawn("kbuildsycoca6")
 
+proc renDuration(a: App): float =
+  if a.renPath == a.player.path: a.player.duration else: -1.0
+
+proc renMoveTo(a: App, t: float) =
+  ## The bookmark being edited moves to the frame nearest t.
+  let t = a.snapToFrame(a.renPath, t)
+  if t != a.renTime and a.moveBookmark(a.renPath, a.renTime, t):
+    a.renTime = t
+    a.previewBookmark()
+  a.renTimeText = fmtTime(a.renTime, true, a.renDuration)
+
 proc renderRename(a: App, shot: string) =
   ## Draws the Edit Bookmark window; Enter does what Save does, Escape what
   ## Cancel does. Leaving the Time field moves the bookmark there, onto the
-  ## nearest frame, so the seek bar shows it right away.
+  ## nearest frame, so the seek bar shows it right away; the wheel over it
+  ## (Up/Down in it) moves it a frame. With Preview, playback follows it.
   if a.overlay != ovRename: return
   let w = a.renWin
   let ui = a.renUi
@@ -6949,14 +8082,12 @@ proc renderRename(a: App, shot: string) =
     colPanel.b.float32 / 255, 1)
   glClear(GL_COLOR_BUFFER_BIT)
   let W = ui.size.x
+  let dur = a.renDuration
   proc commitTime() =
-    ## The Time field was left: the bookmark moves to the nearest frame.
+    ## The Time field was left without it seeing so.
     if esc: return  # Cancel puts it back anyway
-    try:
-      let t = a.snapToFrame(a.renPath, parseTime(a.renTimeText))
-      if t != a.renTime and a.moveBookmark(a.renPath, a.renTime, t): a.renTime = t
-    except ValueError: discard
-    a.renTimeText = fmtTime(a.renTime, true, a.player.duration)
+    try: a.renMoveTo(parseTime(a.renTimeText))
+    except ValueError: a.renTimeText = fmtTime(a.renTime, true, dur)
   # Switching to another window leaves the field too.
   if ui.focusId == "ren-time" and not w.focused:
     ui.focusId = ""
@@ -6967,8 +8098,17 @@ proc renderRename(a: App, shot: string) =
   # Clicking the Name field takes the focus before the Time field sees the click.
   if wasTime and ui.focusId != "ren-time": commitTime()
   ui.textIn("Time", rect(16, 72, W - 32, 22), colTextDim, FontSmall)
-  if eeCommitted in ui.textField("ren-time", rect(16, 96, W - 32, 28), a.renTimeText):
-    commitTime()
+  # A frame a step; without video, a tenth of a second.
+  let fps = a.frameRate(a.renPath)
+  var t = a.renTime
+  if ui.timeField("ren-time", rect(16, 96, W - 32, 28), a.renTimeText, t,
+                  if fps > 0: 1 / fps else: 0.1, hi = (if dur > 0: dur else: Inf), dur = dur) and
+     not esc:
+    a.renMoveTo(t)
+  if ui.checkbox("ren-preview", vec2(16, 139), "Preview", a.cfg.bookmarkPreview):
+    a.cfg.save()
+    a.previewBookmark()
+  ui.tip(rect(16, 139, 90, 22), "Jump to the bookmark's time as it changes")
   let cancel = ui.textButton("ren-cancel", rect(W - 224, 136, 100, 28), "Cancel")
   let ok = ui.textButton("ren-ok", rect(W - 116, 136, 100, 28), "Save", primary = true)
   ui.drawTooltip()
@@ -7444,6 +8584,7 @@ proc renderPick(a: App, shot: string) =
   of paDraw: a.beginRectDraw(a.pickDlg.drawRequest)
   of paBrowse: a.browsePickPath(a.pickDlg.browseRow)
   of paRun:
+    if a.dialog != nil and a.dialog.purpose == "pickpath": return  # its path is still to come
     a.endRectDraw(true, refocus = false)
     let d = a.pickDlg
     var picks = a.extPicks
@@ -7585,11 +8726,18 @@ proc shortcutColumns(a: App): array[2, seq[ShortcutGroup]] =
       ("Bigger / smaller", @[kaSubBigger, kaSubSmaller], "Shift+Numpad + / -")]),
     ("Text fields", @[
       ("Next / previous word", "Ctrl+Right / Ctrl+Left"),
-      ("Select next / previous word", "Ctrl+Shift+Right / Left")]),
+      ("Select next / previous word", "Ctrl+Shift+Right / Left"),
+      ("Timestamp: a frame later / earlier", "Up / Down")]),
     ("Drawing a rectangle (Run window)", @[
       ("Confirm / cancel", "Enter / Esc"),
       ("Move by one pixel", "Arrows")]),
-    ("Run log", @[("Copy selected text", "Ctrl+C")])]
+    ("Run log", @[("Copy selected text", "Ctrl+C")]),
+    ("Playlist (after clicking it)", @[
+      ("Select previous / next entry (pointer still over it)", "Up / Down"),
+      ("Select all entries", "Ctrl+A"),
+      ("Duplicate selected entries", "Ctrl+D"),
+      ("Move selected entries up / down", "Ctrl+Shift+Up / Down"),
+      ("Move selected entries to top / bottom", "Ctrl+Shift+Home / End")])]
   var view = a.keyRows("View", [
     ("Compact mode", @[kaCompact], ""),
     ("Seek bar", @[kaSeekBar], ""), ("Controls", @[kaControls], ""),
@@ -7614,6 +8762,7 @@ proc shortcutColumns(a: App): array[2, seq[ShortcutGroup]] =
     ("Mouse", @[
       ("Play / Pause", "Click video"), ("Full screen", "Double-click video"),
       ("Move window", "Drag video"), ("Context menu", "Right-click"),
+      ("Move playlist column", "Drag column header"),
       ("Resize window (compact mode)", "Drag window edge"),
       ("Volume", "Wheel"), ("Zoom at cursor", "Ctrl+Wheel"),
       ("Restore zoom / panning", "Middle-click video"),
@@ -7627,7 +8776,10 @@ proc shortcutColumns(a: App): array[2, seq[ShortcutGroup]] =
       ("Toggle seek snapping", "Shift+Drag seek bar"),
       ("Repeat options", "Right-click loop button"),
       ("Select word / all in a text field", "Double / Triple-click"),
+      ("Step a timestamp field by one frame", "Wheel over it"),
       ("Select run log text / extend selection", "Drag / Shift+Click run log"),
+      ("Add or remove a playlist entry from the selection", "Ctrl+Click playlist"),
+      ("Select playlist entries up to the clicked one", "Shift+Click playlist"),
       ("Select word / whole run log", "Double / Triple-click run log"),
       ("Draw on video / keep value (Run window)", "Click / Right-click rectangle icon"),
       ("Draw, resize or move the rectangle", "Drag video / its side / inside it")])]
@@ -7813,6 +8965,10 @@ proc frame(a: App) =
     else: a.lookDrag(ui.mouse)
 
   # Chrome
+  if w.buttonPressed[MouseLeft] or w.buttonPressed[MouseRight]:
+    a.plFocused = a.cfg.showPlaylist and ui.mouse.inside(plRect)
+    a.plArrows = a.plFocused
+  if not (a.cfg.showPlaylist and ui.mouse.inside(plRect)): a.plArrows = false
   if a.cfg.showPlaylist: a.playlistPanel(plRect)
   else: a.plListRect = Rect()
   if a.cfg.showRunLog: a.runLogPanel(rlRect)
@@ -7889,7 +9045,9 @@ proc frame(a: App) =
               elif edge * {weTopLeft, weBottomRight} != {}: ptResizeNWSE
               elif edge != {}: ptResizeNESW
               elif hide: ptHidden elif resize: ptResize elif resizeV: ptResizeV
-              elif overLog: ptText else: ptArrow
+              elif overLog: ptText
+              elif ui.activeId == "plcolumn" and a.plColumnFrom.moved: ptMoving
+              else: ptArrow
   if a.rectEdit != nil and (overVideo or w.buttonDown[MouseLeft]):
     shape = case a.rectEdit.cursorAt(a.videoMap, ui.mouse)
       of rcCross: ptCross
@@ -7962,15 +9120,26 @@ proc runScriptStep(a: App, st: ScriptStep) =
     var path: seq[int]
     for x in st.args[1 .. ^1]: path.add parseInt(x)
     a.menus.openBar(parseInt(st.args[0]), path)
-  of "ctx": a.ctxMenu = cmVideo; a.menus.openContext(vec2(parseFloat(st.args[0]), parseFloat(st.args[1])))
+  of "ctx":  # x y [seek]: the seek bar's menu, else the video's
+    let pos = vec2(parseFloat(st.args[0]), parseFloat(st.args[1]))
+    if st.args.len > 2: a.seekBarContext(pos)
+    else: a.ctxMenu = cmVideo; a.menus.openContext(pos)
   of "plctx": a.ctxMenu = cmPlaylist; a.menus.openContext(vec2(parseFloat(st.args[0]), parseFloat(st.args[1])))
+  of "colctx":  # x y field: the playlist header's menu, as right-clicking that column
+    a.ctxColumn = parseEnum[PlaylistField](st.args[2])
+    a.ctxMenu = cmPlaylistColumns
+    a.menus.openContext(vec2(parseFloat(st.args[0]), parseFloat(st.args[1])))
   of "sbctx": a.seekBarContext(vec2(parseFloat(st.args[0]), parseFloat(st.args[1])))
-  of "plselect": a.plSelected = parseInt(arg)
+  of "plselect": a.selectOnly(parseInt(arg))
   of "plaction":  # playlist context menu item by label
     a.ctxMenu = cmPlaylist
     for n in a.buildMenu().context.children:
       if n.label == arg and n.enabled and n.action != nil: n.action()
     a.ctxMenu = cmVideo
+  of "ctxaction":  # video frame context menu item by label (top level)
+    a.ctxMenu = cmVideo
+    for n in a.buildMenu().context.children:
+      if n.label == arg and n.enabled and n.action != nil: n.action()
   of "pldump": stderr.writeLine "playlist ", a.plIndex, " ", $a.playlist.mapIt(it.extractFilename)
   of "close": a.menus.close()
   of "mouse":
@@ -8049,6 +9218,16 @@ proc runScriptStep(a: App, st: ScriptStep) =
     a.subs = SubLayout(alignX: parseInt(st.args[0]), alignY: parseInt(st.args[1]),
       offset: vec2(parseFloat(st.args[2]), parseFloat(st.args[3])), scale: parseFloat(st.args[4]))
   of "seek": a.seekTo(parseFloat(arg))
+  of "bmadd": a.addBookmark(parseFloat(arg))
+  of "bmedit": a.showRename(parseInt(arg))  # index: Edit Bookmark for the current file's nth bookmark
+  of "bmpreview": a.cfg.bookmarkPreview = arg == "1"
+  of "bmtime": a.renMoveTo(parseTime(arg))  # as if typed into Edit Bookmark's Time field
+  of "bmstep":  # n: frames, as the wheel over Edit Bookmark's Time field steps
+    let fps = a.frameRate(a.renPath)
+    a.renMoveTo(a.renTime + parseFloat(arg) * (if fps > 0: 1 / fps else: 0.1))
+  of "bmcancel": a.closeRename()
+  of "bmdump": stderr.writeLine "bm ", a.fileBookmarks.mapIt(it.time), " ren=", a.renTime,
+    " text=", a.renTimeText, " pos=", a.player.timePos
   of "abloop":  # a b: sets both loop marks, starting the loop
     a.setLoopMark(false, parseFloat(st.args[0]))
     a.setLoopMark(true, parseFloat(st.args[1]))
@@ -8056,6 +9235,7 @@ proc runScriptStep(a: App, st: ScriptStep) =
     (a.lookYaw, a.lookPitch, a.lookFov) = (parseFloat(st.args[0]).float32,
       parseFloat(st.args[1]).float32, parseFloat(st.args[2]).float32)
   of "pause": a.togglePlay()
+  of "frame": a.frameStep(arg == "1")  # 1 forward, 0 back
   of "sync":  # all | none | add <pid> | remove <pid> | addany (first peer found)
     if arg == "addany":
       if a.peers != nil and a.peers.peers.len > 0: a.syncRequest("add", a.peers.peers[0].pid)
@@ -8109,6 +9289,8 @@ proc runScriptStep(a: App, st: ScriptStep) =
   of "qpick":  # video audio: the quality menu's picks, format ids ("-": Auto)
     let f = st.args.mapIt(if it == "-": "" else: it)
     a.pickQuality(a.player.path, f[0], f[1])
+  of "qlang":  # a language's code: Audio Track's pick of it
+    a.pickLang(a.player.path, arg)
   of "qlock":  # Video|Audio label: clicks the lock of the quality menu's item
     let was = a.ctxMenu
     a.ctxMenu = cmQuality
@@ -8128,9 +9310,10 @@ proc runScriptStep(a: App, st: ScriptStep) =
       " pos=", a.player.timePos, " paused=", a.player.paused,
       " button=", a.qualityRect, " menu=", a.menus.contextRect,
       " playing=", a.playFormat.getOrDefault(a.player.path), " auto=", a.ytAuto.getOrDefault(a.player.path),
-      " wants=", a.wants(a.player.path), " locks=", (a.cfg.streamLockVideo, a.cfg.streamLockAudio),
+      " wants=", a.wants(a.player.path), " rows=", $a.audioRows(a.player.path).mapIt(it.label),
+      " aid=", a.player.selectedTrack("audio"), " locks=", (a.cfg.streamLockVideo, a.cfg.streamLockAudio),
       " holding=", a.holding, " opening=", a.player.opening, " source=", a.player.source.len > 0,
-      " segs=", $a.saved.getOrDefault(a.player.path).segs.mapIt(&"{it.start:.0f}..{it.stop:.0f}:{it.format}")
+      " segs=", $a.saved.lookup(a.player.path).segs.mapIt(&"{it.start:.0f}..{it.stop:.0f}:{it.format}")
   of "ytdump":
     stderr.writeLine "ytdlp status=", a.ytStatus, " mode=", a.ytMode, " overlay=", a.overlay,
       " opening=", a.player.opening, " loaded=", a.player.loaded, " path=", a.player.path,
@@ -8139,9 +9322,12 @@ proc runScriptStep(a: App, st: ScriptStep) =
       " versions=", a.ytCurrent, "/", a.ytLatest, " msg=", a.ytMsg,
       " buffered=", a.player.buffered, " chapters=", a.player.chapters.len,
       " subs=", a.player.tracks.countIt(it.kind == "sub")
+  of "saveto":  # path: File > Save, the dialog answered
+    a.saveSrc = a.player.path
+    a.startSave(arg)
   of "webdump":  # the open link's saved part, its saving and the standby going online
     let p = a.player
-    let s = a.saved.getOrDefault(a.ytCurrentLink)
+    let s = a.saved.lookup(a.ytCurrentLink)
     stderr.writeLine "web t=", p.timePos.formatFloat(ffDecimal, 3), " dur=", p.duration,
       " source=", p.source.len > 0, " part=", p.partStart, "..", p.partEnd,
       " stopped=", p.stopped, " paused=", p.paused, " dumping=", p.dumping,
@@ -8254,6 +9440,7 @@ proc main() =
   removeDownloads()
   setSaveDir(a.cfg.webDir.expandPath)
   a.saved = loadSaveIndex()
+  a.linkInfos = loadLinkInfos()
   a.pruneSaved()
   a.player.initRender()
   a.applyLoop()
@@ -8325,6 +9512,7 @@ proc main() =
     # Restored without playing; Play starts the entry that was current.
     a.playlist = c.playlist.filterIt(fileExists(it) or it.contains("://"))
     a.linkTitles = c.playlistTitles
+    a.ytListed = c.playlistListed.toHashSet
     if a.playlist.len > 0:
       let cur = c.playlistIndex
       a.plSelected =
@@ -8377,6 +9565,7 @@ proc main() =
     a.placeLoopEnd()
     a.pingPong()
     a.loopFrames()
+    a.stepFrames()
     a.pollProbe()
     a.pollMediaKey()
     a.syncEqualizer()
@@ -8389,6 +9578,7 @@ proc main() =
     a.pollEmbed()
     a.pollUpdate()
     a.pollThumbnail()
+    a.pollBoard()
     a.watchVram()
     for st in a.script.due: a.runScriptStep(st)
     if a.script.next < a.script.steps.len: a.dirtyUntil = now() + 0.5
@@ -8504,6 +9694,8 @@ proc main() =
 
   if a.overlay == ovOptions: a.closeOptions(false)
   if a.ytCaps.running: a.ytCaps.stop()
+  a.board.cancel()
+  a.ytStyling.cancel()
   if a.ytSubs.running: a.ytSubs.stop()
   if a.ytList.running: a.ytList.stop()
   if a.ytInfo.running: a.ytInfo.stop()
@@ -8512,6 +9704,7 @@ proc main() =
   a.recordEnd()  # mpv closes the file as it shuts down
   if a.eqUnsaved.len > 0: a.saveEqualizer()
   a.saved.save()
+  a.saveLinkInfos()
   a.savePosition()
   a.rememberState()
   a.cfg.save()

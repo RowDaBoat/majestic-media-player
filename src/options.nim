@@ -2,7 +2,7 @@
 ## tree view) and the selected page on the right. Edits apply to the config
 ## live; the caller snapshots it beforehand so Cancel can undo them.
 
-import std/[os, strutils, strformat, math, tables, times]
+import std/[os, strutils, sequtils, strformat, math, tables, times]
 import silky, vmath, bumpy, chroma, pixie
 import ui, theme, config, assoc, keymap, websave, mediainfo, screenpick, fontlist, gpumem
 
@@ -16,6 +16,7 @@ type
     opPlayback = "Playback"
     opOnline = "Online"
     opWeb = "Media Cache"
+    opAudioFiles = "Audio Files"
     opSubtitles = "Subtitles"
     opSubStyle = "Default"
     opMisc = "Miscellaneous"
@@ -75,15 +76,24 @@ type
     fontHi: int                 ## the list's highlighted row, -1 when none
     fontTop: int                ## its first visible row
     fontAt: Rect                ## the Font field and its arrow, where the list hangs
+    find: string                ## the search bar above both columns; "" when not searching
+    findScroll: float32         ## the search results' scroll
 
   Pane = object
     ## Layout cursor for a page.
     x, y, w: float32
     started: bool               ## a group header was placed already
+    find: seq[string]           ## search words, lower case; empty when not searching
+    page: OptionsPage           ## while searching: the page being gone through,
+    title: string               ## its group being gone through,
+    header: bool                ## whether that group's header was drawn,
+    shown: bool                 ## whether the last row was
+    jump: bool                  ## a result was clicked: open jumpTo, leaving the search
+    jumpTo: OptionsPage
 
 const
   Tree = [(opPlayer, 0), (opInterface, 1), (opFormats, 1), (opPaths, 1), (opKeys, 1), (opPlayback, 0),
-          (opOnline, 1), (opWeb, 1), (opSubtitles, 0),
+          (opOnline, 1), (opWeb, 1), (opAudioFiles, 1), (opSubtitles, 0),
           (opSubStyle, 1), (opMisc, 0), (opSystem, 0)]
   Parents = {opPlayer, opPlayback, opSubtitles}
   TreeWidth = 180'f32
@@ -111,8 +121,13 @@ proc opened*(d: OptionsDialog, ui: Ui) =
   d.picker = ""
   d.fontOpen = false
   d.scroll = 0
+  d.find = ""
   ui.navId = "o-tree"
   ui.navVisible = false
+
+proc searching*(d: OptionsDialog): bool =
+  ## Whether the search bar holds something (Esc empties it first).
+  d.find.len > 0
 
 proc selectPage*(d: OptionsDialog, ui: Ui, p: OptionsPage) =
   if p == d.page: return
@@ -143,10 +158,13 @@ proc dotsV(ui: Ui, x, y1, y2: float32) =
     y += 2
 
 proc drawTree(d: OptionsDialog, ui: Ui, r: Rect, keys: bool) =
+  ## While searching the tree is greyed out; clicking a page leaves the
+  ## search for it.
+  let dim = d.find.strip.len > 0
   ui.rect(r, colBackground)
   ui.border(r, colBorder)
   let rows = d.visibleRows
-  let focused = ui.tabStop("o-tree", r)
+  let focused = not dim and ui.tabStop("o-tree", r)
   let top = r.y + 6
   let x0 = r.x + 14             # root connector column, expanders sit on it
   proc rowY(i: int): float32 = top + i.float32 * TreeRow
@@ -189,21 +207,24 @@ proc drawTree(d: OptionsDialog, ui: Ui, r: Rect, keys: bool) =
     let lx = x0 + level.float32 * TreeIndent + 12
     let label = rect(lx, y + 2, ui.textSize($p).x + 10, TreeRow - 4)
     let rowR = rect(lx, y, r.x + r.w - lx - 4, TreeRow)
-    let sel = d.page == p
+    let sel = d.page == p and not dim
     let hov = ui.hover(rowR)
     if sel: ui.rect(label, colAccent)
     elif hov: ui.rect(label, colHover)
     if sel and focused: ui.focusRing(rect(label.x + 2, label.y + 2, label.w - 4, label.h - 4))
     ui.textIn($p, rect(label.x + 5, label.y, label.w, label.h),
-      if sel: colOnAccent else: colText)
+      if sel: colOnAccent elif dim: colTextDisabled else: colText)
     if hov and ui.pressed():
       ui.consumeClick()
+      if dim:
+        d.find = ""
+        d.scroll = 0
       ui.navId = "o-tree"
       d.selectPage(ui, p)
     if hov and p in Parents and ui.window.buttonPressed[DoubleClick]: d.toggle()
 
   # Keyboard: Up/Down move, Left collapses (or goes to the parent), Right expands.
-  if not keys or ui.navId notin ["", "o-tree"]: return
+  if dim or not keys or ui.navId notin ["", "o-tree"]: return
   let w = ui.window
   var cur = 0
   for i, (p, _) in rows:
@@ -218,31 +239,77 @@ proc drawTree(d: OptionsDialog, ui: Ui, r: Rect, keys: bool) =
 
 # --- page building blocks -----------------------------------------------------
 
+proc crumb(p: OptionsPage): string =
+  ## Where a page sits in the tree, e.g. Player->Interface.
+  if p.parentOf == p: $p else: $p.parentOf & "->" & $p
+
 proc group(ui: Ui, p: var Pane, title: string) =
+  if p.find.len > 0:            # its header waits for a matching row
+    p.title = title
+    p.header = false
+    p.shown = false
+    return
   if p.started: p.y += 6 + 7    # plus half an em of the 13 px header font, whole pixels
   p.started = true
   ui.groupHeader(vec2(p.x, p.y), p.w, title)
   p.y += 26
 
-proc gap(p: var Pane) = p.y += 10
+proc show(ui: Ui, p: var Pane, texts: varargs[string]): bool =
+  ## Whether a row goes on the page. While searching, only the rows whose
+  ## page name, group title, label or values hold every word of the search,
+  ## under their group's header naming where they come from; a click on it
+  ## opens that page.
+  if p.find.len == 0: return true
+  let hay = ($p.page & " " & p.title & " " & texts.join(" ")).toLowerAscii
+  p.shown = p.find.allIt(it in hay)
+  if not p.shown or p.header: return p.shown
+  p.header = true
+  if p.started: p.y += 6 + 7
+  p.started = true
+  let title = p.page.crumb & "->" & p.title
+  let hr = rect(p.x, p.y, ui.textSize(title, FontSmall).x + 2, 20)
+  let hov = ui.hover(hr)
+  ui.textIn(title, hr, if hov: colAccent else: colTextDim, FontSmall)
+  ui.rect(rect(hr.x + hr.w + 8, p.y + 10, max(0'f32, p.w - hr.w - 8), 1), colBorder)
+  if hov:
+    ui.tip(hr, "Open " & $p.page)
+    if ui.pressed():
+      ui.consumeClick()
+      p.jump = true
+      p.jumpTo = p.page
+  p.y += 26
+  true
+
+proc follows(p: Pane): bool =
+  ## Whether a hint or note goes on the page: while searching, only under
+  ## the row it explains.
+  p.find.len == 0 or p.shown
+
+proc gap(p: var Pane) =
+  if p.follows: p.y += 10
 
 proc checkRow(ui: Ui, p: var Pane, id, label: string, value: var bool) =
+  if not ui.show(p, label): return
   discard ui.checkbox(id, vec2(p.x + 8, p.y + 2), label, value)
   p.y += Row
 
 proc radioRow[T](ui: Ui, p: var Pane, id, label: string, value: var T, option: T) =
+  if not ui.show(p, label): return
   if ui.radioButton(id, vec2(p.x + 8, p.y + 2), label, value == option):
     value = option
   p.y += Row
 
 proc numberRow(ui: Ui, p: var Pane, id, label: string, value: var float,
             step, lo, hi: float, decimals = 0) =
+  if not ui.show(p, label, formatFloat(value, ffDecimal, decimals).strip(leading = false, chars = {'.'})):
+    return
   ui.textIn(label, rect(p.x + 8, p.y, LabelW, 26), colText)
   discard ui.numberField(id, rect(p.x + 8 + LabelW, p.y, 150, 26), value,
     step, lo, hi, decimals)
   p.y += Row + 4
 
 proc textRow(ui: Ui, p: var Pane, id, label: string, value: var string, placeholder: string) =
+  if not ui.show(p, label, value): return
   ui.textIn(label, rect(p.x + 8, p.y, LabelW, 26), colText)
   discard ui.textField(id, rect(p.x + 8 + LabelW, p.y, max(120'f32, p.w - LabelW - 8), 26),
     value, placeholder)
@@ -258,6 +325,7 @@ proc button(ui: Ui, id, label: string, r: Rect, enabled: bool): bool =
 proc toggleNumberRow(ui: Ui, p: var Pane, id, label: string, on: var bool,
                      value: var int, step, lo, hi: int) =
   ## A checkbox turning a limit on, its number beside it.
+  if not ui.show(p, label, $value): return
   discard ui.checkbox(id, vec2(p.x + 8, p.y + 2), label, on)
   var v = value.float
   discard ui.numberField(id & "-n", rect(p.x + 8 + LabelW, p.y, 150, 26), v,
@@ -266,12 +334,14 @@ proc toggleNumberRow(ui: Ui, p: var Pane, id, label: string, on: var bool,
   p.y += Row + 4
 
 proc hint(ui: Ui, p: var Pane, s: string) =
+  if not p.follows: return
   ui.textIn(s, rect(p.x + 8, p.y - 2, p.w - 8, 18), colTextDim, FontSmall)
   p.y += 20
 
 proc folderRow(ui: Ui, p: var Pane, id, label: string, value: var string,
                placeholder: string): bool =
   ## A folder text input with a Browse... button; true when it was pressed.
+  if not ui.show(p, label, value): return
   const bw = 96'f32
   ui.textIn(label, rect(p.x + 8, p.y, LabelW, 26), colText)
   let fw = max(120'f32, p.w - LabelW - 8 - bw - 8)
@@ -282,6 +352,7 @@ proc folderRow(ui: Ui, p: var Pane, id, label: string, value: var string,
 
 proc folderNote(ui: Ui, p: var Pane, value: string) =
   ## Warns when a typed folder does not exist.
+  if not p.follows: return
   let d = value.expandPath
   if d.len > 0 and not dirExists(d):
     ui.textIn("This folder does not exist.", rect(p.x + 8 + LabelW, p.y - 2, p.w - LabelW - 8, 18),
@@ -290,6 +361,7 @@ proc folderNote(ui: Ui, p: var Pane, value: string) =
 
 proc fileNote(ui: Ui, p: var Pane, value: string) =
   ## Warns when a typed program does not exist.
+  if not p.follows: return
   let f = value.expandPath
   if f.len > 0 and not fileExists(f):
     ui.textIn("This file does not exist.", rect(p.x + 8 + LabelW, p.y - 2, p.w - LabelW - 8, 18),
@@ -297,6 +369,26 @@ proc fileNote(ui: Ui, p: var Pane, value: string) =
     p.y += 20
 
 # --- pages ----------------------------------------------------------------------
+
+proc resultRow(ui: Ui, p: var Pane, label, value: string, valueW = 0'f32): bool =
+  ## A search result standing for an entry of a page's list (a format, a
+  ## command, a cached link): its name and value; true when clicked, which
+  ## opens the page.
+  let r = rect(p.x + 8, p.y, p.w - 8, 24)
+  let vw = if valueW > 0: valueW else: r.w - LabelW
+  let hov = ui.hover(r)
+  if hov:
+    ui.rect(r, colHover)
+    ui.tip(r, "Open " & $p.page)
+  ui.textIn(ui.ellipsize(label, r.w - vw - 16), rect(r.x + 8, r.y, r.w - vw - 16, r.h), colText)
+  ui.textIn(ui.ellipsize(value, vw - 8, FontSmall), rect(r.x + r.w - vw, r.y, vw - 8, r.h),
+    colTextDim, FontSmall)
+  if hov and ui.pressed():
+    ui.consumeClick()
+    p.jump = true
+    p.jumpTo = p.page
+    result = true
+  p.y += 24
 
 proc playerPage(ui: Ui, c: var Config, p: var Pane) =
   ui.group(p, "Open options")
@@ -315,13 +407,14 @@ proc interfacePage(ui: Ui, c: var Config, p: var Pane) =
   ui.numberRow(p, "o-scale", "UI scaling (percent)", c.uiScale, 25, 50, 300)
   ui.hint(p, "Size of text, menus and controls in every window.")
   ui.group(p, "OSD")
-  ui.textIn("OSD scaling", rect(p.x + 8, p.y, LabelW, 26), colText)
-  let sw = clamp(p.w - LabelW - 8 - 70, 120'f32, 300'f32)
-  discard ui.slider("o-osdscale", rect(p.x + 8 + LabelW, p.y, sw, 26), c.osdScale,
-    OsdScaleMin, OsdScaleMax, 0.05)
-  ui.textIn("x" & formatFloat(c.osdScale, ffDecimal, 2),
-    rect(p.x + 8 + LabelW + sw + 14, p.y, 60, 26), colText)
-  p.y += Row + 4
+  let osd = "x" & formatFloat(c.osdScale, ffDecimal, 2)
+  if ui.show(p, "OSD scaling", osd):
+    ui.textIn("OSD scaling", rect(p.x + 8, p.y, LabelW, 26), colText)
+    let sw = clamp(p.w - LabelW - 8 - 70, 120'f32, 300'f32)
+    discard ui.slider("o-osdscale", rect(p.x + 8 + LabelW, p.y, sw, 26), c.osdScale,
+      OsdScaleMin, OsdScaleMax, 0.05)
+    ui.textIn(osd, rect(p.x + 8 + LabelW + sw + 14, p.y, 60, 26), colText)
+    p.y += Row + 4
   ui.checkRow(p, "o-osdwin", "Scale with window size", c.osdScaleByWindow)
   ui.hint(p, if c.osdScaleByWindow: "OSD text grows and shrinks with the video frame."
              else: "OSD text keeps the same size whatever the window's size.")
@@ -334,11 +427,26 @@ proc interfacePage(ui: Ui, c: var Config, p: var Pane) =
   ui.radioRow(p, "o-tpath", "Display full path", c.titleFullPath, true)
   ui.checkRow(p, "o-ttitle", "Replace file name with title", c.titleUseMediaTitle)
 
-proc formatsPage(d: OptionsDialog, ui: Ui, p: var Pane, bottom: float32) =
+proc loadAssoc(d: OptionsDialog) =
   if not d.assocLoaded:
     d.assoc = loadAssocItems()
     d.assocLoaded = true
     d.listScroll = 0
+
+proc formatsResults(d: OptionsDialog, ui: Ui, p: var Pane) =
+  ## Formats while searching: the matching formats; a click shows it in the list.
+  d.loadAssoc()
+  ui.group(p, "File association")
+  for it in d.assoc:
+    let kind = if it.video: "Video" else: "Audio"
+    let mimes = if it.mimes.len > 0: it.mimes.join(", ") else: "not in the MIME database"
+    if ui.show(p, "." & it.ext, kind, mimes) and
+       ui.resultRow(p, "." & it.ext, kind & (if it.checked: ", opens here" else: "") & "  " & mimes):
+      d.search = it.ext
+      d.listCursor = 0
+
+proc formatsPage(d: OptionsDialog, ui: Ui, p: var Pane, bottom: float32) =
+  d.loadAssoc()
   ui.group(p, "File association")
   discard ui.textField("o-search", rect(p.x + 8, p.y, p.w - 8, 26), d.search,
     "Search extensions or MIME types")
@@ -478,13 +586,14 @@ proc pathsPage(d: OptionsDialog, ui: Ui, c: var Config, p: var Pane) =
   ui.hint(p, "mkvpropedit embeds bookmarks as chapters; yt-dlp opens and saves online videos.")
   ui.hint(p, "Empty: the one the player installed, else the one on PATH.")
   ui.group(p, "Settings")
-  ui.textIn("Settings folder", rect(p.x + 8, p.y, LabelW, 26), colText)
-  const bw = 96'f32
-  let tw = max(120'f32, p.w - LabelW - 8 - bw - 8)
-  ui.textIn(ui.ellipsize(configDir(), tw), rect(p.x + 8 + LabelW, p.y, tw, 26), colTextDim)
-  if ui.textButton("o-cfgdir", rect(p.x + 16 + LabelW + tw, p.y, bw, 26), "Open"):
-    d.request = prShowSettings
-  p.y += Row + 4
+  if ui.show(p, "Settings folder", configDir()):
+    ui.textIn("Settings folder", rect(p.x + 8, p.y, LabelW, 26), colText)
+    const bw = 96'f32
+    let tw = max(120'f32, p.w - LabelW - 8 - bw - 8)
+    ui.textIn(ui.ellipsize(configDir(), tw), rect(p.x + 8 + LabelW, p.y, tw, 26), colTextDim)
+    if ui.textButton("o-cfgdir", rect(p.x + 16 + LabelW + tw, p.y, bw, 26), "Open"):
+      d.request = prShowSettings
+    p.y += Row + 4
   ui.hint(p, "Settings, remembered positions, bookmarks and Run commands are kept here.")
 
 const KeyCapture = "o-keycap"     ## focusId while waiting for a key
@@ -514,6 +623,20 @@ proc assignKeys*(d: OptionsDialog, c: var Config, act: KeyAction, ks: seq[KeyCom
     if ks.len == 0: Actions[act].label & ": no key"
     else: Actions[act].label & ": " & c.keysText(act)
   if taken.len > 0: d.keyNote.add " (taken from " & taken.join(", ") & ")"
+
+proc keysResults(d: OptionsDialog, ui: Ui, c: Config, p: var Pane) =
+  ## Keys while searching: the matching commands under their groups; a click
+  ## selects it in the list.
+  for g in KeyGroup:
+    ui.group(p, $g)
+    for act in KeyAction:
+      if Actions[act].group != g: continue
+      let key = c.keysText(act)
+      if ui.show(p, Actions[act].label, key) and
+         ui.resultRow(p, Actions[act].label, if key.len > 0: key else: "None", 190):
+        d.keySearch = ""
+        d.keySel = act
+        d.keyReveal = true
 
 proc keysPage(d: OptionsDialog, ui: Ui, c: var Config, p: var Pane, bottom: float32) =
   let w = ui.window
@@ -709,15 +832,17 @@ proc onlinePage(ui: Ui, c: var Config, p: var Pane) =
   ui.radioRow(p, "o-sqlimit", "Limit resolution to:", c.streamQuality, sqLimit)
   # The heights to pick from, on a line of their own under it; picking one
   # picks the limit too.
-  var x = p.x + 32
-  for h in [2160, 1440, 1080, 720, 480, 360, 240]:
-    let label = $h & "p"
-    if ui.radioButton(&"o-sqh{h}", vec2(x, p.y + 2), label,
-                      c.streamQuality == sqLimit and c.streamMaxHeight == h):
-      c.streamQuality = sqLimit
-      c.streamMaxHeight = h
-    x += 24 + ui.textSize(label).x + 14
-  p.y += Row
+  const Heights = [2160, 1440, 1080, 720, 480, 360, 240]
+  if ui.show(p, "Limit resolution to:", Heights.mapIt($it & "p").join(" ")):
+    var x = p.x + 32
+    for h in Heights:
+      let label = $h & "p"
+      if ui.radioButton(&"o-sqh{h}", vec2(x, p.y + 2), label,
+                        c.streamQuality == sqLimit and c.streamMaxHeight == h):
+        c.streamQuality = sqLimit
+        c.streamMaxHeight = h
+      x += 24 + ui.textSize(label).x + 14
+    p.y += Row
   ui.radioRow(p, "o-sqlow", "Lowest quality (uses the least data)", c.streamQuality, sqLowest)
   ui.radioRow(p, "o-sqaudio", "Audio only (no video is downloaded)", c.streamQuality, sqAudioOnly)
   p.gap
@@ -727,12 +852,26 @@ proc onlinePage(ui: Ui, c: var Config, p: var Pane) =
   ui.hint(p, "Applies to links opened from now on; cached media plays as it was cached.")
   ui.hint(p, "When nothing fits a limit, the smallest version available is fetched instead.")
 
+proc audioFilesPage(ui: Ui, c: var Config, p: var Pane) =
+  ui.group(p, "Front cover")
+  ui.checkRow(p, "o-cover", "Show an audio file's front cover", c.showCover)
+  if ui.show(p, "Folder pictures", c.coverNames):
+    ui.textIn("Folder pictures", rect(p.x + 8, p.y, LabelW, 26), colText)
+    discard ui.textArea("o-covernames", rect(p.x + 8 + LabelW, p.y, max(120'f32, p.w - LabelW - 8), 96),
+      c.coverNames, "e.g. folder")
+    p.y += 96 + 4
+  ui.hint(p, "Without a cover inside it, a picture in its folder with one of these names, one per line.")
+  ui.hint(p, "Earlier lines win; letter case and the extension (.jpg, .png...) don't matter.")
+  ui.group(p, "Very short files")
+  ui.checkRow(p, "o-shortaudio", "Add delay after very short files", c.shortAudioDelay)
+  ui.numberRow(p, "o-shortaudioms", "Delay (milliseconds)", c.shortAudioMs, 50, 1, 60_000)
+  ui.hint(p, "A file shorter than this is followed by this much silence before the next item.")
+
 proc webPage(d: OptionsDialog, ui: Ui, c: var Config, p: var Pane, bottom: float32) =
   let web = d.web
   ui.group(p, "Cache folder")
   const bw = 96'f32
   const lw = 110'f32            # narrower labels: the folder field has two buttons
-  ui.textIn("Space taken", rect(p.x + 8, p.y, lw, 26), colText)
   proc pct(part, whole: float): string =
     let v = 100 * part / whole
     if v < 10: formatFloat(v, ffDecimal, 1) & "%" else: $int(round(v)) & "%"
@@ -741,28 +880,31 @@ proc webPage(d: OptionsDialog, ui: Ui, c: var Config, p: var Pane, bottom: float
     &" of {c.webSizeGB} GiB)"
   elif web.total > 0: usage.add "  (" & pct(web.used.float, web.total.float) & " of the disk)"
   if web.free >= 0: usage.add "  " & fmtBytes(web.free.float) & " free"
-  let uw = p.w - lw - 8 - 128
-  ui.textIn(ui.ellipsize(usage, uw), rect(p.x + 8 + lw, p.y, uw, 26), colTextDim)
-  let clearR = rect(p.x + p.w - 120, p.y, 120, 26)
-  if d.confirmClear:
-    if ui.textButton("o-webclear-yes", clearR, "Really clear?", primary = true):
-      d.confirmClear = false
-      d.request = prClearWeb
-    elif ui.pressed() and not ui.hover(clearR): d.confirmClear = false
-  elif ui.button("o-webclear", "Clear cache", clearR, web.items.len > 0 or web.used > 0):
-    d.confirmClear = true
-  p.y += Row + 4
-  ui.textIn("Folder", rect(p.x + 8, p.y, lw, 26), colText)
-  let fw = max(120'f32, p.w - lw - 8 - 2 * (bw + 8))
-  discard ui.textField("o-webdir", rect(p.x + 8 + lw, p.y, fw, 26), c.webDir,
-    defaultSaveDir())
-  if ui.textButton("o-webdir-browse", rect(p.x + 16 + lw + fw, p.y, bw, 26), "Browse..."):
-    d.request = prBrowseWeb
-  if ui.textButton("o-webdir-open", rect(p.x + 24 + lw + fw + bw, p.y, bw, 26), "Open"):
-    d.request = prOpenWebDir
-  p.y += Row + 4
+  if ui.show(p, "Space taken", usage, "Clear cache"):
+    ui.textIn("Space taken", rect(p.x + 8, p.y, lw, 26), colText)
+    let uw = p.w - lw - 8 - 128
+    ui.textIn(ui.ellipsize(usage, uw), rect(p.x + 8 + lw, p.y, uw, 26), colTextDim)
+    let clearR = rect(p.x + p.w - 120, p.y, 120, 26)
+    if d.confirmClear:
+      if ui.textButton("o-webclear-yes", clearR, "Really clear?", primary = true):
+        d.confirmClear = false
+        d.request = prClearWeb
+      elif ui.pressed() and not ui.hover(clearR): d.confirmClear = false
+    elif ui.button("o-webclear", "Clear cache", clearR, web.items.len > 0 or web.used > 0):
+      d.confirmClear = true
+    p.y += Row + 4
+  if ui.show(p, "Folder", c.webDir, defaultSaveDir()):
+    ui.textIn("Folder", rect(p.x + 8, p.y, lw, 26), colText)
+    let fw = max(120'f32, p.w - lw - 8 - 2 * (bw + 8))
+    discard ui.textField("o-webdir", rect(p.x + 8 + lw, p.y, fw, 26), c.webDir,
+      defaultSaveDir())
+    if ui.textButton("o-webdir-browse", rect(p.x + 16 + lw + fw, p.y, bw, 26), "Browse..."):
+      d.request = prBrowseWeb
+    if ui.textButton("o-webdir-open", rect(p.x + 24 + lw + fw + bw, p.y, bw, 26), "Open"):
+      d.request = prOpenWebDir
+    p.y += Row + 4
   ui.hint(p, "Online media is cached here as it streams, and plays from disk when opened again.")
-  if c.webDir.expandPath notin ["", web.dir]:
+  if p.follows and c.webDir.expandPath notin ["", web.dir]:
     ui.textIn("Applied on OK; what's cached in the current folder stays there.",
       rect(p.x + 8, p.y - 2, p.w - 8, 18), colAccent, FontSmall)
     p.y += 20
@@ -774,6 +916,11 @@ proc webPage(d: OptionsDialog, ui: Ui, c: var Config, p: var Pane, bottom: float
   ui.hint(p, "Checked on OK, at start and as media is cached; the least recently opened go first.")
 
   ui.group(p, "Cached media")
+  if p.find.len > 0:            # the matching links; a click opens the page
+    for it in web.items:
+      let title = if it.title.len > 0: it.title else: it.url
+      if ui.show(p, title, it.url): discard ui.resultRow(p, title, fmtBytes(it.bytes.float), 90)
+    return
   # Checked items still cached; the list may have changed since.
   var picked: seq[string]
   for it in web.items:
@@ -1057,6 +1204,7 @@ proc colorRow(d: OptionsDialog, ui: Ui, p: var Pane, id, label: string, value: v
     if d.pickClose:
       d.picker = ""
       if ui.focusId == PickerFocus: ui.focusId = ""
+  if not ui.show(p, label, value): return
   ui.textIn(label, rect(p.x + 8, p.y, LabelW, 26), colText)
   var x = p.x + 8 + LabelW
   let ok = value.validColor
@@ -1260,11 +1408,12 @@ proc subtitlesPage(d: OptionsDialog, ui: Ui, c: var Config, p: var Pane) =
 
 proc subStylePage(d: OptionsDialog, ui: Ui, c: var Config, p: var Pane) =
   ui.group(p, "Default style")
-  d.fontRow(ui, p, c.subFont)
-  ui.textIn("Style", rect(p.x + 8, p.y, LabelW, 26), colText)
-  discard ui.checkbox("o-sbold", vec2(p.x + 8 + LabelW, p.y + 2), "Bold", c.subBold)
-  discard ui.checkbox("o-sitalic", vec2(p.x + 8 + LabelW + 90, p.y + 2), "Italic", c.subItalic)
-  p.y += Row + 4
+  if ui.show(p, "Font", c.subFont): d.fontRow(ui, p, c.subFont)
+  if ui.show(p, "Style", "Bold", "Italic"):
+    ui.textIn("Style", rect(p.x + 8, p.y, LabelW, 26), colText)
+    discard ui.checkbox("o-sbold", vec2(p.x + 8 + LabelW, p.y + 2), "Bold", c.subBold)
+    discard ui.checkbox("o-sitalic", vec2(p.x + 8 + LabelW + 90, p.y + 2), "Italic", c.subItalic)
+    p.y += Row + 4
   ui.numberRow(p, "o-ssize", "Size", c.subSize, 2, 1, 300)
   ui.numberRow(p, "o-sspacing", "Character spacing", c.subSpacing, 0.5, -10, 10, 1)
   ui.numberRow(p, "o-slinesp", "Line spacing", c.subLineSpacing, 1, -100, 200, 1)
@@ -1280,9 +1429,10 @@ proc subStylePage(d: OptionsDialog, ui: Ui, c: var Config, p: var Pane) =
   ui.hint(p, if c.subStyleAss: "Styled subtitles lose their own fonts, colors and positioning."
              else: "Styled subtitles keep their own look; this style is for plain ones (SRT...).")
   p.gap
-  if ui.textButton("o-sreset", rect(p.x + 8, p.y, 140, 28), "Reset style"):
-    c.resetSubStyle()
-  p.y += 34
+  if ui.show(p, "Reset style"):
+    if ui.textButton("o-sreset", rect(p.x + 8, p.y, 140, 28), "Reset style"):
+      c.resetSubStyle()
+    p.y += 34
 
 proc miscPage(ui: Ui, c: var Config, p: var Pane) =
   ui.group(p, "Steps")
@@ -1308,7 +1458,8 @@ proc systemPage(ui: Ui, c: var Config, p: var Pane) =
   var mb = c.loopFramesMB.float
   ui.numberRow(p, "o-lfmem", "Loop frames (MB)", mb, 64, 64, LoopFramesMaxMB.float)
   c.loopFramesMB = clamp(int(round(mb)), 64, LoopFramesMaxMB)
-  ui.hint(p, "Video memory for short A-B loops' frames, which keep them moving.")
+  ui.hint(p, "Video memory for short A-B loops' frames, which keep them moving,")
+  ui.hint(p, "and for the frames kept around a paused position, for instant frame steps.")
   ui.hint(p, &"Loops needing more play the plain way, often frozen. At most {LoopFramesMaxMB} MB.")
 
 # --- window -----------------------------------------------------------------------
@@ -1322,7 +1473,20 @@ proc draw*(d: OptionsDialog, ui: Ui, c: var Config, r: Rect): OptionsAction =
   d.pickerInput(ui, c)
   d.fontInput(ui, c)
 
-  let body = rect(r.x + 16, r.y + 16, r.w - 32, r.h - 16 - 58)
+  # The search bar spans both columns. Esc in it, or with nothing focused,
+  # empties it first.
+  let findR = rect(r.x + 16, r.y + 16, r.w - 32, 26)
+  if d.find.len > 0 and w.buttonPressed[KeyEscape] and ui.focusId in ["", "o-find"]:
+    d.find = ""
+    ui.focusId = ""
+  if eeChanged in ui.textField("o-find", findR, d.find,
+      "Search options: headers, labels or values"):
+    d.findScroll = 0
+    d.picker = ""
+    d.fontOpen = false
+  let searching = d.find.strip.len > 0
+
+  let body = rect(r.x + 16, findR.y + findR.h + 10, r.w - 32, r.h - 16 - 58 - findR.h - 10)
   let treeR = rect(body.x, body.y, TreeWidth, body.h)
   d.drawTree(ui, treeR, keys)
 
@@ -1330,22 +1494,46 @@ proc draw*(d: OptionsDialog, ui: Ui, c: var Config, r: Rect): OptionsAction =
   ui.sk.pushClipRect(pageR)
   let outerClip = ui.hitClip
   ui.hitClip = pageR
-  let origin = pageR.y - d.scroll
+  let scroll = if searching: addr d.findScroll else: addr d.scroll
+  let origin = pageR.y - scroll[]
   var p = Pane(x: pageR.x, y: origin, w: pageR.w - 12)
   let pageStops = ui.tabStops.len
-  case d.page
-  of opPlayer: playerPage(ui, c, p)
-  of opInterface: interfacePage(ui, c, p)
-  of opFormats: d.formatsPage(ui, p, pageR.y + pageR.h)
-  of opPaths: d.pathsPage(ui, c, p)
-  of opKeys: d.keysPage(ui, c, p, pageR.y + pageR.h)
-  of opPlayback: playbackPage(ui, c, p)
-  of opOnline: onlinePage(ui, c, p)
-  of opWeb: d.webPage(ui, c, p, pageR.y + pageR.h)
-  of opSubtitles: d.subtitlesPage(ui, c, p)
-  of opSubStyle: d.subStylePage(ui, c, p)
-  of opMisc: miscPage(ui, c, p)
-  of opSystem: systemPage(ui, c, p)
+  if searching:
+    # Every page in the tree's order, keeping the rows that match.
+    p.find = strutils.splitWhitespace(d.find.toLowerAscii)
+    for (page, _) in Tree:
+      p.page = page
+      case page
+      of opPlayer: playerPage(ui, c, p)
+      of opInterface: interfacePage(ui, c, p)
+      of opFormats: d.formatsResults(ui, p)
+      of opPaths: d.pathsPage(ui, c, p)
+      of opKeys: d.keysResults(ui, c, p)
+      of opPlayback: playbackPage(ui, c, p)
+      of opOnline: onlinePage(ui, c, p)
+      of opWeb: d.webPage(ui, c, p, pageR.y + pageR.h)
+      of opAudioFiles: audioFilesPage(ui, c, p)
+      of opSubtitles: d.subtitlesPage(ui, c, p)
+      of opSubStyle: d.subStylePage(ui, c, p)
+      of opMisc: miscPage(ui, c, p)
+      of opSystem: systemPage(ui, c, p)
+    if not p.started:
+      ui.textIn("No matching options", rect(p.x, p.y, p.w, 40), colTextDim, h = CenterAlign)
+  else:
+    case d.page
+    of opPlayer: playerPage(ui, c, p)
+    of opInterface: interfacePage(ui, c, p)
+    of opFormats: d.formatsPage(ui, p, pageR.y + pageR.h)
+    of opPaths: d.pathsPage(ui, c, p)
+    of opKeys: d.keysPage(ui, c, p, pageR.y + pageR.h)
+    of opPlayback: playbackPage(ui, c, p)
+    of opOnline: onlinePage(ui, c, p)
+    of opWeb: d.webPage(ui, c, p, pageR.y + pageR.h)
+    of opAudioFiles: audioFilesPage(ui, c, p)
+    of opSubtitles: d.subtitlesPage(ui, c, p)
+    of opSubStyle: d.subStylePage(ui, c, p)
+    of opMisc: miscPage(ui, c, p)
+    of opSystem: systemPage(ui, c, p)
   ui.hitClip = outerClip
   ui.sk.popClipRect()
   let pageStopsEnd = ui.tabStops.len
@@ -1354,13 +1542,17 @@ proc draw*(d: OptionsDialog, ui: Ui, c: var Config, r: Rect): OptionsAction =
   let contentH = p.y - origin
   let maxScroll = max(0'f32, contentH - pageR.h)
   if ui.hover(pageR) and ui.scroll() != 0:
-    d.scroll += ui.scroll() * 3
+    scroll[] += ui.scroll() * 3
     ui.scrollConsumed = true
-  d.scroll = clamp(d.scroll, 0, maxScroll)
+  scroll[] = clamp(scroll[], 0, maxScroll)
   if maxScroll > 0:
     let th = max(24'f32, pageR.h * pageR.h / contentH)
-    let ty = pageR.y + (pageR.h - th) * (d.scroll / maxScroll)
+    let ty = pageR.y + (pageR.h - th) * (scroll[] / maxScroll)
     ui.rect(rect(pageR.x + pageR.w - 4, ty, 3, th), colTrack)
+  if p.jump:                    # a search result was clicked: open its page
+    d.find = ""
+    d.selectPage(ui, p.jumpTo)
+    d.scroll = 0
 
   ui.rect(rect(r.x + 1, r.y + r.h - 50, r.w - 2, 1), colBorder)
   let by = r.y + r.h - 40
@@ -1382,6 +1574,6 @@ proc draw*(d: OptionsDialog, ui: Ui, c: var Config, r: Rect): OptionsAction =
   let i = if d.keyTaken or d.picker.len > 0: -1 else: ui.tabNavigate()
   if i >= pageStops and i < pageStopsEnd:
     let sr = ui.tabStops[i].r
-    if sr.y < pageR.y: d.scroll -= pageR.y - sr.y + 4
-    elif sr.y + sr.h > pageR.y + pageR.h: d.scroll += sr.y + sr.h - pageR.y - pageR.h + 4
-    d.scroll = clamp(d.scroll, 0, maxScroll)
+    if sr.y < pageR.y: scroll[] -= pageR.y - sr.y + 4
+    elif sr.y + sr.h > pageR.y + pageR.h: scroll[] += sr.y + sr.h - pageR.y - pageR.h + 4
+    scroll[] = clamp(scroll[], 0, maxScroll)

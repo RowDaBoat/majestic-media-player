@@ -139,9 +139,12 @@ proc resolve*(p: CmdPart, path: string, picks: Table[string, string]): tuple[val
     else:
       result.err = "Card " & p.name & " doesn't refer to anything"
 
-proc compose*(parts: seq[CmdPart], path: string, picks: Table[string, string]): tuple[script, err: string] =
+proc compose*(parts: seq[CmdPart], path: string, picks: Table[string, string],
+    timeFix = ""): tuple[script, err: string] =
   ## A bash script: one assignment per card, then the command line with each
   ## card expanded as "${name}" (quoted to fit the quotes typed around it).
+  ## With timeFix, a bash function, timestamps are assigned what it makes of
+  ## them (times of a clip of the media file).
   var assigned: seq[string]
   var body = ""
   var inSingle, inDouble, escaped = false
@@ -159,7 +162,9 @@ proc compose*(parts: seq[CmdPart], path: string, picks: Table[string, string]): 
     if err.len > 0: return ("", err)
     if p.name notin assigned:
       assigned.add p.name
-      result.script.add p.name & "=" & quoteShellPosix(value) & "\n"
+      result.script.add p.name & "=" &
+        (if timeFix.len > 0 and p.isTimestamp: "$(" & timeFix & " " & quoteShellPosix(value) & ") || exit"
+         else: quoteShellPosix(value)) & "\n"
     let v = "${" & p.name & "}"
     body.add(if inSingle: "'\"" & v & "\"'" elif inDouble: v else: "\"" & v & "\"")
   result.script.add body

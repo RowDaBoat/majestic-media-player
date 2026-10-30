@@ -1,8 +1,17 @@
 diff --git a/src/windy/platforms/linux/x11.nim b/src/windy/platforms/linux/x11.nim
-index 5b29e3c..70ee52a 100644
+index 5b29e3c..a48ba81 100644
 --- a/src/windy/platforms/linux/x11.nim
 +++ b/src/windy/platforms/linux/x11.nim
-@@ -66,6 +66,8 @@ var
+@@ -52,6 +52,8 @@ type
+     xdndSource: XWindow
+     xdndVersion: int32
+     xdndFormat: Atom
++    xdndIncr: bool      ## a large drop is arriving in chunks (INCR)
++    xdndData: string    ## the chunks so far
+ 
+     state: WindowState
+ 
+@@ -66,6 +68,8 @@ var
    onQuitRequest*: Callback
    multiClickInterval*: Duration = initDuration(milliseconds = 200)
    multiClickRadius*: float = 4
@@ -11,25 +20,27 @@ index 5b29e3c..70ee52a 100644
  
    initialized: bool
    windows: seq[Window]
-@@ -94,6 +96,8 @@ var
+@@ -94,6 +98,9 @@ var
    xaXdndActionPrivate: Atom
    xaTextUriList: Atom
    xaTextPlain: Atom
 +  xaTextPlainUtf8: Atom
 +  xaString: Atom
++  xaIncr: Atom
    xaXdndAware: Atom
  
  proc initConstants(display: Display) =
-@@ -133,6 +137,8 @@ proc initConstants(display: Display) =
+@@ -133,6 +140,9 @@ proc initConstants(display: Display) =
    xaXdndActionPrivate = display.XInternAtom("XdndActionPrivate", 0)
    xaTextUriList = display.XInternAtom("text/uri-list", 0)
    xaTextPlain = display.XInternAtom("text/plain", 0)
 +  xaTextPlainUtf8 = display.XInternAtom("text/plain;charset=utf-8", 0)
 +  xaString = display.XInternAtom("STRING", 0)
++  xaIncr = display.XInternAtom("INCR", 0)
    xaXdndAware = display.XInternAtom("XdndAware", 0)
  
  proc atomIfExist(name: string): Atom =
-@@ -192,7 +198,8 @@ proc property(
+@@ -192,7 +202,8 @@ proc property(
  
    result.kind = kind
  
@@ -39,7 +50,7 @@ index 5b29e3c..70ee52a 100644
    result.data = newString(len)
    if len != 0:
      copyMem(result.data[0].addr, data, len)
-@@ -788,6 +795,19 @@ proc newWindow*(
+@@ -788,6 +799,19 @@ proc newWindow*(
      result.handle, wmProtocols[0].addr, cint wmProtocols.len
    )
  
@@ -59,7 +70,7 @@ index 5b29e3c..70ee52a 100644
    result.im = display.XOpenIM
    result.ic = result.im.XCreateIC(
      "clientWindow",
-@@ -814,8 +834,11 @@ proc newWindow*(
+@@ -814,8 +838,11 @@ proc newWindow*(
    result.applyCursor()
  
    # Enable XDnD awareness (version 5)
@@ -73,7 +84,49 @@ index 5b29e3c..70ee52a 100644
  
    makeContextCurrent result
  
-@@ -865,8 +888,8 @@ proc pollEvents(window: Window) =
+@@ -849,6 +876,41 @@ proc newWindow*(
+ 
+   windows.add result
+ 
++proc finishDrop(window: Window, data: string) =
++  ## The whole of a drop's data has arrived: hands it over and tells the source.
++  if data.len > 0:
++    # Parse URI list (files separated by newlines).
++    let uriList = data.strip(leading = false, chars = {'\0'})
++    for line in uriList.splitLines():
++      if line.len > 0 and not line.startsWith("#") and window.onFileDrop != nil:
++        # Convert file URIs to local paths; other URIs (http, ...) pass
++        # through. The contents are not read: drops can be huge media
++        # files or directories, so fileData is always empty.
++        let filePath =
++          if line.startsWith("file://"): decodeUrl(line[7..^1], decodePlus = false)
++          else: line
++        window.onFileDrop(filePath, "")
++
++  # Clean up the property.
++  window.handle.delProperty(xaWindyXdndTargetProperty)
++
++  # Send finished message.
++  if window.xdndVersion >= 2:
++    let reply = window.xdndSource.newClientMessage(xaXdndFinished, [
++      cast[clong](window.handle),
++      1.clong,  # Data received successfully
++      cast[clong](xaXdndActionCopy)
++    ])
++    window.xdndSource.send(reply)
++    display.XFlush()
++
++  # Reset XDnD state.
++  window.xdndSource = 0
++  window.xdndVersion = 0
++  window.xdndFormat = 0
++  window.xdndIncr = false
++  window.xdndData = ""
++
+ proc pollEvents(window: Window) =
+ 
+   # Clear all per-frame data
+@@ -865,8 +927,8 @@ proc pollEvents(window: Window) =
      d: Display,
      event: ptr XEvent,
      userData: pointer
@@ -84,7 +137,34 @@ index 5b29e3c..70ee52a 100644
  
    template pushButtonEvent(
      button: Button,
-@@ -925,9 +948,12 @@ proc pollEvents(window: Window) =
+@@ -909,25 +971,35 @@ proc pollEvents(window: Window) =
+         window.xdndSource = cast[XWindow](ev.client.data.l[0])
+         window.xdndVersion = (ev.client.data.l[1] shr 24).int32
+         window.xdndFormat = 0
++        window.xdndIncr = false
++        window.xdndData = ""
+ 
+         if window.xdndVersion > 5:
+           continue
+ 
+         var formats: seq[Atom]
+ 
+-        # Try to get the full type list from source window.
+-        let prop = window.xdndSource.property(xaXdndTypeList)
+-        if prop.data.len > 0:
+-          formats = prop.data.asSeq(Atom)
++        # More than three types: the full list is in the source's
++        # XdndTypeList. Only then; otherwise that property can still hold an
++        # earlier drag's list (KWin keeps a file drag's text/uri-list there),
++        # and a text drop would ask for a format it doesn't have and be lost.
++        let typeList =
++          if (ev.client.data.l[1] and 1) != 0: window.xdndSource.property(xaXdndTypeList).data
++          else: ""
++        if typeList.len > 0:
++          formats = typeList.asSeq(Atom)
+         else:
+           # Fall back to formats from client message data.
+           for i in 2..4:
              if ev.client.data.l[i] != 0:
                formats.add(cast[Atom](ev.client.data.l[i]))
  
@@ -100,7 +180,7 @@ index 5b29e3c..70ee52a 100644
              window.xdndFormat = fmt
              break
  
-@@ -941,6 +967,13 @@ proc pollEvents(window: Window) =
+@@ -941,6 +1013,13 @@ proc pollEvents(window: Window) =
          if window.xdndVersion > 5:
            continue
  
@@ -114,7 +194,25 @@ index 5b29e3c..70ee52a 100644
          # Send status back to source.
          let acceptFlag: clong = if window.xdndFormat != 0: 1 else: 0
          let action: clong = if window.xdndVersion >= 2 and window.xdndFormat != 0: cast[clong](xaXdndActionCopy) else: 0
-@@ -1055,10 +1088,13 @@ proc pollEvents(window: Window) =
+@@ -993,13 +1072,15 @@ proc pollEvents(window: Window) =
+       if window.ic != nil:
+         XSetICFocus window.ic
+ 
+-      # press currently pressed keys
++      # Keys held as focus arrives are down, not pressed here: they were
++      # pressed in another window. (Enter accepting a file dialog would
++      # otherwise press Enter again in the window focus returns to.)
+       for k in queryKeyboardState().mapit(
+           keysymToButton display.XKeycodeToKeysym(it.char, 0
+         )):
+         if k == ButtonUnknown:
+           continue
+-        pushButtonEvent(k, true)
++        window.buttonDown.incl k
+ 
+       if window.onFocusChange != nil:
+         window.onFocusChange()
+@@ -1055,10 +1136,13 @@ proc pollEvents(window: Window) =
  
      of xeButtonPress, xeButtonRelease:
  
@@ -131,46 +229,72 @@ index 5b29e3c..70ee52a 100644
  
        let
          now = getTime()
-@@ -1122,18 +1158,30 @@ proc pollEvents(window: Window) =
+@@ -1122,36 +1206,39 @@ proc pollEvents(window: Window) =
  
      of xeSelection:
        # Handle XDnD selection data.
 -      if ev.selection.property == xaWindyXdndTargetProperty:
-+      if ev.selection.property == 0 and window.xdndSource != 0 and
-+         ev.selection.selection == xaXdndSelection:
-+        # The source couldn't give the format asked for: the drop failed.
-+        if window.xdndVersion >= 2:
-+          window.xdndSource.send(window.xdndSource.newClientMessage(xaXdndFinished,
-+            [cast[clong](window.handle), 0.clong, 0.clong]))
-+          display.XFlush()
-+        window.xdndSource = 0
-+        window.xdndVersion = 0
-+        window.xdndFormat = 0
-+      elif ev.selection.property == xaWindyXdndTargetProperty:
-         let prop = window.handle.property(xaWindyXdndTargetProperty)
-         if prop.data.len > 0:
-           # Parse URI list (files separated by newlines).
+-        let prop = window.handle.property(xaWindyXdndTargetProperty)
+-        if prop.data.len > 0:
+-          # Parse URI list (files separated by newlines).
 -          let uriList = prop.data
-+          let uriList = prop.data.strip(leading = false, chars = {'\0'})
-           for line in uriList.splitLines():
+-          for line in uriList.splitLines():
 -            if line.len > 0 and line.startsWith("file://"):
 -              # Convert URI to local path and decode percent-encoding.
 -              var filePath = decodeUrl(line[7..^1])
 -              if window.onFileDrop != nil:
 -                let fileContent = readFile(filePath)
 -                window.onFileDrop(filePath, fileContent)
-+            if line.len > 0 and not line.startsWith("#") and window.onFileDrop != nil:
-+              # Convert file URIs to local paths; other URIs (http, ...) pass
-+              # through. The contents are not read: drops can be huge media
-+              # files or directories, so fileData is always empty.
-+              let filePath =
-+                if line.startsWith("file://"): decodeUrl(line[7..^1], decodePlus = false)
-+                else: line
-+              window.onFileDrop(filePath, "")
+-
+-        # Clean up the property.
+-        window.handle.delProperty(xaWindyXdndTargetProperty)
+-
+-        # Send finished message.
++      if ev.selection.property == 0 and window.xdndSource != 0 and
++         ev.selection.selection == xaXdndSelection:
++        # The source couldn't give the format asked for: the drop failed.
+         if window.xdndVersion >= 2:
+-          let reply = window.xdndSource.newClientMessage(xaXdndFinished, [
+-            cast[clong](window.handle),
+-            1.clong,  # Data received successfully
+-            cast[clong](xaXdndActionCopy)
+-          ])
+-          window.xdndSource.send(reply)
++          window.xdndSource.send(window.xdndSource.newClientMessage(xaXdndFinished,
++            [cast[clong](window.handle), 0.clong, 0.clong]))
+           display.XFlush()
+-
+-        # Reset XDnD state.
+         window.xdndSource = 0
+         window.xdndVersion = 0
+         window.xdndFormat = 0
++      elif ev.selection.property == xaWindyXdndTargetProperty:
++        let prop = window.handle.property(xaWindyXdndTargetProperty)
++        if prop.kind == xaIncr:
++          # Too big for one property (KWin's limit is 64 KiB, a list of a
++          # thousand files): deleting it asks the source for the first chunk.
++          window.xdndIncr = true
++          window.xdndData = ""
++          window.handle.delProperty(xaWindyXdndTargetProperty)
++          display.XFlush()
++        else:
++          window.finishDrop(prop.data)
++
++    of xeProperty:
++      # The next chunk of a large drop; an empty one ends it.
++      if window.xdndIncr and ev.property.state == PropertyNewValue and
++         ev.property.atom == xaWindyXdndTargetProperty:
++        let prop = window.handle.property(xaWindyXdndTargetProperty)
++        if prop.data.len > 0:
++          window.xdndData.add prop.data
++          window.handle.delProperty(xaWindyXdndTargetProperty)
++          display.XFlush()
++        else:
++          window.finishDrop(window.xdndData)
  
-         # Clean up the property.
-         window.handle.delProperty(xaWindyXdndTargetProperty)
-@@ -1224,8 +1272,8 @@ proc processClipboardEvents: bool =
+     else:
+       discard
+@@ -1224,8 +1311,8 @@ proc processClipboardEvents: bool =
      d: Display,
      event: ptr XEvent,
      userData: pointer
@@ -181,7 +305,7 @@ index 5b29e3c..70ee52a 100644
  
    while display.XCheckIfEvent(
      ev.addr, checkEvent, cast[pointer](clipboardWindow)
-@@ -1348,8 +1396,12 @@ proc `icon=`*(window: Window, icon: Image) =
+@@ -1348,8 +1435,12 @@ proc `icon=`*(window: Window, icon: Image) =
    var data: seq[uint64]
    data.add icon.width.uint64
    data.add icon.height.uint64
@@ -196,7 +320,7 @@ index 5b29e3c..70ee52a 100644
  
    display.XChangeProperty(
      window.handle,
-@@ -1455,3 +1507,4 @@ proc saveFileDialog*(
+@@ -1455,3 +1546,4 @@ proc saveFileDialog*(
      args.add("--file-filter=" & filter.name & " | " &
        filter.extensions.replace(";", " ").replace(",", " "))
    result = runZenity(args)

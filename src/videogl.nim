@@ -100,14 +100,17 @@ proc free*(t: var VideoTarget) =
     glDeleteTextures(1, t.tex.addr)
   t = VideoTarget()
 
-proc render*(ctx: MpvRenderContext, t: VideoTarget) =
-  ## Renders the current mpv frame into the target texture.
+proc render*(ctx: MpvRenderContext, t: VideoTarget, untimed = false) =
+  ## Renders the current mpv frame into the target texture; `untimed`, not
+  ## waiting for the time it's due.
   var
     fbo = MpvOpenGlFbo(fbo: t.fbo.cint, w: t.w.cint, h: t.h.cint)
     flip: cint = 0
+    blockFlag: cint = 0
     params = [
       MpvRenderParam(kind: rpOpenGlFbo, data: fbo.addr),
       MpvRenderParam(kind: rpFlipY, data: flip.addr),
+      MpvRenderParam(kind: if untimed: rpBlockForTargetTime else: rpInvalid, data: blockFlag.addr),
       MpvRenderParam(kind: rpInvalid, data: nil)
     ]
   discard mpv_render_context_render(ctx, params[0].addr)

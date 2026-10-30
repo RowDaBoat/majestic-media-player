@@ -100,12 +100,23 @@ The Run menu runs its command lines with Git for Windows' bash (set
   Default apps still wins there, and the Formats page says so.
 - The UI font is IBM Plex Sans (SIL Open Font License), embedded in the binary.
 
+- Frame steps: mpv's `frame-back-step` decodes from the previous keyframe on every press, so
+  it scales with keyframe spacing. While paused, the hidden standby player steps through the
+  frames around the position (up to `loopFramesMB`) and each is kept in a texture; a step shows
+  another texture and the main player follows with a coalesced exact seek, so `Player.timePos`
+  is held (`holdTime`) meanwhile. A frame is only kept once mpv has given both its new time and
+  a new picture: they arrive separately, in either order. The window refills near its edges.
+  Links, 360° video, A-B loops and CPU rendering use the plain mpv step, as does a press in the
+  second or so after pausing, before the frames are in.
+
 ## Source layout
 
 | File | Purpose |
 |---|---|
 | `src/majestic.nim` | App state, menus, layout, panels, main loop |
 | `src/player.nim` | mpv playback instance, thumbnail-preview instance, folder helpers |
+| `src/ytboard.nim` | YouTube storyboards for seek bar previews: fetched left to right into the cache, shown by the preview instance |
+| `src/srv3.nim` | YouTube's styled subtitles (srv3): fetched into the cache (the hook's links, `fmt=srv3`), turned into ASS, put in place of the plain tracks; File > Save muxes them into an .mkv with ffmpeg |
 | `src/videogl.nim` | mpv → texture rendering and the transformed video quad |
 | `src/menutree.nim` | Menu bar / popup / context-menu system |
 | `src/options.nim` | Options window (page tree and pages) |
@@ -121,7 +132,7 @@ The Run menu runs its command lines with Git for Windows' bash (set
 - `MMP_DEBUG=1` prints mpv's log to stderr.
 - `MMP_SCRIPT` drives the UI for automated checks, e.g.
   `MMP_SCRIPT="1:open ~/v.mkv;3:menu 1;3.5:shot /tmp/view.png;4:quit"`.
-  Commands: `open`, `menu <bar> [sub...]`, `ctx x y`, `close`, `mouse x y|off`,
+  Commands: `open`, `menu <bar> [sub...]`, `ctx x y [seek]`, `frame 0|1` (a frame step, 1 forward), `close`, `mouse x y|off`,
   `overlay <name>`, `optpage <page>`, `focus <field id>`, `type <text>`, `action Menu/Sub/Item`, `fs 0|1`, `seek t`, `pause`,
   `size w h`, `set prop value`, `dump props...`, `shot file.png`, `quit`.
   `shot` also writes each open menu popup as `file-menuN.png`.

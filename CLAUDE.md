@@ -153,3 +153,5 @@
 * Fullscreen should make the Seek bar, Controls and Status  (let's call it the "bottom layout") something that appears at the bottom of the screen for as long as the cursor is near the bottom side. The bottom layout in fullscreen mustn't move the video frame's position/dimensions when making it appear and disappear in the process.
 
 * The cursor must disappear when playing a video and the cursor is not moving and placed on top of the video frame after 1 second (and it must appear again when mouse is moved again or the video is paused/stopped)
+
+* Do all the scratchpad work here in `tmp/` (not in `/tmp/`).

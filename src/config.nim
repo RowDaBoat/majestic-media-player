@@ -13,6 +13,11 @@ type
   RepeatMode* = enum
     rmFile, rmPlaylist
 
+  PlaylistField* = enum
+    ## A playlist column, and what sorting by it goes by.
+    pfName, pfFilename, pfDuration, pfSize, pfDimensions, pfAudioBitrate,
+    pfTrack, pfArtist, pfYear, pfAlbum
+
   OpenMode* = enum
     omSamePlayer, omNewPlayer
 
@@ -53,8 +58,11 @@ type
     showStatus*: bool = true
     showPlaylist*: bool = false
     playlistWidth*: float = 300    # pixels, changed by dragging its left edge
-    playlistShowSize*: bool = false
+    playlistColumns*: seq[PlaylistField]   # shown, left to right; set by loadConfig when empty
+    playlistShowSize*: bool = false        # older versions' columns, read once into playlistColumns
     playlistShowDimensions*: bool = false
+    playlistCursorFollows*: bool = true    # the selection moves to the entry that plays
+    playlistShowMillis*: bool = false      # the Duration column as HH:MM:SS.mmm
     showRunLog*: bool = false
     seededPresets*: seq[string]    # preset command lines already offered once
     runLogHeight*: float = 200     # pixels, changed by dragging its bottom edge
@@ -83,6 +91,7 @@ type
     rememberTransform*: bool = false
     rememberPlaylist*: bool = false
     bookmarksAsChapters*: bool = false  # chapter steps also stop at bookmarks
+    bookmarkPreview*: bool = false # Edit Bookmark seeks to the time it shows
     titleFullPath*: bool = false
     titleUseMediaTitle*: bool = true
     # Options > Player > Paths
@@ -116,6 +125,13 @@ type
     streamLockAudio*: string = ""  # the audio row by rank: "auto", "highest", "mid",
                                    # "lowest" (ytdlp.AudioRanks); "" none
     ytThumbnail*: bool = true      # a YouTube link's thumbnail while no video track shows
+    ytSeekPreview*: bool = true    # seek bar previews on YouTube links, from its storyboards
+    showCover*: bool = true        # an audio file's front cover in the video frame
+    coverNames*: string = "folder\nalbum"  # pictures beside an audio file taken as its
+                                   # cover when it has none in it: names without the
+                                   # extension, one per line, first found wins
+    shortAudioDelay*: bool = true  # silence after a very short audio file, before the next
+    shortAudioMs*: float = 500     # how short, and how much silence: milliseconds
     # Options > Playback > Media Cache
     webDir*: string = ""           # "" = the cache folder's "streams"
     webKeepOn*: bool = true        # forget links not opened for webKeepHours
@@ -157,6 +173,7 @@ type
     playlist*: seq[string]         # kept when "Remember playlist" is on
     playlistIndex*: int = -1
     playlistTitles*: Table[string, string]  # its links' titles
+    playlistListed*: seq[string]   # its YouTube playlist links already listed
 
 const
   MaxRecent = 15
@@ -233,6 +250,10 @@ proc loadConfig*(): Config =
       result = readFile(path).fromJson(Config)
     except CatchableError as e:
       stderr.writeLine "config: ignoring unreadable ", path, ": ", e.msg
+  if result.playlistColumns.len == 0:
+    result.playlistColumns = @[pfName, pfDuration]
+    if result.playlistShowSize: result.playlistColumns.add pfSize
+    if result.playlistShowDimensions: result.playlistColumns.add pfDimensions
 
 proc save*(c: Config) =
   let path = configPath()
@@ -313,6 +334,7 @@ type
     ## Check for Updates), whatever the Remember options say.
     playlist*: seq[string]
     titles*: Table[string, string]  # its links' titles
+    listed*: seq[string]           # its YouTube playlist links already listed
     index*: int = -1               # the entry open, else -1
     selected*: int = -1            # the entry selected
     time*: float
