@@ -2,10 +2,10 @@
 ## as a seamless loop's standby, and a video-less third for a loop's sound)
 ## and a lightweight instance that renders seek-bar thumbnails.
 
-import std/[algorithm, atomics, json, sequtils, strutils, os, tables, times]
+import std/[algorithm, atomics, json, osproc, sequtils, strutils, os, tables, times]
 import mpv, videogl, spherical, gpumem, coverart
 from config import AudioExtensions
-from ytdlp import YtdlSubLangs
+from ytdlp import YtdlSubLangs, linkSphere, hlsSphere
 
 type
   Track* = object
@@ -51,6 +51,9 @@ type
     timeAt: float             ## when timePos last changed, epochTime
     frameDur: float           ## the last step of timePos while playing, a frame
     holdTime*: bool           ## the app sets timePos (step frames): mpv's lags behind
+    endPinned: bool           ## timePos is the last frame's (pinEnd), until eof-reached goes
+    eofJumps: int             ## jumps when the end was reached
+    timeJumps: int            ## jumps when the last time was taken
     eofReached*: bool
     backward*: bool           ## playing in reverse (ping-pong loops)
     threadless*: bool         ## opened without mpv's demuxer thread: turns
@@ -77,6 +80,10 @@ type
                               ## 403"): mpv then skips to the end
     gpuOom*: bool             ## mpv told of the GPU out of memory; the app clears it
     sphere*: SphereInfo       ## 360° metadata of the open file
+    savedSphere: SphereInfo   ## its saved part's (mpv's files don't say)
+    meshRead: Process         ## reading a link's mesh (startMeshRead); nil otherwise
+    meshHead: string          ## where it goes
+    meshHls: bool             ## LinkSphere's
     justLoaded*: bool         ## set on FILE_LOADED, cleared by the app
     eofHandled*: bool
     props*: Table[string, string]  ## MirroredProps as they are now
@@ -98,7 +105,12 @@ type
     openSeek: float           ## sought there while keepTime, -1: not; done once open
     pausedAt: float           ## when it last paused, epoch seconds
     endPaused: bool           ## paused by mpv on reaching the end, not by the user
+    endHold*: bool            ## sent to the last frame to stay there: not playback ending
+    endResumed*: bool         ## a seek back from there just set it playing
     sought*: float            ## where a seek is headed until its time gets there, -1: none
+    landing: float = -1       ## the time to show until an exact seek lands, -1: none
+    landingJumps, landingRestarts: int  ## jumps and restarts when it was asked for
+    landingAt: float          ## and when, epochTime
                               ## (the same media again) until it has loaded
     expanded*: seq[string]    ## expandText results, in order
     linkHooked: bool          ## LinkWaitHook added
@@ -116,6 +128,7 @@ type
     wantedImage, wantedCrop: string  ## showImage's request
     crop: string              ## and the part of the image displayed
     hasFrame*: bool
+    usedAt: float             ## when last asked for, epoch seconds
 
 var
   # int, not bool: with MSVC, std/atomics' exchange is a 64-bit interlocked
@@ -128,6 +141,7 @@ var
 let logAll = existsEnv("MMP_DEBUG")  ## mpv's log (warnings and up) to stderr
 
 const
+  LandingWait* = 0.5  ## seconds for a seek that shows no sign of landing
   MirroredProps* = ["aid", "vid", "sid", "secondary-sid", "volume", "speed",
     "sub-delay", "audio-delay", "sub-visibility", "slang", "alang",
     "sub-file-paths", "sub-align-x", "sub-align-y", "sub-margin-x",
@@ -151,6 +165,7 @@ const
   LinkWaitHook = 78'u64       ## reply id of the on_load hooks after yt-dlp's
   CoverHook = 79'u64          ## the on_preloaded hook's (pickCover)
   LinkWaitMax = 30.0          ## seconds a link's opening waits at most
+  ContextIdle* = 30.0         ## seconds unused before a render context is freed
 
 proc onMainUpdate(d: pointer) {.cdecl.} = frameReady.store(1)
 proc onPreviewUpdate(d: pointer) {.cdecl.} = previewReady.store(1)
@@ -345,11 +360,29 @@ proc loopSoundAt*(p: Player, path, aid: string, a, b, start: float) =
     p.h.commandAsync("seek", f(start), "absolute", "exact")
 
 proc initRender*(p: Player) =
-  ## Must run with the window's GL context current.
+  ## Must run with the window's GL context current. Only once something with
+  ## video opens (the on_preloaded hook): each context takes up ~200 MiB of
+  ## video memory on NVIDIA, for the CUDA context of its hardware decoding.
+  if p.render != nil: return
   # Non-blocking: the app waits for each frame's target time itself, so the UI
   # keeps running between video frames.
   p.render = createRenderContext(p.h, blockForTargetTime = false)
   mpv_render_context_set_update_callback(p.render, onMainUpdate, nil)
+
+proc freeRender*(p: Player) =
+  ## Its context and target, GL context current; video stops if it's playing.
+  if p.render == nil: return
+  mpv_render_context_free(p.render)
+  p.render = nil
+  p.target.free()
+
+proc wantsRender(p: Player): bool =
+  ## Whether what's opening may need a video output. Mpv's video fails for
+  ## the file if there's no render context as it opens one. A link's tracks
+  ## can turn up later.
+  if p.path.contains("://"): return true
+  for i in 0 ..< p.h.getInt("track-list/count"):
+    if p.h.getStr("track-list/" & $i & "/type") == "video": return true
 
 proc parseTracks(p: Player, j: JsonNode) =
   p.tracks.setLen 0
@@ -398,7 +431,16 @@ proc handleProp(p: Player, id: Prop, ev: ptr MpvEventProperty) =
     p.paused = b
     if b: p.pausedAt = epochTime()
   of pTimePos:
-    if p.holdTime: return
+    if p.holdTime or d == nil: return  # unavailable for a moment isn't 0
+    if p.endPinned and p.jumps == p.eofJumps: return
+    # With the video out, mpv's time is the sound's, behind it by the audio
+    # output's latency. That's no step back, near the end of playing forward.
+    let back = p.timePos - f
+    if back > 0 and back < min(0.5, p.duration / 2) and p.jumps == p.timeJumps and
+       not (p.paused or p.seeking or p.backward) and
+       p.timePos >= p.duration - 3 * max(p.frameDur, 0.05) and epochTime() - p.timeAt < 0.6:
+      return
+    p.timeJumps = p.jumps
     let step = abs(f - p.timePos)
     if step > 0.001 and step < 0.1: p.frameDur = step
     p.timePos = f
@@ -408,7 +450,9 @@ proc handleProp(p: Player, id: Prop, ev: ptr MpvEventProperty) =
   of pDuration: p.duration = max(f, p.fullDuration)
   of pEof:
     p.eofReached = b
-    if not p.eofReached: p.eofHandled = false
+    if p.eofReached: p.eofJumps = p.jumps
+    if not p.eofReached: (p.eofHandled, p.endPinned) = (false, false)
+    elif p.endHold: p.eofHandled = true
     # mpv pauses itself at the end, around when it tells of it.
     elif not p.paused or epochTime() - p.pausedAt < 0.2: p.endPaused = true
   of pVolume: p.volume = f
@@ -510,8 +554,44 @@ proc setCoverNames*(p: Player, names: openArray[string]) =
   p.h.command("change-list", "cover-art-whitelist", "clr", "")
   for n in names: p.h.command("change-list", "cover-art-whitelist", "append", n)
 
+proc stopMeshRead(p: Player) =
+  if p.meshRead == nil: return
+  try: p.meshRead.terminate(); p.meshRead.close()
+  except OSError: discard
+  p.meshRead = nil
+  discard tryRemoveFile(p.meshHead)
+
+proc findSphere(p: Player) =
+  ## How the file just loaded lies on the sphere. A mesh tells a link's 360°
+  ## from its VR180, and only the stream's header holds it (mpv's demuxers
+  ## skip it), so that comes apart: fetched as the link plays (pollMeshRead).
+  p.stopMeshRead()
+  if p.source.len > 0: p.sphere = p.savedSphere
+  elif "://" notin p.path: p.sphere = detectSphere(p.path)
+  else:
+    let link = linkSphere(p.h.getNode("user-data/mpv/ytdl/json-subprocess-result/stdout").getStr)
+    p.sphere = link.sphere
+    if link.meshUrl.len == 0: return
+    p.meshHls = link.meshHls
+    p.meshHead = getTempDir() / "majestic-" & $getCurrentProcessId() & "-mesh"
+    try:
+      p.meshRead = startProcess("curl", args = ["-fsL", "--max-time", "15", "-r", "0-262143",
+        "-o", p.meshHead, link.meshUrl], options = {poUsePath, poStdErrToStdOut, poDaemon})
+    except OSError: discard
+
+proc pollMeshRead(p: Player): bool =
+  ## True when a link's mesh just came and changed what's on the sphere.
+  if p.meshRead == nil or p.meshRead.running: return
+  p.meshRead.close()
+  p.meshRead = nil
+  let s = detectSphere(p.meshHead)
+  discard tryRemoveFile(p.meshHead)
+  p.sphere = if p.meshHls: hlsSphere(s) else: s
+  p.sphere.is360
+
 proc pollEvents*(p: Player): bool =
   ## Drains the mpv event queue. Returns true if anything changed.
+  if p.pollMeshRead: result = true
   if p.linkHold != 0 and epochTime() >= p.linkHoldUntil:
     p.releaseLink()
     result = true
@@ -532,7 +612,7 @@ proc pollEvents*(p: Player): bool =
       # Read here rather than in load: the previous file may still show a
       # frame or two until mpv switches over.
       if not p.hidden:
-        p.sphere = detectSphere(p.path)
+        p.findSphere()
         p.addSameNameAudio()
       p.loaded = true
       p.opening = false
@@ -557,6 +637,11 @@ proc pollEvents*(p: Player): bool =
         # Tracks found, none picked yet: the cover's picked before mpv
         # shows another (and the window fits that one).
         if not p.hidden and p.h.getStr("audio-display") != "no": p.pickCover()
+        if p.wantsRender():
+          try: p.initRender()
+          except MpvError as err:
+            stderr.writeLine "video disabled: ", err.msg
+            p.gpuOom = true  # it's the video memory that runs out here
         discard mpv_hook_continue(p.h, e.id)
         continue
       p.releaseLink()
@@ -586,10 +671,14 @@ proc pollEvents*(p: Player): bool =
     else: discard
 
 proc load*(p: Player, path: string, start = 0.0, threadless = false, opts = "",
-           source = "", partStart = 0.0, partEnd = 0.0, fullDuration = 0.0) =
+           source = "", partStart = 0.0, partEnd = 0.0, fullDuration = 0.0,
+           sphere = SphereInfo()) =
   ## Opens path (or `source` in its place), starting at `start` seconds when
   ## given, with mpv's per-file options `opts` ("name=value,..."). A link's
-  ## saved part (source) holds partStart to partEnd of the link's fullDuration.
+  ## saved part (source) holds partStart to partEnd of the link's fullDuration
+  ## and lies on `sphere`.
+  p.stopMeshRead()
+  p.savedSphere = sphere
   p.threadless = threadless
   p.h.setProp("demuxer-thread", if threadless: "no" else: "yes")
   p.path = path
@@ -612,7 +701,9 @@ proc load*(p: Player, path: string, start = 0.0, threadless = false, opts = "",
   p.keepTime = false
   p.openSeek = -1
   p.endPaused = false
+  p.endHold = false
   p.sought = -1
+  p.landing = -1
   p.buffered.setLen 0
   p.cacheAhead = -1
   p.buffering = false
@@ -654,6 +745,7 @@ proc externalFiles*(p: Player): seq[string] =
     if p.h.getFlag(t & "external"): result.add p.h.getStr(t & "external-filename")
 
 proc close*(p: Player) =
+  p.stopMeshRead()
   p.releaseLink()
   p.h.commandAsync("stop")
   p.path = ""
@@ -712,6 +804,7 @@ proc togglePause*(p: Player) =
 proc play*(p: Player) =
   if p.loaded:
     p.stopped = false
+    p.endHold = false
     if p.eofReached:
       inc p.jumps
       p.h.commandAsync("seek", "0", "absolute")
@@ -734,6 +827,24 @@ proc stop*(p: Player) =
   p.h.commandAsync("seek", "0", "absolute", "exact")
   p.stopped = true
 
+proc pinEnd*(p: Player, t: float) =
+  ## The end was reached on the frame at time t: that's the time from here on,
+  ## not the sound's. Going anywhere else ends it.
+  if p.jumps != p.eofJumps: return
+  p.endPinned = true
+  p.timePos = t
+
+proc keepAtEnd*(p: Player) =
+  ## The end reached next stays paused there; nothing follows it.
+  p.endHold = true
+  p.endPaused = false
+  if p.eofReached: p.eofHandled = true
+
+proc holdEnd*(p: Player) =
+  ## keepAtEnd, going forward.
+  p.setBackward(false)
+  p.keepAtEnd()
+
 proc pastPart(p: Player, t: float): bool =
   ## A seek to t leaves the saved part: noted for the app to go online.
   result = p.partEnd > 0 and (t > p.partEnd - 0.5 or t < p.partStart - 0.05)
@@ -741,11 +852,13 @@ proc pastPart(p: Player, t: float): bool =
 
 proc noteSeek(p: Player, t: float) =
   ## A seek to t: noted (sought), unless it's to the end anyway. Back from the
-  ## end mpv paused itself at, playing goes on.
+  ## end mpv paused itself at, playing goes on, except at the very start: the
+  ## file over and back at its beginning waits there.
   p.sought = if t < p.duration - 5: max(t, 0) else: -1
-  if p.endPaused and p.eofReached and t < p.duration - 0.5:
+  if p.endPaused and p.eofReached and t > 0 and t < p.duration - 0.5:
     p.h.setProp("pause", false)
-  if t < p.duration - 0.5: p.endPaused = false
+    p.endResumed = true
+  if t < p.duration - 0.5: (p.endPaused, p.endHold) = (false, false)
 
 proc seek*(p: Player, t: float, exact = true) =
   if not p.loaded or p.pastPart(t): return
@@ -757,6 +870,29 @@ proc seek*(p: Player, t: float, exact = true) =
   inc p.jumps
   p.h.commandAsync("seek", formatFloat(max(t, 0), ffDecimal, 3), "absolute",
     if exact: "exact" else: "keyframes")
+
+proc landOn*(p: Player, t: float) =
+  ## An exact seek to t was just asked for: its time is the one to show. mpv's
+  ## stays the old one for a while, or that of a keyframe sought before it.
+  if not p.loaded: return
+  (p.landing, p.landingJumps, p.landingRestarts) = (t, p.jumps, p.restarts)
+  p.landingAt = epochTime()
+
+proc landingOn*(p: Player): float =
+  ## Where the exact seek noted by landOn is landing, -1 once it has, or
+  ## anything else took the player elsewhere, or mpv isn't going there.
+  if p.landing < 0: return -1
+  let there = p.restarts > p.landingRestarts and p.timePos >= p.landing - 0.1 and
+    p.timePos <= p.landing + 1
+  if p.jumps != p.landingJumps or
+     not p.seeking and (there or epochTime() - p.landingAt > LandingWait):
+    p.landing = -1
+  p.landing
+
+proc shownPos*(p: Player): float =
+  ## The time to show: timePos, or where a seek is landing.
+  let t = p.landingOn
+  if t >= 0: t else: p.timePos
 
 proc seekRelative*(p: Player, d: float) =
   if p.pastPart(p.timePos + d): return
@@ -912,14 +1048,23 @@ proc newPreview*(): Preview =
   h.setOpt("load-scripts", "no")
   check mpv_initialize(h), "preview mpv_initialize"
 
-proc initRender*(pv: Preview) =
-  pv.render = createRenderContext(pv.h, blockForTargetTime = false)
+proc initRender(pv: Preview): bool =
+  ## Whether it has a render context: made on the first request, GL context
+  ## current, as a preview may never be asked for (see Player.initRender).
+  pv.usedAt = epochTime()
+  if pv.render != nil: return true
+  try:
+    pv.render = createRenderContext(pv.h, blockForTargetTime = false)
+  except MpvError as e:
+    stderr.writeLine "seek preview unavailable: ", e.msg
+    return false
   mpv_render_context_set_update_callback(pv.render, onPreviewUpdate, nil)
+  true
 
 proc request*(pv: Preview, path: string, t: float) =
   ## Ask for a thumbnail at time t. Seeks are coalesced: only the latest
   ## request is issued once the previous one completes.
-  if pv == nil: return
+  if pv == nil or not pv.initRender(): return
   if path != pv.path:
     pv.path = path
     pv.hasFrame = false
@@ -938,7 +1083,7 @@ proc request*(pv: Preview, path: string, t: float) =
 proc showImage*(pv: Preview, path, crop: string) =
   ## Ask for a part of an image (crop: a video-crop value), coalesced like
   ## request. The last one stays up until it's in.
-  if pv == nil: return
+  if pv == nil or not pv.initRender(): return
   (pv.wantedImage, pv.wantedCrop) = (path, crop)
   if pv.busy: return
   if path != pv.path:
@@ -984,6 +1129,14 @@ proc forget*(pv: Preview) =
   pv.hasFrame = false
   pv.busy = false
   pv.opening = false
+
+proc releaseIdle*(pv: Preview) =
+  ## Frees its render context once it's gone unused a while.
+  if pv == nil or pv.render == nil or epochTime() - pv.usedAt < ContextIdle: return
+  pv.forget()
+  mpv_render_context_free(pv.render)
+  pv.render = nil
+  pv.target.free()
 
 # --- folder navigation -----------------------------------------------------
 

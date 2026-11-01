@@ -59,6 +59,7 @@ type
     showPlaylist*: bool = false
     playlistWidth*: float = 300    # pixels, changed by dragging its left edge
     playlistColumns*: seq[PlaylistField]   # shown, left to right; set by loadConfig when empty
+    playlistColumnWidths*: Table[string, float]  # pixels, by field name: the columns resized by hand
     playlistShowSize*: bool = false        # older versions' columns, read once into playlistColumns
     playlistShowDimensions*: bool = false
     playlistCursorFollows*: bool = true    # the selection moves to the entry that plays
@@ -82,6 +83,8 @@ type
     osdScaleByWindow*: bool = true # OSD text grows and shrinks with the video frame
     showMillis*: bool = false      # timestamps as HH:MM:SS.mmm
     showRemaining*: bool = false   # status/OSD time as -remaining / duration
+    showFrames*: bool = false      # the frame number left of the status/OSD time
+    syncOffsetSeconds*: bool = false  # Synchronize > Properties: the offset in seconds, not frames
     showAllShortcuts*: bool = false  # status bar hints include view toggles and pan/rotate/scale
     autoFitWindow*: bool = true
     sphereDragMovesWindow*: bool = false  # 360° video: drag moves the window, Ctrl+drag looks around
@@ -254,6 +257,10 @@ proc loadConfig*(): Config =
     result.playlistColumns = @[pfName, pfDuration]
     if result.playlistShowSize: result.playlistColumns.add pfSize
     if result.playlistShowDimensions: result.playlistColumns.add pfDimensions
+  # Keys saved before 0 joined Home on Go To Beginning, when 0 had its own command.
+  if "seek-0" in result.keys:
+    result.keys.del("seek-0")
+    result.keys.del("go-to-beginning")
 
 proc save*(c: Config) =
   let path = configPath()

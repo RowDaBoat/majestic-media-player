@@ -2,8 +2,11 @@
 ## container headers (Matroska/WebM Projection element, MP4 sv3d/st3d boxes
 ## and the older Spherical Video V1 XML), without ffprobe or decoding.
 ## Only headers are read: a few KB for typical files.
+## YouTube's newer 360° and VR180 videos come with a mesh instead (Spherical
+## Video V2's mshp, in its own ytmp box): the picture's layout, drawn as it is.
 
-import std/[os, strutils]
+import std/[base64, math, os, strutils]
+import zippy
 
 type
   Projection* = enum
@@ -20,11 +23,18 @@ type
     top*, bottom*, left*, right*: float32
     ## Pose of the picture on the sphere, degrees.
     yaw*, pitch*, roll*: float32
+    mesh*: string             ## prMesh: its box's content, base64 (meshes)
+
+  MeshPart* = object
+    ## An eye's mesh, ready to draw.
+    vertices*: seq[float32]   ## x, y, z, u, v of each; -z ahead, v up
+    indices*: seq[uint32]     ## triangles
 
 const
   MaxElement = 16 * 1024 * 1024  ## larger header elements are malformed or not ours
 
-proc is360*(s: SphereInfo): bool = s.projection == prEquirect
+proc is360*(s: SphereInfo): bool =
+  s.projection == prEquirect or (s.projection == prMesh and s.mesh.len > 0)
 
 # --- byte helpers -----------------------------------------------------------
 
@@ -135,13 +145,15 @@ proc mkvVideo(f: File, e: Ebml, s: var SphereInfo) =
             of 2: prCubemap
             of 3: prMesh
             else: prNone
-        of idProjectionPrivate: s.parseBounds(d, 4)  # after version + flags
+        of idProjectionPrivate:
+          if s.projection == prMesh: s.mesh = encode(d)
+          else: s.parseBounds(d, 4)  # after version + flags
         of idPoseYaw: s.yaw = beFloat(d)
         of idPosePitch: s.pitch = beFloat(d)
         of idPoseRoll: s.roll = beFloat(d)
         else: discard
     else: discard
-  if s.projection != prEquirect:
+  if s.projection != prEquirect:  # any mesh would have them in itself
     (s.top, s.bottom, s.left, s.right) = (0'f32, 0'f32, 0'f32, 0'f32)
 
 proc mkvInfo(f: File, fileSize: int64): SphereInfo =
@@ -235,6 +247,10 @@ proc sampleEntry(f: File, b: Box, s: var SphereInfo) =
       let (ok, proj) = f.findBox(c.data, c.stop, "proj")
       if not ok: continue
       for p in f.boxes(proj.data, proj.stop):
+        if p.kind in ["mshp", "ytmp"]:
+          s.projection = prMesh
+          s.mesh = encode(f.readAt(p.data, int(min(p.stop - p.data, MaxElement))))
+          continue
         let d = f.readAt(p.data, int(min(p.stop - p.data, 64)))
         case p.kind
         of "prhd":
@@ -245,7 +261,6 @@ proc sampleEntry(f: File, b: Box, s: var SphereInfo) =
           s.projection = prEquirect
           s.parseBounds(d, 4)
         of "cbmp": s.projection = prCubemap
-        of "mshp": s.projection = prMesh
         else: discard
     else: discard
 
@@ -273,6 +288,73 @@ proc mp4Info(f: File, fileSize: int64): SphereInfo =
       break
     return
 
+# --- mesh --------------------------------------------------------------------
+
+proc meshes*(s: SphereInfo): seq[MeshPart] =
+  ## The mesh's parts: one, or one for each eye. None when it's malformed.
+  type Bits = object
+    d: string
+    at: int                   ## in bits
+  proc get(b: var Bits, n: int): uint32 =
+    if b.at + n > b.d.len * 8: raise newException(ValueError, "mesh ends early")
+    for _ in 0 ..< n:
+      result = result shl 1 or uint32(b.d[b.at shr 3].uint8 shr (7 - (b.at and 7)) and 1)
+      inc b.at
+  proc delta(b: var Bits, n: int): int =
+    let v = b.get(n).int  # zigzag
+    (v shr 1) xor -(v and 1)
+  proc width(count: int): int = ceil(log2(float(count * 2))).int
+  try:
+    let box = decode(s.mesh)
+    if box.len < 12: return
+    let body =
+      case box[8 .. 11]
+      of "dfl8": uncompress(box[12 .. ^1], dfDeflate)
+      of "raw ": box[12 .. ^1]
+      else: return
+    var at = 0
+    while at + 8 <= body.len:
+      let size = be(body, at, 4).int
+      if body[at + 4 .. at + 7] != "mesh" or size < 16 or at + size > body.len: return @[]
+      var b = Bits(d: body[at + 8 ..< at + size])
+      at += size
+      let coords = b.get(32).int
+      var values = newSeq[float32](coords)
+      for v in values.mitems: v = cast[float32](b.get(32))
+      let verts = b.get(32).int
+      var part: MeshPart
+      part.vertices = newSeq[float32](verts * 5)
+      var ids: array[5, int]
+      for i in 0 ..< verts:
+        for k in 0 ..< 5:
+          ids[k] += b.delta(width(coords))
+          part.vertices[i * 5 + k] = values[ids[k]]
+      b.at = (b.at + 7) and not 7
+      for _ in 0 ..< b.get(32).int:
+        discard b.get(8)  # texture
+        let kind = b.get(8)
+        let count = b.get(32).int
+        var list = newSeq[uint32](count)
+        var id = 0
+        for i in 0 ..< count:
+          id += b.delta(width(verts))
+          if id notin 0 ..< verts: return @[]
+          list[i] = id.uint32
+        b.at = (b.at + 7) and not 7
+        case kind
+        of 0: part.indices.add list
+        of 1:  # strip: the repeated indices between its runs make no triangle
+          for i in 2 ..< count:
+            if list[i - 2] == list[i - 1] or list[i - 1] == list[i] or list[i - 2] == list[i]:
+              continue
+            part.indices.add [list[i - 2], list[i - 1], list[i]]
+        of 2:  # fan
+          for i in 2 ..< count: part.indices.add [list[0], list[i - 1], list[i]]
+        else: return @[]
+      result.add part
+  except ValueError, IndexDefect, ZippyError:
+    return @[]
+
 # --- entry point ------------------------------------------------------------
 
 proc detectSphere*(path: string): SphereInfo =
@@ -291,6 +373,7 @@ proc detectSphere*(path: string): SphereInfo =
       result = f.mp4Info(size)
   except IOError, OSError:
     result = SphereInfo()
+  if result.projection == prMesh and result.meshes.len == 0: result = SphereInfo()
 
 when isMainModule:
   for p in commandLineParams():

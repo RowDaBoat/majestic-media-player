@@ -100,6 +100,15 @@ The Run menu runs its command lines with Git for Windows' bash (set
   Default apps still wins there, and the Formats page says so.
 - The UI font is IBM Plex Sans (SIL Open Font License), embedded in the binary.
 
+- Render contexts: each costs ~200 MiB of video memory on NVIDIA (the CUDA context of its
+  hardware decoding), so none is made at startup. A player gets one in its `on_preloaded` hook,
+  as mpv's video would fail without it, if the file has a video track or is a link; the seek
+  preview on its first request. The standby's and the preview's are freed after `ContextIdle`
+  seconds unused; the playing player's stays. `render` and `update` take a nil context.
+
+- The end of a file: once the video runs out, mpv's `time-pos` is the sound's, behind by the audio output's latency, then wherever the sound stopped (short of the last frame or past it), and `frame-back-step` from there finds the last frame again. So `Player` ignores small steps back near the end of forward playback, and `settleEnd` pins the position to the last frame on EOF (`pinEnd`, until the next jump). The seek bar counts that frame as 100%.
+- Seek bar clicks: a click seeks exactly once, on press, so the picture never visits the keyframe before the spot; dragging seeks to keyframes between marks and exactly on a mark snapped to. `Player.landOn` keeps the time shown (seek bar, status bar, OSD) on an exact seek's target until `landingOn` sees it land: mpv's `time-pos` stays the old one for a while, and a keyframe's after an earlier seek.
+- Synchronized frame steps: the master steps and names the time it landed on; slaves go to the frame that puts them at that time plus their offset rather than stepping themselves, so they can't drift at either end of a file. A slave's press only asks the master. A slave's offset is signed: positive is ahead of the master, negative behind it (it waits at its start until the master gets that far).
 - Frame steps: mpv's `frame-back-step` decodes from the previous keyframe on every press, so
   it scales with keyframe spacing. While paused, the hidden standby player steps through the
   frames around the position (up to `loopFramesMB`) and each is kept in a texture; a step shows
@@ -108,6 +117,15 @@ The Run menu runs its command lines with Git for Windows' bash (set
   a new picture: they arrive separately, in either order. The window refills near its edges.
   Links, 360° video, A-B loops and CPU rendering use the plain mpv step, as does a press in the
   second or so after pausing, before the frames are in.
+- 360° links: `detectSphere` needs a file, so `Player.findSphere` asks yt-dlp's JSON
+  (`linkSphere`), per format and not per video: YouTube renders a 360° video's lesser DASH
+  formats through a fixed camera. Those are noted as nothing, and so are its HLS formats, which
+  stay on the sphere, except on VR180, where they're flat too. `meshHls` covers that: only a
+  mesh format's header tells VR180 (a mesh per eye), read with curl, mpv's demuxers skip it.
+  Meshes aren't an approximation: EAC and VR180's warped layout are both drawn from the mesh
+  itself (`drawMesh`). Saved parts note their `Seg.sphere`, as opening them skips yt-dlp.
+  ffmpeg drops meshes when merging, and needs `-strict -2` for an `.mp4`'s sv3d: a downloaded
+  mesh video, or `equi` in `.mp4`, comes out flat.
 
 ## Source layout
 

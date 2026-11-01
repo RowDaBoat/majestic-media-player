@@ -31,6 +31,7 @@ const
   VK_LBUTTON* = 0x01'i32
   VK_RBUTTON* = 0x02'i32
   VK_MBUTTON* = 0x04'i32
+  VK_SHIFT* = 0x10'i32
   VK_CONTROL* = 0x11'i32
   SM_SWAPBUTTON* = 23'i32
   ASFW_ANY* = -1'i32

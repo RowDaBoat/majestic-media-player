@@ -5,6 +5,7 @@
 
 import std/[os, strutils, strformat, tables, times, hashes, algorithm, sequtils, uri]
 import jsony
+import spherical
 when not defined(windows): import std/posix
 
 type
@@ -15,6 +16,7 @@ type
     start*, stop*: float
     format*: string           ## yt-dlp's format ids it holds ("401+251"); "": saved
                               ## before formats were noted, as `auto` then was
+    sphere*: SphereInfo       ## its picture on the sphere: mpv's files don't say
 
   Saved* = object
     title*: string

@@ -53,6 +53,7 @@ type
     kaJumpForward = "jump-forward"
     kaJumpBack = "jump-back"
     kaGoBeginning = "go-to-beginning"
+    kaGoEnd = "go-to-end"
     kaSeek10 = "seek-10", kaSeek20 = "seek-20", kaSeek30 = "seek-30",
     kaSeek40 = "seek-40", kaSeek50 = "seek-50", kaSeek60 = "seek-60", kaSeek70 = "seek-70",
     kaSeek80 = "seek-80", kaSeek90 = "seek-90"
@@ -136,6 +137,7 @@ const
     (kgNavigate, "Jump forward", "Jump Forward", "Right"),
     (kgNavigate, "Jump back", "Jump Back", "Left"),
     (kgNavigate, "Go to beginning", "Go To Beginning", "Home|0"),
+    (kgNavigate, "Go to last frame", "Go To Last Frame", "End"),
     (kgNavigate, "Jump to 10%", "Jump To 10%", "1"),
     (kgNavigate, "Jump to 20%", "Jump To 20%", "2"),
     (kgNavigate, "Jump to 30%", "Jump To 30%", "3"),
@@ -150,7 +152,7 @@ const
     (kgNavigate, "Next file", "Next File", "Page Down"),
     (kgNavigate, "Previous file", "Previous File", "Page Up"),
     (kgNavigate, "Add bookmark", "Add Bookmark", "Insert"),
-    (kgNavigate, "Remove selected playlist item", "Remove From Playlist", "Delete"),
+    (kgNavigate, "Remove bookmark here or selected playlist item", "Remove Bookmark Or Playlist Item", "Delete"),
     (kgSubtitles, "Align top left", "Align Top Left", "Shift+Numpad 7"),
     (kgSubtitles, "Align top", "Align Top", "Shift+Numpad 8"),
     (kgSubtitles, "Align top right", "Align Top Right", "Shift+Numpad 9"),
@@ -326,6 +328,15 @@ proc actionsUsing*(c: Config, k: KeyCombo): seq[KeyAction] =
   if k.key == ButtonUnknown: return
   for a in KeyAction:
     if k in c.combos(a): result.add a
+
+proc keyClashes*(c: Config): set[KeyAction] =
+  ## The commands sharing a key with another command.
+  var seen: seq[(KeyCombo, KeyAction)]
+  for a in KeyAction:
+    for k in c.combos(a):
+      for (other, b) in seen:
+        if other == k: result.incl {a, b}
+      seen.add (k, a)
 
 proc heldMods*(w: Window): set[KeyMod] =
   if w.buttonDown[KeyLeftControl] or w.buttonDown[KeyRightControl]: result.incl kmCtrl

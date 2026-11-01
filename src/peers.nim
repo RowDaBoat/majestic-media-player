@@ -12,8 +12,9 @@ type
     pid*: int
     title*: string            ## what its window shows
     master*: int              ## its synchronization master, 0 when none
-    offset*: float            ## as a slave: seconds behind its master
+    offset*: float            ## as a slave: seconds ahead of its master, behind when negative
     loop*: bool               ## as a slave: loops on its own until the master ends
+    fps*: float               ## its video's frame rate, 0 when unknown
     sock: Socket
     buf: string
 
@@ -29,7 +30,7 @@ type
     unnamed: seq[Peer]        ## accepted, waiting for their hello
     lastScan: float
     title: string             ## last announced, repeated to new peers
-    status: seq[string]       ## master, offset, loop: likewise
+    status: seq[string]       ## master, offset, loop, fps: likewise
     gone*: seq[int]           ## peers lost since the last poll
 
 proc escape(s: string): string =
@@ -78,7 +79,7 @@ proc startPeerNet*(): PeerNet =
   except CatchableError as e:
     stderr.writeLine "synchronize: cannot listen on ", path, ": ", e.msg
     return nil
-  PeerNet(pid: pid, dir: dir, path: path, server: s, status: @["0", "0", "false"])
+  PeerNet(pid: pid, dir: dir, path: path, server: s, status: @["0", "0", "false", "0"])
 
 proc find*(n: PeerNet, pid: int): Peer =
   if n == nil: return
@@ -96,11 +97,11 @@ proc send*(n: PeerNet, pid: int, fields: varargs[string]) =
   let p = n.find(pid)
   if p != nil and not p.write(encode(fields)): n.drop(p)
 
-proc announce*(n: PeerNet, title: string, master: int, offset: float, loop: bool) =
-  ## Tells every peer this player's title, master and slave settings when
-  ## they change.
+proc announce*(n: PeerNet, title: string, master: int, offset: float, loop: bool, fps: float) =
+  ## Tells every peer this player's title, master, slave settings and frame
+  ## rate when they change.
   if n == nil: return
-  let st = @[$master, $offset, $loop]
+  let st = @[$master, $offset, $loop, $fps]
   if title != n.title:
     n.title = title
     for p in n.peers: n.send(p.pid, "title", title)
@@ -181,12 +182,14 @@ proc poll*(n: PeerNet): seq[Message] =
       if f.len == 0: continue
       case f[0]
       of "title": p.title = if f.len > 1: f[1] else: ""
-      of "status":  # master offset loop
+      of "status":  # master offset loop fps
         p.master = 0
         p.offset = 0
+        p.fps = 0
         try:
           if f.len > 1: p.master = parseInt(f[1])
           if f.len > 2: p.offset = parseFloat(f[2])
+          if f.len > 4: p.fps = parseFloat(f[4])
         except ValueError: discard
         p.loop = f.len > 3 and f[3] == "true"
       else: result.add Message(sender: p.pid, fields: f)

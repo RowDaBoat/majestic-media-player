@@ -2,7 +2,7 @@
 ## slaves dashed, in their group's color) and, for the one selected, its
 ## master, its offset and whether it keeps looping. Changes apply right away.
 
-import std/[strutils, sequtils, strformat]
+import std/[math, strutils, sequtils, strformat]
 import silky, vmath, bumpy, chroma
 import ui, theme
 
@@ -13,16 +13,18 @@ type
     master*: int              ## 0 when not synchronized; its own pid for a master
     offset*: float
     loop*: bool
+    fps*: float               ## its video's frame rate, 0 when unknown
     me*: bool                 ## the player showing the window
 
   SyncAction* = enum
-    saNone, saMaster, saOffset, saLoop, saClose
+    saNone, saMaster, saOffset, saLoop, saSeconds, saClose
 
   SyncDialog* = ref object
     selected*: int            ## pid of the instance shown on the right
     newMaster*: int           ## with saMaster: the master chosen, 0 for none
     newOffset*: float         ## with saOffset
     newLoop*: bool            ## with saLoop
+    useSeconds*: bool         ## the offset shown in seconds, not in the master's frames
     listOpen*: bool           ## the Master dropdown's list
     listScroll: float32
 
@@ -56,7 +58,19 @@ proc candidates(sel: SyncInstance, all: seq[SyncInstance]): seq[int] =
   for s in all:
     if s.pid != sel.pid and not s.isSlave: result.add s.pid
 
-proc newSyncDialog*(): SyncDialog = SyncDialog()
+proc offsetFps(sel: SyncInstance, all: seq[SyncInstance]): float =
+  ## The frame rate sel's offset counts in: its master's, or its own without one.
+  if not sel.isSlave: return sel.fps
+  for s in all:
+    if s.pid == sel.master: return s.fps
+
+proc fpsLabel(fps: float): string =
+  if fps <= 0: return "No frame rate"
+  result = formatFloat(fps, ffDecimal, 3)
+  result.trimZeros()
+  result.add " fps"
+
+proc newSyncDialog*(useSeconds: bool): SyncDialog = SyncDialog(useSeconds: useSeconds)
 
 proc draw*(d: SyncDialog, ui: Ui, r: Rect, all: seq[SyncInstance]): SyncAction =
   let w = ui.window
@@ -133,15 +147,27 @@ proc draw*(d: SyncDialog, ui: Ui, r: Rect, all: seq[SyncInstance]): SyncAction =
 
   let oy = field.y + 44
   ui.textIn("Offset", rect(px, oy, LabelW, 28), colText)
-  var offset = sel.offset
-  if ui.numberField("sy-offset", rect(field.x, oy, 150, 28), offset, 0.5, 0, 359999, 3):
-    d.newOffset = offset
+  # The offset is kept in seconds. Without a frame rate it can only be shown so.
+  let fps = sel.offsetFps(all)
+  let seconds = d.useSeconds or fps <= 0
+  let offsetR = rect(field.x, oy, 150, 28)
+  var offset = if seconds: round(sel.offset * 1000) / 1000 else: round(sel.offset * fps)
+  let changed =
+    if seconds: ui.numberField("sy-offset", offsetR, offset, (if fps > 0: 1 / fps else: 0.5), -359999, 359999, 3)
+    else: ui.numberField("sy-offset", offsetR, offset, 1, -359999 * fps, 359999 * fps)
+  if changed:
+    d.newOffset = if seconds: offset else: round(offset) / fps
     result = saOffset
-  ui.textIn("seconds", rect(field.x + 158, oy, 80, 28), colTextDim, FontSmall)
-  ui.tip(rect(px, oy, LabelW, 28), "Starts playing once the master reaches this time")
+  ui.textIn(if seconds: "seconds" else: "frames", rect(field.x + 158, oy, 80, 28), colTextDim, FontSmall)
+  ui.tip(rect(px, oy, LabelW, 28), "How far ahead of the master, behind it when negative")
+
+  let sy = oy + 36
+  if ui.checkbox("sy-seconds", vec2(field.x, sy), "Use seconds", d.useSeconds):
+    result = saSeconds
+  ui.textIn(fpsLabel(fps), rect(field.x + 120, sy, r.x + r.w - 16 - field.x - 120, 20), colTextDim, FontSmall)
 
   var loop = sel.loop
-  let ly = oy + 44
+  let ly = sy + 32
   if ui.checkbox("sy-loop", vec2(field.x, ly), "Continue looping", loop):
     d.newLoop = loop
     result = saLoop

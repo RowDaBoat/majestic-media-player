@@ -52,6 +52,7 @@ type
     keyScroll: float32
     keySel: KeyAction           ## Keys page: selected command
     capturing: bool             ## Keys page: waiting for the selected command's new key
+    capSlot: int                ## which of its keys that replaces; -1 adds one
     keyTaken: bool              ## a key went to the capture this frame
     keyNote: string             ## Keys page: outcome of the last change
     keyReveal: bool             ## scroll the selected command into view
@@ -157,9 +158,43 @@ proc dotsV(ui: Ui, x, y1, y2: float32) =
     ui.rect(rect(x.round, y, 1, 1), colTextDisabled)
     y += 2
 
-proc drawTree(d: OptionsDialog, ui: Ui, r: Rect, keys: bool) =
+proc pageChanged(p: OptionsPage, c, before: Config): bool =
+  ## Whether a setting of page p differs from when the window opened.
+  template differs(field: untyped): bool = c.field != before.field
+  case p
+  of opPlayer: differs(autoFitWindow) or differs(openMode) or differs(rememberPlaylist) or
+    differs(rememberTime) or differs(rememberTransform) or differs(rememberWindowPos) or
+    differs(rememberWindowSize)
+  of opInterface: differs(osdScale) or differs(osdScaleByWindow) or differs(osdTimestamp) or
+    differs(showFrames) or differs(showMillis) or differs(showRemaining) or
+    differs(titleFullPath) or differs(titleUseMediaTitle) or differs(uiScale)
+  of opFormats: false  # associations apply at once
+  of opPaths: differs(mkvpropedit) or differs(openDir) or differs(screenshotDir) or
+    differs(screenshotNoAsk) or differs(ytdlp)
+  of opKeys: differs(keys)
+  of opPlayback: differs(audioLangs) or differs(bookmarksAsChapters) or
+    differs(keepDisplayOn) or differs(rateStep) or differs(seekPreview) or
+    differs(seekStep) or differs(snapWithShift) or differs(subLangs) or differs(volumeStep)
+  of opOnline: differs(signInCookies) or differs(streamMaxFps30) or
+    differs(streamMaxHeight) or differs(streamOnSave) or differs(streamQuality) or
+    differs(streamSmallAudio)
+  of opWeb: differs(webCount) or differs(webCountOn) or differs(webDir) or
+    differs(webKeepHours) or differs(webKeepOn) or differs(webSizeGB) or differs(webSizeOn)
+  of opAudioFiles: differs(coverNames) or differs(shortAudioDelay) or differs(shortAudioMs) or
+    differs(showCover)
+  of opSubtitles: differs(subDelay) or differs(subPaths)
+  of opSubStyle: differs(subBold) or differs(subColor) or differs(subFont) or
+    differs(subItalic) or differs(subLineSpacing) or differs(subOpacity) or
+    differs(subOutlineColor) or differs(subOutlineOpacity) or differs(subOutlineSize) or
+    differs(subShadowColor) or differs(subShadowOffset) or differs(subShadowOpacity) or
+    differs(subSize) or differs(subSpacing) or differs(subStyleAss)
+  of opMisc: differs(panStep) or differs(rotateStep) or differs(sizeStep)
+  of opSystem: differs(loopFramesMB) or differs(renderMode)
+
+proc drawTree(d: OptionsDialog, ui: Ui, r: Rect, keys: bool, changed, clashing: set[OptionsPage]) =
   ## While searching the tree is greyed out; clicking a page leaves the
-  ## search for it.
+  ## search for it. Pages with unsaved changes get a *, those with clashing
+  ## keys are yellow; a collapsed node stands for its children.
   let dim = d.find.strip.len > 0
   ui.rect(r, colBackground)
   ui.border(r, colBorder)
@@ -205,15 +240,21 @@ proc drawTree(d: OptionsDialog, ui: Ui, r: Rect, keys: bool) =
         ui.consumeClick()
         d.toggle()
     let lx = x0 + level.float32 * TreeIndent + 12
-    let label = rect(lx, y + 2, ui.textSize($p).x + 10, TreeRow - 4)
+    proc marked(pages: set[OptionsPage]): bool =
+      ## p, or a child the collapsed p hides.
+      p in pages or p in Parents and p notin d.expanded and
+        Tree.anyIt(it[0].parentOf == p and it[0] in pages)
+    let name = $p & (if marked(changed): "*" else: "")
+    let label = rect(lx, y + 2, ui.textSize(name).x + 10, TreeRow - 4)
     let rowR = rect(lx, y, r.x + r.w - lx - 4, TreeRow)
     let sel = d.page == p and not dim
     let hov = ui.hover(rowR)
     if sel: ui.rect(label, colAccent)
     elif hov: ui.rect(label, colHover)
     if sel and focused: ui.focusRing(rect(label.x + 2, label.y + 2, label.w - 4, label.h - 4))
-    ui.textIn($p, rect(label.x + 5, label.y, label.w, label.h),
-      if sel: colOnAccent elif dim: colTextDisabled else: colText)
+    ui.textIn(name, rect(label.x + 5, label.y, label.w, label.h),
+      if sel: colOnAccent elif marked(clashing): colWarning
+      elif dim: colTextDisabled else: colText)
     if hov and ui.pressed():
       ui.consumeClick()
       if dim:
@@ -422,6 +463,7 @@ proc interfacePage(ui: Ui, c: var Config, p: var Pane) =
   ui.checkRow(p, "o-osdtime", "Show timestamp in OSD", c.osdTimestamp)
   ui.checkRow(p, "o-millis", "Show milliseconds", c.showMillis)
   ui.checkRow(p, "o-remain", "Show remaining time", c.showRemaining)
+  ui.checkRow(p, "o-frames", "Show frames", c.showFrames)
   ui.group(p, "Title bar")
   ui.radioRow(p, "o-tname", "File name only", c.titleFullPath, false)
   ui.radioRow(p, "o-tpath", "Display full path", c.titleFullPath, true)
@@ -598,9 +640,10 @@ proc pathsPage(d: OptionsDialog, ui: Ui, c: var Config, p: var Pane) =
 
 const KeyCapture = "o-keycap"     ## focusId while waiting for a key
 
-proc startCapture*(d: OptionsDialog, ui: Ui, act: KeyAction) =
+proc startCapture*(d: OptionsDialog, ui: Ui, act: KeyAction, slot = -1) =
   d.keySel = act
   d.capturing = true
+  d.capSlot = slot
   d.keyReveal = true
   ui.focusId = KeyCapture       # the window's own keys (Esc, Enter, Tab) stand back
   ui.navId = "o-keys-list"
@@ -610,19 +653,19 @@ proc stopCapture(d: OptionsDialog, ui: Ui) =
   if ui.focusId == KeyCapture: ui.focusId = ""
 
 proc assignKeys*(d: OptionsDialog, c: var Config, act: KeyAction, ks: seq[KeyCombo]) =
-  ## Gives act the keys ks, taking each from any command that had it.
-  var taken: seq[string]
-  for k in ks:
-    for other in c.actionsUsing(k):
-      if other != act:
-        c.removeCombo(other, k)
-        let name = "\"" & Actions[other].label & "\""
-        if name notin taken: taken.add name
+  ## Gives act the keys ks. A key another command has stays there too: OK
+  ## waits for one of them to give it up.
   c.setCombos(act, ks)
   d.keyNote =
     if ks.len == 0: Actions[act].label & ": no key"
     else: Actions[act].label & ": " & c.keysText(act)
-  if taken.len > 0: d.keyNote.add " (taken from " & taken.join(", ") & ")"
+
+proc addKey(d: OptionsDialog, c: var Config, act: KeyAction, k: KeyCombo, slot = -1) =
+  ## k as another key of act, or in place of its key number slot.
+  var ks = c.combos(act)
+  if slot in 0 .. ks.high: ks[slot] = k
+  else: ks.add k
+  d.assignKeys(c, act, ks.deduplicate)
 
 proc keysResults(d: OptionsDialog, ui: Ui, c: Config, p: var Pane) =
   ## Keys while searching: the matching commands under their groups; a click
@@ -641,16 +684,17 @@ proc keysResults(d: OptionsDialog, ui: Ui, c: Config, p: var Pane) =
 proc keysPage(d: OptionsDialog, ui: Ui, c: var Config, p: var Pane, bottom: float32) =
   let w = ui.window
   d.keyTaken = false
+  let wasCapturing = d.capturing
   if d.capturing:
-    # The next key pressed, with the modifiers held, becomes the command's
-    # key. Escape or a click cancels.
+    # The next key pressed, with the modifiers held, goes to the command.
+    # Escape or a click cancels.
     let key = w.pressedKey
     if w.buttonPressed[KeyEscape] or w.buttonPressed[MouseLeft] or
        w.buttonPressed[MouseRight] or ui.focusId != KeyCapture:
       d.stopCapture(ui)
       d.keyTaken = w.buttonPressed[KeyEscape]
     elif key != ButtonUnknown:
-      d.assignKeys(c, d.keySel, @[KeyCombo(mods: w.heldMods, key: key)])
+      d.addKey(c, d.keySel, KeyCombo(mods: w.heldMods, key: key), d.capSlot)
       d.stopCapture(ui)
       d.keyTaken = true
 
@@ -675,12 +719,13 @@ proc keysPage(d: OptionsDialog, ui: Ui, c: var Config, p: var Pane, bottom: floa
       acts.add rows.len
       rows.add (false, g, act)
 
+  let clashes = c.keyClashes
   let footer = 8'f32 + 34 + 18  # buttons and the status line below the list
   let list = rect(p.x + 8, p.y, p.w - 8, max(120'f32, bottom - p.y - footer))
   ui.rect(list, colBackground)
   ui.border(list, colBorder)
   const rowH = 24'f32
-  const keyW = 190'f32
+  const keyW = 220'f32
   let inner = rect(list.x + 1, list.y + 1, list.w - 2, list.h - 2)
   let maxScroll = max(0'f32, rows.len.float32 * rowH - inner.h)
   let listFocused = ui.tabStop("o-keys-list", list)
@@ -696,7 +741,7 @@ proc keysPage(d: OptionsDialog, ui: Ui, c: var Config, p: var Pane, bottom: floa
     d.reveal(acts[cur])
   if listFocused and ui.focusId.len == 0 and acts.len > 0:
     # Up/Down/PageUp/PageDown/Home/End move the selection, Enter or Space
-    # asks for a new key, Delete or Backspace removes the key.
+    # asks for another key, Delete or Backspace removes its keys.
     let page = max(1, int(inner.h / rowH) - 1)
     var n = max(cur, 0)
     if w.buttonPressed[KeyUp]: dec n
@@ -736,35 +781,57 @@ proc keysPage(d: OptionsDialog, ui: Ui, c: var Config, p: var Pane, bottom: floa
     let act = row.act
     let sel = act == d.keySel and cur >= 0
     let capturing = sel and d.capturing
+    let clash = act in clashes
     let hov = ui.hover(r)
-    if sel: ui.rect(r, if listFocused or capturing: colAccent else: colPanelRaised)
+    # Yellow doesn't read on the accent color.
+    let accent = sel and (listFocused or capturing) and not clash
+    if sel: ui.rect(r, if accent: colAccent else: colPanelRaised)
     elif hov: ui.rect(r, colHover)
-    let fg = if sel and (listFocused or capturing): colOnAccent else: colText
+    let fg = if clash: colWarning elif accent: colOnAccent else: colText
     let changed = not c.isDefault(act)
     ui.textIn(ui.ellipsize(Actions[act].label, r.w - keyW - 40),
       rect(r.x + 20, r.y, r.w - keyW - 28, rowH), fg)
     let kr = rect(r.x + r.w - keyW - 6, r.y + 2, keyW, rowH - 4)
-    let key = c.keysText(act)
+    let keys = c.combos(act)
+    var picked = -1             # the key under the pointer
     if capturing:
       ui.rect(kr, colBackground)
       ui.border(kr, colAccent)
       ui.textIn("Press a key...", rect(kr.x + 8, kr.y, kr.w - 16, kr.h), colTextDim, FontSmall)
     else:
       let kcol =
-        if sel and (listFocused or capturing): colOnAccent
-        elif key.len == 0: colTextDisabled
+        if clash: colWarning
+        elif accent: colOnAccent
+        elif keys.len == 0: colTextDisabled
         elif changed: colAccent
         else: colTextDim
-      ui.textIn((if changed: "• " else: "") & (if key.len > 0: key else: "None"),
-        rect(kr.x + 8, kr.y, kr.w - 16, kr.h), kcol, FontSmall)
-      if ui.hover(kr): ui.tip(kr, "Click to change")
+      var x = kr.x + 8
+      proc put(s: string) =
+        ui.textIn(s, rect(x, kr.y, kr.x + kr.w - x, kr.h), kcol, FontSmall)
+        x += ui.textSize(s, FontSmall).x
+      if changed: put("• ")
+      if keys.len == 0: put("None")
+      for i, k in keys:
+        if i > 0: put(" / ")
+        let chip = rect(x - 3, kr.y, ui.textSize($k, FontSmall).x + 6, kr.h)
+        if ui.hover(chip):
+          picked = i
+          ui.rect(chip, if accent: colAccentHover else: colPressed)
+        put($k)
+      if ui.hover(kr):
+        ui.tip(kr, if picked >= 0: "Click to change, right-click to remove" else: "Click to add a key")
     if hov and ui.pressed():
       ui.consumeClick()
       ui.navId = "o-keys-list"
       ui.focusId = ""
-      # Clicking the key, or double-clicking the row, asks for a new key.
-      if ui.hover(kr) or (sel and w.buttonPressed[DoubleClick]): d.startCapture(ui, act)
+      # Clicking a key changes it; clicking beside it or double-clicking the
+      # row adds one.
+      if ui.hover(kr) or (sel and w.buttonPressed[DoubleClick]): d.startCapture(ui, act, picked)
       else: d.keySel = act
+    elif picked >= 0 and w.buttonPressed[MouseRight] and not wasCapturing:
+      d.keySel = act
+      c.removeCombo(act, keys[picked])
+      d.keyNote = Actions[act].label & ": " & $keys[picked] & " removed"
   if rows.len == 0:
     ui.textIn("No matching commands", inner, colTextDim, FontSmall, h = CenterAlign)
   ui.sk.popClipRect()
@@ -775,7 +842,7 @@ proc keysPage(d: OptionsDialog, ui: Ui, c: var Config, p: var Pane, bottom: floa
   const bw = 110'f32
   let by = p.y
   proc at(i: int): Rect = rect(list.x + i.float32 * (bw + 8), by, bw, 28)
-  if ui.button("o-keyset", "Change...", at(0), has): d.startCapture(ui, d.keySel)
+  if ui.button("o-keyset", "Add...", at(0), has): d.startCapture(ui, d.keySel)
   if ui.button("o-keyclear", "Clear", at(1), has and c.combos(d.keySel).len > 0):
     d.assignKeys(c, d.keySel, @[])
   if ui.button("o-keyreset", "Default", at(2), has and not c.isDefault(d.keySel)):
@@ -792,10 +859,11 @@ proc keysPage(d: OptionsDialog, ui: Ui, c: var Config, p: var Pane, bottom: floa
   p.y += 34
   let note =
     if d.capturing: "Press a key for \"" & Actions[d.keySel].label & "\"; Esc cancels."
+    elif clashes.card > 0: "The yellow commands share a key: change one of them to save."
     elif d.keyNote.len > 0: d.keyNote
-    else: "Click a key to change it. A key given to another command is taken from it."
+    else: "Click a key to change it, right-click to remove it. Add... gives a command another key."
   ui.textIn(ui.ellipsize(note, p.w - 8, FontSmall), rect(p.x + 8, p.y, p.w - 8, 18),
-    if d.capturing: colAccent else: colTextDim, FontSmall)
+    if d.capturing: colAccent elif clashes.card > 0: colWarning else: colTextDim, FontSmall)
   p.y += 18
 
 proc playbackPage(ui: Ui, c: var Config, p: var Pane) =
@@ -812,7 +880,7 @@ proc playbackPage(ui: Ui, c: var Config, p: var Pane) =
   ui.hint(p, if c.snapWithShift: "Seeking snaps to chapters only while Shift is held."
              else: "Seeking snaps to chapters; hold Shift to seek freely.")
   ui.checkRow(p, "o-bmch", "Bookmarks as chapters", c.bookmarksAsChapters)
-  ui.hint(p, "Next/previous chapter also stops at bookmarks.")
+  ui.hint(p, "Next/previous chapter stops at bookmarks; the seek bar titles parts by them.")
   ui.group(p, "Steps")
   ui.numberRow(p, "o-rate", "Playback rate", c.rateStep, 0.05, 0.05, 2, 2)
   var jumpMs = c.seekStep * 1000
@@ -1464,8 +1532,9 @@ proc systemPage(ui: Ui, c: var Config, p: var Pane) =
 
 # --- window -----------------------------------------------------------------------
 
-proc draw*(d: OptionsDialog, ui: Ui, c: var Config, r: Rect): OptionsAction =
+proc draw*(d: OptionsDialog, ui: Ui, c: var Config, before: Config, r: Rect): OptionsAction =
   ## Draws the window's contents filling r (the Options window's client area).
+  ## before is the config when it opened, for the pages with unsaved changes.
   let w = ui.window
   # Keys that belong to the window, not to a text field being edited.
   let keys = ui.focusId.len == 0
@@ -1488,7 +1557,13 @@ proc draw*(d: OptionsDialog, ui: Ui, c: var Config, r: Rect): OptionsAction =
 
   let body = rect(r.x + 16, findR.y + findR.h + 10, r.w - 32, r.h - 16 - 58 - findR.h - 10)
   let treeR = rect(body.x, body.y, TreeWidth, body.h)
-  d.drawTree(ui, treeR, keys)
+  var changed: set[OptionsPage]
+  for (page, _) in Tree:
+    if page.pageChanged(c, before): changed.incl page
+  let clashing = c.keyClashes.card > 0
+  # On the Keys page its list shows them already.
+  let clashPages = if clashing and (searching or d.page != opKeys): {opKeys} else: {}
+  d.drawTree(ui, treeR, keys, changed, clashPages)
 
   let pageR = rect(treeR.x + treeR.w + 16, body.y, body.w - treeR.w - 16, body.h)
   ui.sk.pushClipRect(pageR)
@@ -1556,12 +1631,16 @@ proc draw*(d: OptionsDialog, ui: Ui, c: var Config, r: Rect): OptionsAction =
 
   ui.rect(rect(r.x + 1, r.y + r.h - 50, r.w - 2, 1), colBorder)
   let by = r.y + r.h - 40
-  if ui.textButton("o-ok", rect(r.x + r.w - 212, by, 92, 30), "OK", primary = true):
+  let okR = rect(r.x + r.w - 212, by, 92, 30)
+  if clashing:
+    discard ui.button("o-ok", "OK", okR, false)
+    ui.tip(okR, "Some keys are on more than one command (Player > Keys)")
+  elif ui.textButton("o-ok", okR, "OK", primary = true):
     result = oaOk
   if ui.textButton("o-cancel", rect(r.x + r.w - 112, by, 92, 30), "Cancel"):
     result = oaCancel
   # Enter means OK unless a focused button took it.
-  if result == oaNone and enter and not ui.enterUsed: result = oaOk
+  if result == oaNone and enter and not ui.enterUsed and not clashing: result = oaOk
   d.drawPicker(ui, c)
   d.drawFonts(ui, c)
   if result != oaNone:

@@ -7,8 +7,9 @@ import std/[os, dynlib, strutils]
 import config
 
 const
-  StartVram* = 512'i64 shl 20   ## free at start for the GPU (Prefer GPU, Adaptive)
-  ReturnVram* = 1024'i64 shl 20 ## free for a while to go back to the GPU from the CPU
+  # A video takes up 550-750 MiB, and pausing one ~200 more (the standby).
+  StartVram* = 1024'i64 shl 20  ## free at start for the GPU (Prefer GPU, Adaptive)
+  ReturnVram* = 1536'i64 shl 20 ## free for a while to go back to the GPU from the CPU
   LowVram* = 256'i64 shl 20    ## Adaptive: free under this for a while, to the CPU
   RenderArg* = "--render="      ## a restart's renderer: "--render=cpu" / "--render=gpu"
   SoftwareMark = "MMP_SOFTWARE_GL"  ## set along with useSoftwareGl's settings

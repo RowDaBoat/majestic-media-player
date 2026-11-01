@@ -17,7 +17,7 @@ Majestic's aim is to be the video player I wish I had.
 - **Seek bar shows what's downloaded** of online videos: parts skipped over are striped.
 - **A silent delay after very short audio files**, shown on the seek bar past a `]` mark.
 - **Synchronized players**, for footage recorded from several angles.
-- **VR / 360° videos.**
+- **VR / 360° videos**, YouTube's included (360°, VR180 and 3D).
 - **A very, VERY resizable compact mode.**
 - **Zoom, pan and rotate** the video (Ctrl+mouse).
 - **A-B loops, ping-pong playback and an equalizer.**

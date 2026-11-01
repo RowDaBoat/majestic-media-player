@@ -4,7 +4,7 @@
 ## build, which can then keep itself up to date with -U too.
 
 import std/[os, osproc, json, math, strutils, strformat, algorithm, sequtils]
-import runlog, config
+import runlog, config, spherical
 
 const
   YtdlSubLangs* = "all,-live_chat"
@@ -109,7 +109,7 @@ proc captions*(exe, url: string, cookies = ""): YtJob =
   start(ytCaptions, exe, @["--no-warnings", "--no-playlist"] & cookieArgs(cookies) &
     @["-O", "MMPCAPS %(automatic_captions)j", "-O", "MMPSUBS %(subtitles)j",
       "-O", "MMPFMTS %(formats.:.{format_id," &
-      "vcodec,acodec,height,fps,abr,language,format_note})j", "-O", "MMPSB %(formats.:.{format_id," &
+      "vcodec,acodec,height,fps,abr,language,format_note,protocol})j", "-O", "MMPSB %(formats.:.{format_id," &
       "width,height,columns,rows,fps,fragments})j", "--", url], url)
 
 proc playlistItems*(exe, url: string, cookies = ""): YtJob =
@@ -355,6 +355,62 @@ proc styledSubs*(j: YtJob): seq[tuple[url, title, lang: string]] =
         break
   result.sort(proc(a, b: auto): int = cmp(a.lang, b.lang))  # the order mpv's hook adds them in
 
+type
+  LinkSphere* = object
+    ## How a link's picture lies on the sphere, as far as yt-dlp's formats say.
+    sphere*: SphereInfo
+    meshUrl*: string          ## a format with a mesh, whose header says the rest
+    meshHls*: bool            ## the picture isn't that format but an HLS one
+
+proc noted(f: JsonNode, what: string): bool =
+  ## A format's note (its picture's projection is there) has `what`, whose
+  ## full name may go on ("equi_threed_top_bottom").
+  f{"format_note"}.getStr.split(", ").anyIt(it.startsWith(what))
+
+proc flat(f: JsonNode, spherical: bool): bool =
+  ## YouTube renders a 360° video's lesser formats through a fixed camera,
+  ## noted as nothing. Its HLS ones, noted as nothing too, stay on the sphere.
+  spherical and not f.noted("equi") and not f.noted("mesh") and
+    "m3u8" notin f{"protocol"}.getStr
+
+proc stereoNoted(f: JsonNode): StereoLayout =
+  let note = f{"format_note"}.getStr
+  if "top_bottom" in note: slTopBottom
+  elif "left_right" in note: slSideBySide
+  else: slMono
+
+proc linkSphere*(info: string): LinkSphere =
+  ## From the JSON yt-dlp gave for a link: what's playing decides, not the
+  ## video: the same one can be on the sphere in one format and flat in the
+  ## other (flat).
+  if "equi" notin info and "mesh" notin info: return
+  let j = try: parseJson(info) except CatchableError: return
+  var video = j
+  for f in j{"requested_formats"}.getElems:
+    if f{"vcodec"}.getStr notin ["", "none"]: video = f
+  var equi, mesh: JsonNode
+  for f in j{"formats"}.getElems:
+    if f.noted("equi"): equi = f
+    elif f.noted("mesh"): mesh = f
+  if video.noted("mesh"): result.meshUrl = video{"url"}.getStr
+  elif video.noted("equi"):
+    result.sphere = SphereInfo(projection: prEquirect, stereo: video.stereoNoted)
+  elif "m3u8" notin video{"protocol"}.getStr: discard
+  elif equi != nil:
+    result.sphere = SphereInfo(projection: prEquirect, stereo: equi.stereoNoted)
+  elif mesh != nil:
+    result.meshUrl = mesh{"url"}.getStr
+    result.meshHls = true
+
+proc hlsSphere*(mesh: SphereInfo): SphereInfo =
+  ## An HLS format's picture on a video that also has a format with `mesh`:
+  ## equirectangular (top and bottom if in 3D), but a mesh for each eye means
+  ## VR180, and those HLS formats are flat.
+  if mesh.meshes.len == 1:
+    SphereInfo(projection: prEquirect,
+      stereo: if mesh.stereo == slMono: slMono else: slTopBottom)
+  else: SphereInfo()
+
 proc qualities*(j: YtJob): tuple[video, audio: seq[Quality]] =
   ## ytCaptions: the link's video qualities, tallest first ("1080p60"), and
   ## its audio ones as yt-dlp ranks them, best first ("130k aac"): its "ba"
@@ -371,9 +427,11 @@ proc qualities*(j: YtJob): tuple[video, audio: seq[Quality]] =
   type A = tuple[q: Quality, abr: float]
   var alone, muxed: seq[V]
   var audio: seq[A]
+  let spherical = all.anyIt(it.noted("equi") or it.noted("mesh"))
   for f in all:
     let id = f{"format_id"}.getStr
     if id.len == 0 or id.endsWith("-drc"): continue  # the same, compressed
+    if f.flat(spherical): continue
     let (vc, ac) = (f{"vcodec"}.getStr, f{"acodec"}.getStr)
     let (h, fps, abr) = (f.num("height"), f.num("fps"), f.num("abr"))
     if h > 0 and vc != "none":

@@ -109,6 +109,7 @@ const
   GrabModeAsync = 1.cint
   GrabSuccess = 0.cint
   Button1to3Mask = 0x700.cuint
+  ShiftMask = 0x1.cuint
   ControlMask = 0x4.cuint
 
 proc glXGetCurrentDisplay(): XDisplay {.importc, dynlib: "libGL.so.1".}
@@ -389,10 +390,10 @@ proc pointerButtonsDown*(): bool =
     ry.addr, wx.addr, wy.addr, mask.addr)
   (mask and Button1to3Mask) != 0
 
-proc ctrlHeld*(): bool =
-  ## Whether Ctrl is held, even while another window has the keyboard (the
-  ## server's modifier state; on Xwayland that needs KWin's "Legacy X11 App
-  ## Support" to pass modifiers on, which it does by default).
+proc modifiersHeld(): cuint =
+  ## The server's modifier state, right even while another window has the
+  ## keyboard (on Xwayland that needs KWin's "Legacy X11 App Support" to pass
+  ## modifiers on, which it does by default).
   let d = glXGetCurrentDisplay()
   if d == nil: return
   var root, child: XID
@@ -400,7 +401,15 @@ proc ctrlHeld*(): bool =
   var mask: cuint
   discard XQueryPointer(d, XDefaultRootWindow(d), root.addr, child.addr, rx.addr,
     ry.addr, wx.addr, wy.addr, mask.addr)
-  (mask and ControlMask) != 0
+  mask
+
+proc ctrlHeld*(): bool =
+  ## Whether Ctrl is held, even while another window has the keyboard.
+  (modifiersHeld() and ControlMask) != 0
+
+proc shiftHeld*(): bool =
+  ## Whether Shift is held, even while another window has the keyboard.
+  (modifiersHeld() and ShiftMask) != 0
 
 var grabCursor: XID
 

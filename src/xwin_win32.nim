@@ -507,6 +507,10 @@ proc ctrlHeld*(): bool =
   ## Whether Ctrl is held, even while another window has the keyboard.
   (GetAsyncKeyState(VK_CONTROL).int and 0x8000) != 0
 
+proc shiftHeld*(): bool =
+  ## Whether Shift is held, even while another window has the keyboard.
+  (GetAsyncKeyState(VK_SHIFT).int and 0x8000) != 0
+
 var grabbedBy: HWND
 
 proc grabPointer*(window: Window): bool =
