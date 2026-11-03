@@ -3,8 +3,11 @@
 # to the licenses folder). Source: see README.txt.
 acl	2.4.0-1	LGPL-2.1-or-later AND GPL-2.0-or-later	appimage/common/LGPL-2.1-or-later.txt appimage/common/GPL-2.0-or-later.txt
 alsa-lib	1.2.16.1-1	LGPL-2.1-or-later	appimage/common/LGPL-2.1-or-later.txt
+alsa-topology-conf	1.2.5.1-4	BSD	appimage/alsa-topology-conf
+alsa-ucm-conf	1.2.16.1-1	BSD-3-Clause	appimage/alsa-ucm-conf
 aom	3.15.3-1	BSD-3-Clause	libmpv/aom
 brotli	1.2.1-1	MIT	libmpv/brotli
+bubblewrap	0.13.1-1	LGPL-2.1-or-later	appimage/common/LGPL-2.1-or-later.txt
 bzip2	1.0.8-6	BSD	libmpv/bzip2
 cairo	1.18.6-1	LGPL-2.1-only OR MPL-1.1	appimage/common/LGPL-2.1-only.txt appimage/common/MPL-1.1.txt
 curl	8.23.0-1	curl	libmpv/curl
@@ -29,6 +32,7 @@ gnutls	3.8.13-3	GPL-3.0-or-later AND LGPL-2.1-or-later	GPL-3.0.txt appimage/comm
 graphite	1:1.3.15-1	LGPL-2.1-or-later OR MPL-2.0 OR GPL-2.0-or-later	appimage/graphite
 gsm	1.0.24-1	custom	appimage/gsm
 harfbuzz	15.0.0-1	MIT	libmpv/harfbuzz
+hicolor-icon-theme	0.18-1	GPL-2.0-or-later	appimage/common/GPL-2.0-or-later.txt
 highway	1.4.0-1	Apache-2.0 OR BSD-3-Clause	libmpv/highway
 icu	78.3-1	LicenseRef-Unicode-3.0 BSD-2-Clause BSD-3-Clause NAIST-2003	appimage/icu
 intel-gmmlib	22.10.0-1	MIT	appimage/intel-gmmlib
@@ -46,6 +50,7 @@ libavc1394	0.5.4-7	GPL-2.0-or-later AND LGPL-2.1-or-later	appimage/common/GPL-2.
 libbluray	1.5.1-1	LGPL-2.1-only	libmpv/libbluray
 libbs2b	3.1.0-11	MIT	libmpv/libbs2b
 libbsd	0.12.2-2	custom	appimage/libbsd
+libcap	2.78-1	BSD-3-Clause OR GPL-2.0-only	appimage/libcap
 libcdio	2.4.0-1	GPL-3.0-or-later	GPL-3.0.txt
 libcdio-paranoia	10.2+2.0.2-3	GPL-3.0-or-later	GPL-3.0.txt
 libdatrie	0.2.14-1	LGPL-2.1-or-later	appimage/common/LGPL-2.1-or-later.txt
@@ -96,6 +101,7 @@ libtheora	1.2.0-1	BSD-3-Clause	appimage/libtheora
 libunibreak	7.0-1	custom:zlib/libpng	libmpv/libunibreak
 libunistring	1.4.2-1	GPL-2.0-or-later LGPL-3.0-or-later	appimage/common/GPL-2.0-or-later.txt appimage/common/LGPL-3.0-or-later.txt
 libunwind	1.8.3-1	MIT	appimage/libunwind
+libusb	1.0.30-1	LGPL-2.1-or-later	appimage/common/LGPL-2.1-or-later.txt
 libva	2.24.1-1	MIT	libmpv/libva
 libvdpau	1.5-4	MIT	appimage/libvdpau
 libvorbis	1.3.7-4	BSD-3-Clause	libmpv/vorbis
@@ -105,6 +111,7 @@ libwebp	1.6.0-2	BSD-3-Clause	libmpv/libwebp
 libx11	1.8.14-1	MIT AND X11	appimage/libx11
 libxau	1.0.12-1	MIT-open-group	appimage/libxau
 libxcb	1.17.0-1	X11	appimage/libxcb
+libxcursor	1.2.3-1	HPND-sell-variant	appimage/libxcursor
 libxdmcp	1.1.5-2	MIT-open-group	appimage/libxdmcp
 libxext	1.3.7-1	LicenseRef-libxext	appimage/libxext
 libxfixes	6.0.2-1	MIT HPND-sell-variant	appimage/libxfixes
@@ -134,11 +141,13 @@ openjpeg2	2.5.4-1	BSD-2-Clause MIT	appimage/openjpeg2
 openssl	3.6.5-1	Apache-2.0	libmpv/openssl
 opus	1.6.1-1	BSD-3-Clause	libmpv/opus
 pango	1:1.58.2-1	LGPL-2.0-or-later	appimage/common/LGPL-2.0-or-later.txt
+pciutils	3.15.0-1	GPL-2.0-only	appimage/common/GPL-2.0-only.txt
 pcre2	10.49-1	BSD-2-Clause BSD-3-Clause WITH PCRE2-exception	appimage/pcre2
 pixman	0.46.4-1	MIT	appimage/pixman
 rav1e	0.8.1-3	BSD-2-Clause	appimage/rav1e
 rubberband	4.0.0-2	GPL-2.0-or-later	libmpv/rubberband
 sdl2-compat	2.32.74-1	Zlib	libmpv/libsdl2
+sdl3	3.4.18-1	Zlib	appimage/sdl3
 shaderc	2026.4-1	Apache-2.0	libmpv/shaderc
 snappy	1.3.1-1	BSD-3-Clause	appimage/snappy
 sndio	1.10.0-1	ISC	appimage/sndio
@@ -154,11 +163,13 @@ vid.stab	1.1.2-1	GPL-2.0-or-later	appimage/common/GPL-2.0-or-later.txt
 vmaf	3.2.1-1	BSD-2-Clause-Patent	appimage/vmaf
 vulkan-icd-loader	1.4.363.0-1	Apache-2.0	libmpv/vulkan
 vulkan-intel	1:26.2.6-1	MIT AND BSD-3-Clause AND SGI-B-2.0	Mesa.txt
+vulkan-mesa-implicit-layers	1:26.2.6-1	MIT AND BSD-3-Clause AND SGI-B-2.0	Mesa.txt
 vulkan-radeon	1:26.2.6-1	MIT AND BSD-3-Clause AND SGI-B-2.0	Mesa.txt
 wayland	1.26.0-1	MIT	appimage/wayland
 x264	3:0.165.r3222.b35605a-2	GPL-2.0-only	libmpv/x264
 x265	4.3-1	GPL-2.0-or-later	libmpv/x265
 xcb-util-keysyms	0.4.1-5	X11-distribute-modifications-variant	appimage/xcb-util-keysyms
+xkeyboard-config	2.49-1	LicenseRef-xkeyboard-config	appimage/xkeyboard-config
 xvidcore	1.3.7-4	GPL-2.0-only	appimage/common/GPL-2.0-only.txt
 xz	5.8.4-1	GPL-2.0-or-later AND 0BSD AND LicenseRef-Public-Domain AND LGPL-2.1-or-later	libmpv/xz
 zeromq	4.3.5-3	MPL-2.0	appimage/common/MPL-2.0.txt

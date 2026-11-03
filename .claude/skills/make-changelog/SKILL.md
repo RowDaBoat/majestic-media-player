@@ -29,7 +29,7 @@ Reply with one line naming the audience, then the changelog in one ```markdown c
 to paste, in this shape:
 
 ```markdown
-## Majestic 0.20.0
+## Majestic v0.20.0
 
 ### Highlights
 
