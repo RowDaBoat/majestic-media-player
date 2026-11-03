@@ -87,6 +87,8 @@ The Run menu runs its command lines with Git for Windows' bash (set
 - Settings and recent files live in `~/.config/majestic-media-player/config.json`
   (`%APPDATA%\majestic-media-player\config.json` on Windows);
   remembered playback positions (View ▸ Options ▸ Player) in `positions.json` next to it.
+  Each running player saves the whole config, so only the one whose Options
+  changed the keys writes them: the others keep the file's keys and pick them up.
 - With "Same player for each media file" (the default), a running player listens
   on `$XDG_RUNTIME_DIR/majestic-media-player.sock` and files opened from the
   file manager are handed to it instead of starting a second window. On
@@ -98,6 +100,12 @@ The Run menu runs its command lines with Git for Windows' bash (set
   and the previous default takes over again. On Windows they go to the
   registry under `HKEY_CURRENT_USER`; an app the user picked in Settings ▸
   Default apps still wins there, and the Formats page says so.
+- `src/mediactl*.nim` puts Play/Pause, Previous and Next in the desktop's task bar.
+  On Linux that's MPRIS on the session bus, which Plasma's task manager shows in
+  a window's tooltip, tying the player to the window by process id and
+  `DesktopEntry`. On Windows it's
+  `ITaskbarList3` thumbnail toolbar buttons. `MediaState` follows the Controls
+  bar's buttons, read four times a second; commands run from the main loop.
 - The UI font is IBM Plex Sans (SIL Open Font License), embedded in the binary.
 
 - Render contexts: each costs ~200 MiB of video memory on NVIDIA (the CUDA context of its
@@ -141,6 +149,7 @@ The Run menu runs its command lines with Git for Windows' bash (set
 | `src/assoc*.nim` | File associations (XDG mimeapps.list / Windows registry) |
 | `src/instance.nim`, `src/peers.nim`, `src/ipc.nim` | Single-instance hand-over, Synchronize links, local sockets |
 | `src/syncdlg.nim` | Synchronize ▸ Properties window (masters, slaves, offset, looping) |
+| `src/mediactl*.nim` | Task bar media controls (MPRIS / Windows thumbnail toolbar) |
 | `src/ui.nim` | Widget helpers on top of Silky's drawing primitives |
 | `src/xwin*.nim`, `src/win32api.nim` | X11 / Win32 helpers (drag, on-top, aspect hints, monitors, menu popup windows) |
 | `src/config.nim`, `src/dialogs*.nim`, `src/theme.nim`, `src/icons.nim` | Settings, file dialogs (kdialog/zenity, Windows common dialogs), palette, vector icons |

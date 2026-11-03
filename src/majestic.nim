@@ -5,7 +5,7 @@ import std/[os, strutils, strformat, times, math, osproc, unicode, sequtils, alg
   random, tables, sets, streams, json]
 import silky, vmath, bumpy, chroma, pixie, opengl, jsony
 import mpv, videogl, xwin, config, dialogs, theme, ui, menutree, player, icons, debugscript,
-  options, instance, playlists, peers, cmdlines, runlog, mediainfo, inhibit, spherical, keymap,
+  options, instance, playlists, peers, cmdlines, runlog, mediainfo, inhibit, spherical, keymap, mediactl,
   rectedit, syncdlg, ytdlp, websave, mediasave, mkvtoolnix, updater, ytthumb, ytboard, srv3,
   netprobe
 from std/uri import encodeUrl, decodeUrl, parseUri, decodeQuery, UriParseError
@@ -524,6 +524,8 @@ type
     # window management
     onTopApplied: bool
     screenInhibit: Inhibitor  # keeps the display on while video plays
+    media: MediaControls      # the task bar's play/pause, previous and next
+    mediaPollAt, mediaStateAt: float  # when to look at each next, see syncMediaControls
     title: string
     hintsKey: string
     fitPending: bool
@@ -986,6 +988,7 @@ proc autosave(a: App) =
     a.savePosition()
   # Options edits the config live until OK or Cancel; never persist those.
   if a.overlay == ovOptions: return
+  a.cfg.reloadKeys()
   a.rememberState()
   let j = a.cfg.toJson
   if j != a.savedCfg:
@@ -1549,6 +1552,61 @@ proc navigate(a: App, dir: int) =
   # Each player has its own file; the folder step would rewrite a locked playlist.
   if not a.editLocked: a.navigateLocal(dir)
 
+# --- task bar controls ------------------------------------------------------
+
+proc mediaUrl(path: string): string =
+  ## A local file as a file: URI, a link as it is.
+  if path.len == 0 or "://" in path: path
+  else: "file://" & path.absolutePath.split(DirSep).mapIt(it.encodeUrl(usePlus = false)).join("/")
+
+proc mediaState(a: App): MediaState =
+  let p = a.player
+  result = MediaState(rate: p.speed, volume: p.volume / 100, position: p.timePos,
+    duration: p.duration, url: p.path.mediaUrl,
+    # As the Controls bar's buttons.
+    canPlay: p.loaded or a.cfg.recentFiles.len > 0, canPause: p.loaded,
+    canSeek: p.loaded and p.duration > 0)
+  result.canGoNext = p.loaded and not a.playlistLocked
+  result.canGoPrevious = result.canGoNext
+  result.status = if not p.loaded or p.stopped: msStopped
+    elif p.playing or a.padRunning: msPlaying
+    else: msPaused
+  if p.loaded:
+    result.title = p.h.getStr("media-title")
+    result.artist = p.h.getStr("metadata/by-key/Artist")
+    result.album = p.h.getStr("metadata/by-key/Album")
+  if result.title.len == 0 and p.path.len > 0: result.title = p.path.fileTitle
+
+proc runMediaCommand(a: App, c: MediaCommand) =
+  let p = a.player
+  let s = a.mediaState
+  case c.kind
+  of mcPlay: (if s.canPlay: a.play())
+  of mcPause: (if s.canPause: a.pause())
+  of mcPlayPause: (if s.canPlay: a.playPause())
+  of mcStop: (if p.loaded: a.stop())
+  of mcNext: (if s.canGoNext: a.navigate(1))
+  of mcPrevious: (if s.canGoPrevious: a.navigate(-1))
+  of mcSeekBy: (if s.canSeek: a.seekTo(p.timePos + c.value))
+  of mcSeekTo: (if s.canSeek and c.value >= 0 and c.value <= p.duration: a.seekTo(c.value))
+  of mcVolume: p.setVolume(c.value * 100)
+  of mcRaise: a.window.activate()
+  of mcQuit: a.window.closeRequested = true
+
+proc syncMediaControls(a: App) =
+  ## Every iteration; acts a few dozen times a second at most, as the bus
+  ## needn't hear of every frame. A command shows on the bus at the next update.
+  let t = now()
+  if t >= a.mediaPollAt:
+    a.mediaPollAt = t + 0.03
+    for c in a.media.poll():
+      a.runMediaCommand(c)
+      a.dirtyUntil = max(a.dirtyUntil, now() + 0.3)
+      a.mediaStateAt = min(a.mediaStateAt, t + 0.05)
+  if t >= a.mediaStateAt:
+    a.mediaStateAt = t + 0.25
+    a.media.update(a.mediaState, t)
+
 # --- playlist editing -------------------------------------------------------
 
 proc addToPlaylist(a: App, paths: seq[string], at = -1) =
@@ -2103,6 +2161,8 @@ proc timeChoices(a: App): seq[TimeChoice] =
     (if a.hasLoopA: a.loopA else: -1), (if a.hasLoopB: a.loopB else: -1),
     a.fileBookmarks, a.fileChapters)
 
+const SameBookmark = 0.0005  ## seconds; nearer is one bookmark, whatever the frame rate
+
 proc chapterStep(a: App, d: int) =
   let p = a.player
   if not p.loaded: return
@@ -2117,11 +2177,13 @@ proc chapterStep(a: App, d: int) =
     if d > 0:
       let limit = if cur + 1 < p.chapters.len: p.chapters[cur + 1].time else: Inf
       for i, b in marks:
-        if b.time > p.timePos + 0.05 and b.time < limit: bi = i; break
+        if b.time > p.timePos + SameBookmark and b.time < limit: bi = i; break
     else:
       let limit = if cur >= 0: p.chapters[cur].time else: -Inf
+      # Playing, a bookmark just passed doesn't hold the step back.
+      let past = if p.paused: SameBookmark else: 0.5
       for i in countdown(marks.high, 0):
-        if marks[i].time < p.timePos - 0.5 and marks[i].time > limit: bi = i; break
+        if marks[i].time < p.timePos - past and marks[i].time > limit: bi = i; break
     if bi >= 0:
       a.seekTo(marks[bi].time)
       a.osd(marks[bi].label(bi))
@@ -2166,7 +2228,7 @@ proc editBookmarks(a: App, path: string, edit: proc (marks: var seq[Bookmark])) 
 proc addBookmark(a: App, t: float) =
   let p = a.player
   if not p.loaded or p.path.len == 0: return
-  if a.fileBookmarks.anyIt(abs(it.time - t) < 0.05): return
+  if a.fileBookmarks.anyIt(abs(it.time - t) < SameBookmark): return
   a.editBookmarks(p.path, proc (marks: var seq[Bookmark]) =
     var i = 0
     while i < marks.len and marks[i].time < t: inc i
@@ -2192,7 +2254,7 @@ proc moveBookmark(a: App, path: string, t, to: float): bool =
   ## False when another bookmark is already there.
   var moved = false
   a.editBookmarks(path, proc (marks: var seq[Bookmark]) =
-    if marks.anyIt(it.time != t and abs(it.time - to) < 0.0005): return
+    if marks.anyIt(it.time != t and abs(it.time - to) < SameBookmark): return
     for i, b in marks:
       if b.time == t:
         var m = b
@@ -3362,6 +3424,7 @@ proc stepShow(a: App, i: int) =
   p.holdTime = true
   p.timePos = a.sfFrames[i].t
   p.seek(p.timePos)
+  p.holdJumps = p.jumps
   a.sfJumps = p.jumps
 
 proc payStepsOwed(a: App) =
@@ -3850,7 +3913,7 @@ proc importBookmarks(a: App, path: string) =
     for m in marks:
       var j = -1
       for i, b in cur:
-        if abs(b.time - m.time) < 0.05: j = i; break
+        if abs(b.time - m.time) < 0.001: j = i; break  # the file's times are in ms
       if j >= 0:
         if cur[j].name.len == 0: cur[j].name = m.name
         continue
@@ -4052,7 +4115,7 @@ proc rendererChanged(a: App, before: RenderMode)
 
 proc closeOptions(a: App, ok: bool) =
   if ok:
-    a.cfg.save()
+    a.cfg.save(ownKeys = a.cfg.keys != a.cfgBefore.keys)
     a.rendererChanged(a.cfgBefore.renderMode)
     # Another folder for links: its own index, the current one left as is.
     let dir = a.cfg.webDir.expandPath
@@ -5916,7 +5979,7 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
           a.cfg.ytSeekPreview = not a.cfg.ytSeekPreview
           a.cfg.save())
       sb.sep()
-    sb.item("Add Bookmark", enabled = loaded and not on, action = proc () = a.addBookmark(t))
+    sb.item("Add Bookmark", enabled = loaded, action = proc () = a.addBookmark(t))
     sb.item("Edit Bookmark...", enabled = on, action = proc () = a.showRename(i))
     sb.item("Remove Bookmark", enabled = on, action = proc () = a.removeBookmark(bt))
     # Loop marks go at the marker clicked on, else at the time clicked.
@@ -9517,6 +9580,8 @@ proc runScriptStep(a: App, st: ScriptStep) =
           let k = if st.args[1] == "none": KeyCombo() else: parseCombo(st.args[1 .. ^1].join(" "))
           a.optionsDlg.assignKeys(a.cfg, act, if k.key == ButtonUnknown: @[] else: @[k])
         else: a.optionsDlg.startCapture(a.optUi, act)
+  of "optok": a.closeOptions(true)  # the Options window's OK button
+  of "keysdump": stderr.writeLine "keys ", $a.cfg.keys
   of "key":  # combo: runs the command bound to it, as pressing it would
     let k = parseCombo(arg)
     for act in KeyAction:
@@ -9766,6 +9831,7 @@ proc main() =
     return
   a.window.icon = appIcon()
   a.window.initMainWindow()
+  a.media = newMediaControls(a.window)
   if c.compactMode: a.window.setDecorated(false)
   when defined(windows): setDialogOwner(a.window.getHWND)
   a.window.disableVsync()
@@ -10008,6 +10074,7 @@ proc main() =
       a.dirtyUntil = now() + 0.5
     a.applyOnTop()
     a.applyKeepAwake()
+    a.syncMediaControls()
     a.updateAspectHints()
     a.autosave()
 

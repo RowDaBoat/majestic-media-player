@@ -245,6 +245,12 @@ proc writeAtomic(path, data: string) =
   writeFile(tmp, data)
   moveFile(tmp, path)
 
+proc dropOldKeys(keys: var Table[string, string]) =
+  ## Keys saved before 0 joined Home on Go To Beginning, when 0 had its own command.
+  if "seek-0" in keys:
+    keys.del("seek-0")
+    keys.del("go-to-beginning")
+
 proc loadConfig*(): Config =
   result = Config()
   let path = configPath()
@@ -257,18 +263,38 @@ proc loadConfig*(): Config =
     result.playlistColumns = @[pfName, pfDuration]
     if result.playlistShowSize: result.playlistColumns.add pfSize
     if result.playlistShowDimensions: result.playlistColumns.add pfDimensions
-  # Keys saved before 0 joined Home on Go To Beginning, when 0 had its own command.
-  if "seek-0" in result.keys:
-    result.keys.del("seek-0")
-    result.keys.del("go-to-beginning")
+  dropOldKeys(result.keys)
 
-proc save*(c: Config) =
+proc readKeys(keys: var Table[string, string]): bool =
+  ## The file's keys; false, leaving keys as they are, when it can't be read.
+  try:
+    keys = readFile(configPath()).fromJson(Config).keys
+    dropOldKeys(keys)
+    true
+  except CatchableError:
+    false
+
+proc save*(c: Config, ownKeys = false) =
+  ## Every running player saves the whole config, so the keys go by the file
+  ## unless this one's Options changed them (ownKeys): a player still holding
+  ## the old keys mustn't undo that.
   let path = configPath()
+  var c = c
+  if not ownKeys: discard readKeys(c.keys)
   try:
     createDir(path.parentDir)
     writeAtomic(path, c.toJson)
   except CatchableError as e:
     stderr.writeLine "config: cannot save ", path, ": ", e.msg
+
+var keysStamp: Time  # the config file as last checked for keys
+
+proc reloadKeys*(c: var Config) =
+  ## Takes the keys another player saved since.
+  let t = try: getLastModificationTime(configPath()) except OSError: Time()
+  if t != keysStamp:
+    keysStamp = t
+    discard readKeys(c.keys)
 
 # --- Open Recent, shared by every running player -----------------------------
 # Kept apart from the config, which each player saves whole (the last one to

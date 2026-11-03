@@ -21,6 +21,7 @@ Majestic's aim is to be the video player I wish I had.
 - **A very, VERY resizable compact mode.**
 - **Zoom, pan and rotate** the video (Ctrl+mouse).
 - **A-B loops, ping-pong playback and an equalizer.**
+- **Play/Pause, Previous and Next in the taskbar's window preview**, on Windows and KDE Plasma.
 
 Hold Ctrl, Shift or Alt to see what else you can do, or press F1 for every shortcut. Try right-clicking everything, too!
 

@@ -51,6 +51,11 @@ proc renderIcon*(path: string, viewBox, size: int, color = color(1, 1, 1, 1)): I
   let s = size.float32 / 24
   result.fillPath(parsePath(path), color, scale(vec2(s, s)))
 
+proc namedIcon*(name: string, size: int): Image =
+  ## One of iconPaths on its own, for use outside the atlas.
+  for (n, icon) in iconPaths:
+    if n == name: return renderIcon(icon[1], icon[0], size)
+
 proc ringIcon(size: int): Image =
   ## Radio button outline.
   result = newImage(size, size)

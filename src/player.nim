@@ -51,6 +51,7 @@ type
     timeAt: float             ## when timePos last changed, epochTime
     frameDur: float           ## the last step of timePos while playing, a frame
     holdTime*: bool           ## the app sets timePos (step frames): mpv's lags behind
+    holdJumps*: int           ## jumps of the step holding it: any later jump's time counts
     endPinned: bool           ## timePos is the last frame's (pinEnd), until eof-reached goes
     eofJumps: int             ## jumps when the end was reached
     timeJumps: int            ## jumps when the last time was taken
@@ -431,7 +432,7 @@ proc handleProp(p: Player, id: Prop, ev: ptr MpvEventProperty) =
     p.paused = b
     if b: p.pausedAt = epochTime()
   of pTimePos:
-    if p.holdTime or d == nil: return  # unavailable for a moment isn't 0
+    if p.holdTime and p.jumps == p.holdJumps or d == nil: return  # unavailable for a moment isn't 0
     if p.endPinned and p.jumps == p.eofJumps: return
     # With the video out, mpv's time is the sound's, behind it by the audio
     # output's latency. That's no step back, near the end of playing forward.
