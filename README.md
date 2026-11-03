@@ -44,6 +44,10 @@ Then search for **Majestic Media Player** in your application launcher, or right
 
 ### Windows
 
+Download the `-windows-x64.zip` from the [latest release](https://github.com/arkl1te/majestic-media-player/releases/latest), extract it anywhere and run `majestic-media-player.exe`. Nothing else needs to be installed. Help > Check for Updates installs new releases for you.
+
+### Windows from source
+
 Install [Git for Windows](https://gitforwindows.org), [Nim](https://nim-lang.org) 2.2+ and Visual Studio (or its Build Tools) with the C++ workload. Then, from Git Bash:
 
 ```sh
@@ -54,7 +58,7 @@ cd majestic-media-player
 
 Majestic shows up in the Start menu.
 
-To update on either platform, `git pull` and run `./install.sh` again. `./install.sh --uninstall` removes it.
+To update a source install, `git pull` and run `./install.sh` again. `./install.sh --uninstall` removes it.
 
 More details in [TECHNICAL.md](TECHNICAL.md).
 
