@@ -102,7 +102,18 @@ type
     flags*: uint64
     targetTime*: int64
 
+  MpvStreamCbInfo* = object
+    cookie*: pointer
+    readFn*: proc (cookie: pointer, buf: ptr UncheckedArray[byte], nbytes: uint64): int64 {.cdecl.}
+    seekFn*: proc (cookie: pointer, offset: int64): int64 {.cdecl.}
+    sizeFn*: proc (cookie: pointer): int64 {.cdecl.}
+    closeFn*: proc (cookie: pointer) {.cdecl.}
+    cancelFn*: proc (cookie: pointer) {.cdecl.}
+  MpvStreamCbOpenRo* = proc (userData: pointer, uri: cstring, info: ptr MpvStreamCbInfo): cint {.cdecl.}
+
 const
+  MpvErrorLoadingFailed* = -13'i32
+  MpvErrorGeneric* = -20'i32
   MpvRenderUpdateFrame* = 1'u64
   MpvFrameInfoPresent* = 1'u64
   MpvFrameInfoRedraw* = 2'u64
@@ -129,6 +140,8 @@ proc mpv_set_wakeup_callback*(ctx: MpvHandle, cb: proc (d: pointer) {.cdecl.}, d
 proc mpv_request_log_messages*(ctx: MpvHandle, minLevel: cstring): cint
 proc mpv_hook_add*(ctx: MpvHandle, replyUserdata: uint64, name: cstring, priority: cint): cint
 proc mpv_hook_continue*(ctx: MpvHandle, id: uint64): cint
+proc mpv_stream_cb_add_ro*(ctx: MpvHandle, protocol: cstring, userData: pointer,
+                           openFn: MpvStreamCbOpenRo): cint
 
 proc mpv_render_context_create*(res: ptr MpvRenderContext, mpv: MpvHandle, params: ptr MpvRenderParam): cint
 proc mpv_render_context_set_update_callback*(ctx: MpvRenderContext, cb: proc (d: pointer) {.cdecl.}, d: pointer)

@@ -35,6 +35,14 @@ const
     "ssa": "S_TEXT/SSA", "webvtt": "S_TEXT/WEBVTT", "hdmv_pgs_subtitle": "S_HDMV/PGS",
     "dvd_subtitle": "S_VOBSUB"}.toTable
 
+  moduleKinds = {
+    "mptm": "OpenMPT", "mod": "MOD", "s3m": "Scream Tracker 3", "xm": "FastTracker 2",
+    "it": "Impulse Tracker", "mo3": "MO3", "669": "Composer 669", "mtm": "MultiTracker",
+    "med": "OctaMED", "stm": "Scream Tracker 2", "ult": "UltraTracker",
+    "okt": "Oktalyzer", "umx": "Unreal Music", "dbm": "DigiBooster Pro",
+    "digi": "DigiBooster", "far": "Farandole Composer", "ptm": "PolyTracker",
+    "mt2": "MadTracker 2", "imf": "Imago Orpheus", "symmod": "Symphonie"}.toTable
+
   lossless = ["flac", "alac", "truehd", "mlp", "wavpack", "ape", "tta"]
 
   languages = {
@@ -229,7 +237,14 @@ proc containerFormat(fmt: JsonNode, path: string): string =
     of "mp3": "MPEG Audio"
     of "flac": "FLAC"
     of "asf": "Windows Media"
+    of "libopenmpt": "Tracker module"
     else: fmt.str("format_long_name")
+
+proc moduleKind(path: string): string =
+  ## A tracker module's kind, going by its extension (libopenmpt doesn't
+  ## tell FFmpeg): "Impulse Tracker", or "XYZ module" for the rarer ones.
+  let ext = path.splitFile.ext.toLowerAscii.strip(chars = {'.'})
+  moduleKinds.getOrDefault(ext, ext.toUpperAscii & " module")
 
 proc streamDuration(st: JsonNode): float =
   result = st.num("duration")
@@ -439,6 +454,23 @@ proc videoSection(st: JsonNode, matroska: bool, fileSize: float): InfoSection =
   s.hdrRows(st, transfer)
   s
 
+proc moduleAudioSection(st: JsonNode): InfoSection =
+  ## A tracker module has no audio stream as such: libopenmpt renders the
+  ## patterns to PCM as it plays, so that PCM's rate, size and "lossless" say
+  ## nothing about the file. Only what it is rendered to.
+  var s: InfoSection
+  s.add "ID", $(st{"index"}.getInt + 1)
+  s.add "Format", "Tracker module"
+  s.add "Format/Info", "Rendered by libopenmpt"
+  let dur = st.streamDuration
+  if dur > 0: s.add "Duration", fmtDuration(dur)
+  let ch = st{"channels"}.getInt(0)
+  if ch > 0: s.add "Channel(s)", &"{ch} channel" & (if ch == 1: "" else: "s")
+  s.add "Channel layout", st.str("channel_layout")
+  let sr = st.num("sample_rate").int
+  if sr > 0: s.add "Sampling rate", fmtRate(sr)
+  s
+
 proc audioSection(st: JsonNode, matroska: bool, fileSize: float): InfoSection =
   var s: InfoSection
   s.commonHead(st, matroska)
@@ -520,6 +552,7 @@ proc generalSection(fmt: JsonNode, streams: seq[JsonNode], path: string): InfoSe
   var s: InfoSection
   s.add "Complete name", path
   s.add "Format", containerFormat(fmt, path)
+  if fmt.str("format_name") == "libopenmpt": s.add "Format/Info", moduleKind(path)
   let brand = fmt.tag("major_brand").strip
   if brand.len > 0 and fmt.str("format_name").startsWith("mov,mp4"):
     var compat: seq[string]
@@ -611,7 +644,11 @@ proc mpvTrackSection(t: JsonNode): InfoSection =
 proc mpvSections(h: MpvHandle, path: string): seq[InfoSection] =
   var g = InfoSection(title: "General")
   g.add "Complete name", path
-  g.add "Format", h.getStr("file-format")
+  let format = h.getStr("file-format")
+  if format == "libopenmpt":
+    g.add "Format", "Tracker module"
+    g.add "Format/Info", moduleKind(path)
+  else: g.add "Format", format
   let size = h.getInt("file-size", -1)
   if size > 0: g.add "File size", fmtBytes(size.float)
   let dur = h.getFloat("duration")
@@ -650,6 +687,7 @@ proc gatherMediaInfo*(h: MpvHandle, path: string): seq[InfoSection] =
     let fmt = probed["format"]
     let streams = probed{"streams"}.getElems
     let matroska = fmt.str("format_name").startsWith("matroska")
+    let module = fmt.str("format_name") == "libopenmpt"
     let fileSize = fmt.num("size")
     var g = generalSection(fmt, streams, path)
     g.title = "General"
@@ -660,7 +698,8 @@ proc gatherMediaInfo*(h: MpvHandle, path: string): seq[InfoSection] =
       of "video":
         if st.disposition("attached_pic"): image.add imageSection(st)
         else: video.add videoSection(st, matroska, fileSize)
-      of "audio": audio.add audioSection(st, matroska, fileSize)
+      of "audio":
+        audio.add(if module: moduleAudioSection(st) else: audioSection(st, matroska, fileSize))
       of "subtitle": text.add textSection(st, matroska, fileSize)
       of "data": other.add otherSection(st)
       else: discard

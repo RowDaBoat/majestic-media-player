@@ -181,7 +181,7 @@ proc pageChanged(p: OptionsPage, c, before: Config): bool =
   of opWeb: differs(webCount) or differs(webCountOn) or differs(webDir) or
     differs(webKeepHours) or differs(webKeepOn) or differs(webSizeGB) or differs(webSizeOn)
   of opAudioFiles: differs(coverNames) or differs(shortAudioDelay) or differs(shortAudioMs) or
-    differs(showCover)
+    differs(showCover) or differs(showTrackerChart)
   of opSubtitles: differs(subDelay) or differs(subPaths)
   of opSubStyle: differs(subBold) or differs(subColor) or differs(subFont) or
     differs(subItalic) or differs(subLineSpacing) or differs(subOpacity) or
@@ -930,6 +930,9 @@ proc audioFilesPage(ui: Ui, c: var Config, p: var Pane) =
     p.y += 96 + 4
   ui.hint(p, "Without a cover inside it, a picture in its folder with one of these names, one per line.")
   ui.hint(p, "Earlier lines win; letter case and the extension (.jpg, .png...) don't matter.")
+  ui.group(p, "Tracker modules")
+  ui.checkRow(p, "o-trackerchart", "Show the tracker chart (MOD, XM, IT...)", c.showTrackerChart)
+  ui.hint(p, "Each channel's notes, scrolling as they play. Needs libopenmpt.")
   ui.group(p, "Very short files")
   ui.checkRow(p, "o-shortaudio", "Add delay after very short files", c.shortAudioDelay)
   ui.numberRow(p, "o-shortaudioms", "Delay (milliseconds)", c.shortAudioMs, 50, 1, 60_000)

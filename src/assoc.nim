@@ -3,6 +3,7 @@
 
 import std/[os, algorithm]
 import config
+import appimage
 
 type AssocItem* = object
   ext*: string

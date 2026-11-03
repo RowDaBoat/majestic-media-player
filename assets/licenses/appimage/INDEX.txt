@@ -1,0 +1,167 @@
+# Arch Linux packages in the AppImage, as of 2026/11/02 (tools/appimage.sh licenses).
+# Tab-separated: package, version, license, where its license is (relative
+# to the licenses folder). Source: see README.txt.
+acl	2.4.0-1	LGPL-2.1-or-later AND GPL-2.0-or-later	appimage/common/LGPL-2.1-or-later.txt appimage/common/GPL-2.0-or-later.txt
+alsa-lib	1.2.16.1-1	LGPL-2.1-or-later	appimage/common/LGPL-2.1-or-later.txt
+aom	3.15.3-1	BSD-3-Clause	libmpv/aom
+brotli	1.2.1-1	MIT	libmpv/brotli
+bzip2	1.0.8-6	BSD	libmpv/bzip2
+cairo	1.18.6-1	LGPL-2.1-only OR MPL-1.1	appimage/common/LGPL-2.1-only.txt appimage/common/MPL-1.1.txt
+curl	8.23.0-1	curl	libmpv/curl
+dav1d	1.5.4-1	BSD-2-Clause	libmpv/dav1d
+db5.3	5.3.28-7	Sleepycat	appimage/db5.3
+dbus	1.16.2-2	AFL-2.1 OR GPL-2.0-or-later	appimage/dbus
+e2fsprogs	1.47.4-1	GPL LGPL MIT	appimage/manual/e2fsprogs
+expat	2.9.0-1	MIT	appimage/expat
+ffmpeg	2:9.0.2-2	GPL-3.0-only	libmpv/ffmpeg
+fftw	3.3.11-1	GPL-2.0-or-later	appimage/common/GPL-2.0-or-later.txt
+flac	1.5.0-1	BSD-3-Clause GPL-2.0-or-later	appimage/flac
+fontconfig	2:2.18.3-2	HPND AND Unicode-DFS-2016	libmpv/fontconfig
+freetype2	2.15.0-1	FTL OR GPL-2.0-or-later	libmpv/freetype2
+fribidi	1.0.18-1	LGPL-2.1-or-later	libmpv/fribidi
+gdk-pixbuf2	2.44.8-1	LGPL-2.0-or-later	appimage/common/LGPL-2.0-or-later.txt
+glib2	2.90.1-1	LGPL-2.1-or-later	appimage/common/LGPL-2.1-or-later.txt
+glibc	2.44+r50+g1848099f063e-1	GPL-2.0-or-later LGPL-2.1-or-later	appimage/common/GPL-2.0-or-later.txt appimage/common/LGPL-2.1-or-later.txt
+glslang	1:1.4.363.0-1	BSD-3-Clause	libmpv/glslang
+glycin	2.2.5-1	MPL-2.0 OR LGPL-2.1-or-later	appimage/common/MPL-2.0.txt appimage/common/LGPL-2.1-or-later.txt
+gmp	6.3.0-3	GPL-2.0-or-later LGPL-3.0-or-later	appimage/common/GPL-2.0-or-later.txt appimage/common/LGPL-3.0-or-later.txt
+gnutls	3.8.13-3	GPL-3.0-or-later AND LGPL-2.1-or-later	GPL-3.0.txt appimage/common/LGPL-2.1-or-later.txt
+graphite	1:1.3.15-1	LGPL-2.1-or-later OR MPL-2.0 OR GPL-2.0-or-later	appimage/graphite
+gsm	1.0.24-1	custom	appimage/gsm
+harfbuzz	15.0.0-1	MIT	libmpv/harfbuzz
+highway	1.4.0-1	Apache-2.0 OR BSD-3-Clause	libmpv/highway
+icu	78.3-1	LicenseRef-Unicode-3.0 BSD-2-Clause BSD-3-Clause NAIST-2003	appimage/icu
+intel-gmmlib	22.10.0-1	MIT	appimage/intel-gmmlib
+intel-media-driver	26.3.5-1	BSD-3-Clause MIT	appimage/intel-media-driver
+jack2	1.9.22-2	GPL-2.0-or-later LGPL2.1	appimage/common/GPL-2.0-or-later.txt
+keyutils	1.6.3-4	GPL-2.0-or-later LGPL-2.1-or-later	appimage/common/GPL-2.0-or-later.txt appimage/common/LGPL-2.1-or-later.txt
+krb5	1.22.2-1	custom	appimage/krb5
+lame	4.0-1	LGPL-2.0-only	libmpv/lame
+lcms2	2.20-1	MIT	libmpv/lcms2
+leancrypto	1.9.1-1	GPL-2.0-or-later LicenseRef-BSDvariant LicenseRef-leancrypto	appimage/leancrypto
+libarchive	3.8.11-1	BSD-2-Clause BSD-4-Clause-UC Apache-2.0 OR CC0-1.0 OR OpenSSL	libmpv/libarchive
+libass	0.17.5-1	BSD	libmpv/libass
+libasyncns	1:0.8+r3+g68cd5af-3	LGPL	appimage/common/LGPL-2.1-or-later.txt
+libavc1394	0.5.4-7	GPL-2.0-or-later AND LGPL-2.1-or-later	appimage/common/GPL-2.0-or-later.txt appimage/common/LGPL-2.1-or-later.txt
+libbluray	1.5.1-1	LGPL-2.1-only	libmpv/libbluray
+libbs2b	3.1.0-11	MIT	libmpv/libbs2b
+libbsd	0.12.2-2	custom	appimage/libbsd
+libcdio	2.4.0-1	GPL-3.0-or-later	GPL-3.0.txt
+libcdio-paranoia	10.2+2.0.2-3	GPL-3.0-or-later	GPL-3.0.txt
+libdatrie	0.2.14-1	LGPL-2.1-or-later	appimage/common/LGPL-2.1-or-later.txt
+libdisplay-info	0.3.0-1	MIT	appimage/libdisplay-info
+libdovi	3.4.0-1	MIT	appimage/libdovi
+libdrm	2.4.134-1	MIT	appimage/libdrm
+libdvdnav	7.0.0-1	GPL-2.0-or-later	libmpv/libdvdnav
+libdvdread	7.1.1-1	GPL-2.0-or-later	libmpv/libdvdread
+libedit	20260512_3.1-1	BSD-3-Clause	appimage/libedit
+libelf	0.197-1	GPL-2.0-or-later OR LGPL-3.0-or-later	appimage/common/GPL-2.0-or-later.txt appimage/common/LGPL-3.0-or-later.txt
+libffi	3.8.0-1	MIT	appimage/libffi
+libgcc	16.2.1+r23+gd564253eb6c8-1	GPL-3.0-or-later WITH GCC-exception-3.1 GFDL-1.3-or-later	appimage/libgcc
+libglvnd	1.7.0-3	custom:BSD-like	appimage/libglvnd
+libgomp	16.2.1+r23+gd564253eb6c8-1	GPL-3.0-or-later WITH GCC-exception-3.1 GFDL-1.3-or-later	appimage/libgomp
+libidn2	2.3.8-1	GPL2 LGPL3	appimage/common/GPL-2.0-or-later.txt appimage/common/LGPL-3.0-or-later.txt
+libiec61883	1.2.0-9	LGPL	appimage/common/LGPL-2.1-or-later.txt
+libjpeg-turbo	3.2.1-1	BSD-3-Clause IJG	libmpv/libjpeg
+libjxl	0.12.0-1	BSD-3-Clause	libmpv/libjxl
+libmd	1.3.0-1	BSD-3-Clause AND BSD-2-Clause AND ISC AND Beerware AND CC-PDM-1.0	appimage/libmd
+libmodplug	0.8.9.0-7	LicenseRef-PublicDomain	libmpv/libmodplug
+libnghttp2	1.70.0-1	MIT	libmpv/nghttp2
+libnghttp3	1.18.0-1	MIT	libmpv/nghttp3
+libngtcp2	1.25.0-1	MIT	libmpv/ngtcp2
+libogg	1.3.6-1	BSD	libmpv/ogg
+libopenmpt	0.8.9-1	BSD-3-Clause	libmpv/libopenmpt
+libp11-kit	0.26.5-1	BSD-3-Clause	appimage/libp11-kit
+libpciaccess	0.19-1	LicenseRef-libpciaccess	appimage/libpciaccess
+libpgm	5.3.128-4	LGPL-2.1-or-later	appimage/common/LGPL-2.1-or-later.txt
+libpipewire	1:1.6.10-1	MIT	appimage/libpipewire
+libplacebo	7.360.1-7	LGPL-2.1-or-later	libmpv/libplacebo
+libpng	1.6.59-1	libpng-2.0	libmpv/libpng
+libpsl	0.21.5-2	MIT	libmpv/libpsl
+libpulse	17.0+r134+g77d25a1e6-1	LGPL-2.1-or-later	appimage/common/LGPL-2.1-or-later.txt
+libraw1394	2.1.2-4	LGPL-2.1-only	appimage/common/LGPL-2.1-only.txt
+librsvg	2:2.63.4-1	LGPL-2.1-or-later	appimage/common/LGPL-2.1-or-later.txt
+libsamplerate	0.2.2-3	BSD	libmpv/libsamplerate
+libseccomp	2.6.0-1	LGPL-2.1-only	appimage/common/LGPL-2.1-only.txt
+libsixel	1.10.5-1	MIT	libmpv/libsixel
+libsndfile	1.2.2-4	LGPL-2.1-or-later	appimage/common/LGPL-2.1-or-later.txt
+libsodium	1.0.22-1	custom:ISC	appimage/libsodium
+libsoxr	0.1.3-5	LGPL-2.1-only LicenseRef-soxr	libmpv/libsoxr
+libssh	0.12.2-1	LGPL-2.1-or-later	libmpv/libssh
+libssh2	1.11.1-7	BSD-3-Clause	appimage/libssh2
+libstdc++	16.2.1+r23+gd564253eb6c8-1	GPL-3.0-or-later WITH GCC-exception-3.1 GFDL-1.3-or-later	appimage/libstdc++
+libtasn1	4.21.0-1	GPL-3.0-or-later LGPL-2.1-or-later GFDL-1.3-or-later	appimage/libtasn1
+libthai	0.1.30-1	LGPL-2.1-or-later	appimage/common/LGPL-2.1-or-later.txt
+libtheora	1.2.0-1	BSD-3-Clause	appimage/libtheora
+libunibreak	7.0-1	custom:zlib/libpng	libmpv/libunibreak
+libunistring	1.4.2-1	GPL-2.0-or-later LGPL-3.0-or-later	appimage/common/GPL-2.0-or-later.txt appimage/common/LGPL-3.0-or-later.txt
+libunwind	1.8.3-1	MIT	appimage/libunwind
+libva	2.24.1-1	MIT	libmpv/libva
+libvdpau	1.5-4	MIT	appimage/libvdpau
+libvorbis	1.3.7-4	BSD-3-Clause	libmpv/vorbis
+libvpl	2.17.0-1	MIT	libmpv/libvpl
+libvpx	1.17.0-1	custom:BSD	libmpv/libvpx
+libwebp	1.6.0-2	BSD-3-Clause	libmpv/libwebp
+libx11	1.8.14-1	MIT AND X11	appimage/libx11
+libxau	1.0.12-1	MIT-open-group	appimage/libxau
+libxcb	1.17.0-1	X11	appimage/libxcb
+libxdmcp	1.1.5-2	MIT-open-group	appimage/libxdmcp
+libxext	1.3.7-1	LicenseRef-libxext	appimage/libxext
+libxfixes	6.0.2-1	MIT HPND-sell-variant	appimage/libxfixes
+libxkbcommon	1.13.2-1	MIT	appimage/libxkbcommon
+libxml2	2.15.4-1	MIT	libmpv/libxml2
+libxpresent	1.0.2-1	MIT	appimage/libxpresent
+libxrandr	1.5.5-1	HPND-sell-variant	appimage/libxrandr
+libxrender	0.9.13-1	HPND-sell-variant	appimage/libxrender
+libxshmfence	1.3.3-1	HPND-sell-variant	appimage/libxshmfence
+libxss	1.2.5-1	X11	appimage/libxss
+libxv	1.0.13-1	SMLNJ HPND-sell-variant	appimage/libxv
+libxxf86vm	1.1.7-1	X11-distribute-modifications-variant	appimage/libxxf86vm
+llvm-libs	23.1.4-1	Apache-2.0 WITH LLVM-exception	LLVM.txt
+lm_sensors	1:3.6.2-1	GPL-2.0-only OR LGPL-2.1-only	appimage/common/GPL-2.0-only.txt appimage/common/LGPL-2.1-only.txt
+luajit	2.1.1793383622+ea9eb7e-1	MIT	libmpv/luajit
+lz4	1:1.10.0-2	GPL-2.0-or-later	appimage/common/GPL-2.0-or-later.txt
+mesa	1:26.2.6-1	MIT AND BSD-3-Clause AND SGI-B-2.0	Mesa.txt
+mpg123	1.33.7-1	LGPL-2.1-only	appimage/common/LGPL-2.1-only.txt
+mpv	1:0.41.0-6	GPL-2.0-or-later AND LGPL-2.1-or-later	mpv-Copyright.txt GPL-3.0.txt
+mujs	1.3.11-1	ISC	libmpv/mujs
+ncurses	6.6-2	MIT-open-group	appimage/ncurses
+nettle	4.0-1	LGPL-3.0-or-later OR GPL-2.0-or-later	appimage/common/LGPL-3.0-or-later.txt appimage/common/GPL-2.0-or-later.txt
+ocl-icd	2.3.5-1	BSD-2-Clause	appimage/ocl-icd
+openal	1.25.2-2	LGPL-2.0-or-later	libmpv/openal-soft
+opencore-amr	0.1.6-2	Apache	appimage/common/Apache-2.0.txt
+openjpeg2	2.5.4-1	BSD-2-Clause MIT	appimage/openjpeg2
+openssl	3.6.5-1	Apache-2.0	libmpv/openssl
+opus	1.6.1-1	BSD-3-Clause	libmpv/opus
+pango	1:1.58.2-1	LGPL-2.0-or-later	appimage/common/LGPL-2.0-or-later.txt
+pcre2	10.49-1	BSD-2-Clause BSD-3-Clause WITH PCRE2-exception	appimage/pcre2
+pixman	0.46.4-1	MIT	appimage/pixman
+rav1e	0.8.1-3	BSD-2-Clause	appimage/rav1e
+rubberband	4.0.0-2	GPL-2.0-or-later	libmpv/rubberband
+sdl2-compat	2.32.74-1	Zlib	libmpv/libsdl2
+shaderc	2026.4-1	Apache-2.0	libmpv/shaderc
+snappy	1.3.1-1	BSD-3-Clause	appimage/snappy
+sndio	1.10.0-1	ISC	appimage/sndio
+speex	1.2.1-3	BSD-3-Clause	libmpv/speex
+spirv-tools	1:1.4.363.0-1	Apache-2.0	libmpv/spirv-tools
+srt	1.5.7-2	MPL-2.0	libmpv/libsrt
+svt-av1	4.2.0-1	BSD-3-Clause LicenseRef-AOMPL-1.0	libmpv/svtav1
+systemd-libs	262.1-1	LGPL-2.1-or-later CC0-1.0 GPL-2.0-or-later WITH Linux-syscall-note	appimage/common/LGPL-2.1-or-later.txt appimage/common/CC0-1.0.txt appimage/common/GPL-2.0-or-later.txt
+uchardet	0.0.8-4	MPL-1.1	libmpv/uchardet
+util-linux-libs	2.42.4-1	BSD-2-Clause BSD-3-Clause BSD-4-Clause-UC GPL-2.0-only GPL-2.0-or-later GPL-3.0-or-later ISC LGPL-2.1-or-later LicenseRef-PublicDomain	appimage/util-linux-libs
+v4l-utils	1.32.0-2	LGPL	appimage/common/LGPL-2.1-or-later.txt
+vid.stab	1.1.2-1	GPL-2.0-or-later	appimage/common/GPL-2.0-or-later.txt
+vmaf	3.2.1-1	BSD-2-Clause-Patent	appimage/vmaf
+vulkan-icd-loader	1.4.363.0-1	Apache-2.0	libmpv/vulkan
+vulkan-intel	1:26.2.6-1	MIT AND BSD-3-Clause AND SGI-B-2.0	Mesa.txt
+vulkan-radeon	1:26.2.6-1	MIT AND BSD-3-Clause AND SGI-B-2.0	Mesa.txt
+wayland	1.26.0-1	MIT	appimage/wayland
+x264	3:0.165.r3222.b35605a-2	GPL-2.0-only	libmpv/x264
+x265	4.3-1	GPL-2.0-or-later	libmpv/x265
+xcb-util-keysyms	0.4.1-5	X11-distribute-modifications-variant	appimage/xcb-util-keysyms
+xvidcore	1.3.7-4	GPL-2.0-only	appimage/common/GPL-2.0-only.txt
+xz	5.8.4-1	GPL-2.0-or-later AND 0BSD AND LicenseRef-Public-Domain AND LGPL-2.1-or-later	libmpv/xz
+zeromq	4.3.5-3	MPL-2.0	appimage/common/MPL-2.0.txt
+zimg	3.0.6-2	WTFPL	libmpv/libzimg
+zlib	1:1.3.2-4	Zlib	libmpv/zlib
+zstd	1.5.7-3	BSD-3-Clause GPL-2.0-only	libmpv/zstd

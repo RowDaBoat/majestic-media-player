@@ -5,10 +5,14 @@
 #   tools/windows.sh run         build, then start it
 #   tools/windows.sh install     build, then install for the current user
 #   tools/windows.sh uninstall   remove the install, its shortcut and file associations
+#   tools/windows.sh stage DIR   copy what ships (exe, DLLs, cpu\, licenses\) into DIR
 # Requires: nim >= 2.2, git, and Visual Studio (or its Build Tools) with the
 # C++ workload; Nim finds it by itself. libmpv comes prebuilt from the pinned
 # release below, unpacked with 7-Zip; so does Mesa's software OpenGL (cpu\),
-# which renders on the CPU when the GPU's memory is full (Options > System).
+# which renders on the CPU when the GPU's memory is full (Options > System),
+# and libopenmpt, which the tracker chart reads modules with (mpv has its own
+# copy built in, which nothing else can call). Their licenses go in licenses\
+# (assets/licenses/README.txt): keep it in step when changing a pinned version.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 source tools/progress.sh
@@ -19,6 +23,11 @@ LIBMPV_DIR=vendor/libmpv
 MESA_URL=https://github.com/pal1000/mesa-dist-win/releases/download/26.2.4/mesa3d-26.2.4-release-msvc.7z
 MESA_DIR=vendor/mesa
 MESA_DLLS=(opengl32.dll libgallium_wgl.dll)
+OPENMPT_URL=https://lib.openmpt.org/files/libopenmpt/dev/libopenmpt-0.8.9+release.dev.windows.vs2022.zip
+OPENMPT_SHA256=a23e375e576e3a6997ffeeb6cf34488e9020e2a5d8226856b02628b6a87c5e8e
+OPENMPT_DIR=vendor/libopenmpt
+# libopenmpt.dll won't load without the others.
+OPENMPT_DLLS=(libopenmpt.dll openmpt-mpg123.dll openmpt-ogg.dll openmpt-vorbis.dll openmpt-zlib.dll)
 APP_DIR="${LOCALAPPDATA:?}/Programs/Majestic Media Player"
 SHORTCUT="${APPDATA:?}/Microsoft/Windows/Start Menu/Programs/Majestic Media Player.lnk"
 
@@ -66,6 +75,31 @@ fetch_mesa() {
   pb_finish "Mesa ready."
 }
 
+fetch_libopenmpt() {
+  if [[ -f $OPENMPT_DIR/libopenmpt.dll && $(cat "$OPENMPT_DIR/.url" 2>/dev/null) == "$OPENMPT_URL" ]]; then
+    return
+  fi
+  rm -rf "$OPENMPT_DIR"
+  mkdir -p "$OPENMPT_DIR/licenses"
+  pb_download "libopenmpt" "$OPENMPT_URL" "$OPENMPT_DIR/libopenmpt.zip"
+  if [[ $(sha256sum "$OPENMPT_DIR/libopenmpt.zip" | cut -d' ' -f1) != "$OPENMPT_SHA256" ]]; then
+    echo "libopenmpt.zip doesn't match its pinned checksum" >&2
+    exit 1
+  fi
+  local sz d
+  sz=$(find_7z)
+  for d in "${OPENMPT_DLLS[@]}"; do
+    (cd "$OPENMPT_DIR" && "$sz" e -y libopenmpt.zip "bin/amd64/$d" >/dev/null)
+    [[ -f $OPENMPT_DIR/$d ]] || { echo "$d missing from the libopenmpt archive" >&2; exit 1; }
+  done
+  # Its license and those of the libraries in the openmpt-*.dll files.
+  (cd "$OPENMPT_DIR/licenses" && "$sz" e -y ../libopenmpt.zip LICENSE.txt "Licenses/*" >/dev/null)
+  [[ -f $OPENMPT_DIR/licenses/License.mpg123.txt ]] || { echo "libopenmpt's licenses missing" >&2; exit 1; }
+  rm "$OPENMPT_DIR/libopenmpt.zip"
+  echo "$OPENMPT_URL" > "$OPENMPT_DIR/.url"
+  pb_finish "libopenmpt ready."
+}
+
 resources() {
   # The icon Explorer shows for the .exe. rc.exe ships with the Windows SDK;
   # without it the program still builds, just with the generic icon.
@@ -82,22 +116,34 @@ resources() {
 build() {
   fetch_libmpv
   fetch_mesa
+  fetch_libopenmpt
   local res=()
   mapfile -t res < <(resources)
   # --app:gui: no console window. MSVC via Nim's vccexe, which locates Visual
   # Studio itself.
   ./tools/build.sh nim c --cc:vcc "${res[@]}" "$@" -o:"$BIN" src/majestic.nim
   cp "$LIBMPV_DIR/libmpv-2.dll" .
+  cp "${OPENMPT_DLLS[@]/#/$OPENMPT_DIR/}" .
   mkdir -p cpu
   cp "${MESA_DLLS[@]/#/$MESA_DIR/}" cpu/
 }
 
+stage() {
+  # What ships, as built: the program, its DLLs and every license that comes with them.
+  local dest=${1:?usage: tools/windows.sh stage DIR}
+  mkdir -p "$dest/cpu" "$dest/licenses/libopenmpt"
+  cp "$BIN" libmpv-2.dll "${OPENMPT_DLLS[@]}" "$dest/"
+  cp cpu/* "$dest/cpu/"
+  cp -r assets/licenses/* "$dest/licenses/"
+  # The AppImage's (tools/appimage.sh).
+  rm -rf "$dest/licenses/appimage"
+  cp LICENSE "$dest/licenses/Majestic-Media-Player.txt"
+  cp "$OPENMPT_DIR"/licenses/* "$dest/licenses/libopenmpt/"
+}
+
 install_app() {
   build -d:release --app:gui
-  mkdir -p "$APP_DIR"
-  cp "$BIN" libmpv-2.dll "$APP_DIR/"
-  mkdir -p "$APP_DIR/cpu"
-  cp cpu/* "$APP_DIR/cpu/"
+  stage "$APP_DIR"
   local exe
   exe=$(cygpath -w "$APP_DIR/$BIN")
   powershell -NoProfile -Command "
@@ -136,5 +182,6 @@ case "${1:-build}" in
   run)       build -d:release --app:gui; ./"$BIN" "${@:2}" ;;
   install)   install_app ;;
   uninstall) uninstall_app ;;
-  *) sed -n '2,7p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+  stage)     stage "${2:-}" ;;
+  *) sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

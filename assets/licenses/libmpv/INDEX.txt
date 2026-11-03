@@ -1,0 +1,447 @@
+Licenses of the libraries inside libmpv-2.dll
+=============================================
+
+libmpv-2.dll is shinchiro/mpv-winbuild-cmake's build of 2026-10-05 (release
+20261005, recipe commit 05a60b3cfd04e3e3b89918f4a27f3dde2935dff2). Built for
+x86-64, it links the 89 packages its recipe's mpv target depends on, listed
+here with the license files each one had when that build ran: the newest
+commit before 2026-10-05 00:00 UTC on the branch the recipe follows, or the
+release it names. Each folder holds that package's files, unchanged.
+
+Notes:
+- x265's 8-bit and 10-bit builds (x265-8+10bit, x265-10bit-lib) are both x265.
+- opus-dnn is Opus's model data (opus_data-8a07d57c...tar.gz), under Opus's license.
+- avisynth-headers and nvcodec-headers are headers only, with their license in
+  them: the license blocks of the headers FFmpeg uses are copied here.
+- libopenmpt here is the copy built into libmpv (0.7.12); the tracker chart's
+  libopenmpt.dll (0.8.9) has its own folder, ../libopenmpt.
+
+amf-headers
+    https://github.com/GPUOpen-LibrariesAndSDKs/AMF.git
+    commit 6277e353fd625121a8f627b1d0540323ef372a49 (2026-09-22)
+    files: LICENSE.txt
+
+angle-headers
+    https://github.com/google/angle.git
+    commit 756d31051f12e93630ae51fd5e0d03deb6958739 (2026-10-02)
+    files: LICENSE
+
+aom
+    https://aomedia.googlesource.com/aom
+    commit ab7db4094b64397873a0e151e223c84f66bf5fe8 (2026-10-02)
+    files: LICENSE
+
+avisynth-headers
+    https://github.com/AviSynth/AviSynthPlus.git
+    commit 3866da1223f03922ef4a2f560462e41354829ba6 (2026-10-02)
+    files: avisynth_c.h-license.txt
+
+brotli
+    https://github.com/google/brotli.git
+    commit 42a2ed4355bc6287da6bb6319f090b499cba4550 (2026-09-30)
+    files: LICENSE
+
+bzip2
+    https://gitlab.com/bzip2/bzip2.git
+    commit 66c46b8c9436613fd81bc5d03f63a61933a4dcc3 (2023-05-31)
+    files: COPYING
+
+c-ares
+    https://github.com/c-ares/c-ares.git
+    commit f4156c12c8b36f5cb8f8a53658d44b24263c6ad1 (2026-10-01)
+    files: LICENSE.md, LICENSES_APSL-2.0.txt, LICENSES_Autoconf-exception-3.0.txt, LICENSES_BSD-3-Clause.txt, LICENSES_FSFAP.txt, LICENSES_GPL-3.0-or-later.txt, LICENSES_LGPL-2.1-or-later.txt, LICENSES_MIT.txt, LICENSES_Unicode-3.0.txt
+
+curl
+    https://github.com/curl/curl.git
+    commit 6d013631195b1c349e5f783ac8b58ad376c0bdde (2026-10-05)
+    files: COPYING, LICENSES_BSD-4-Clause-UC.txt, LICENSES_ISC.txt, LICENSES_curl.txt
+
+dav1d
+    https://code.videolan.org/videolan/dav1d.git
+    commit 99f3354ed0b9b4bf3c7c9347318dbcc522c94af5 (2026-10-01)
+    files: COPYING
+
+davs2
+    https://github.com/saindriches/davs2.git
+    commit f50435051b72c168c2b566c544e27fcff71ba61a (2023-09-28)
+    files: COPYING
+
+fast_float
+    https://github.com/fastfloat/fast_float.git
+    commit f3f02c8ad0afd8181166dabce6a9e69f8aec24de (2026-10-04)
+    files: LICENSE-APACHE, LICENSE-BOOST, LICENSE-MIT
+
+ffmpeg
+    https://github.com/FFmpeg/FFmpeg.git
+    commit a35c8799920a93b99781eab6e70a5795ee7d182b (2026-10-04)
+    files: COPYING.GPLv2, COPYING.GPLv3, COPYING.LGPLv2.1, COPYING.LGPLv3, LICENSE.md
+
+fontconfig
+    https://gitlab.freedesktop.org/fontconfig/fontconfig.git
+    commit 6fb6183d6cb726cb769817eb2f67e970039ca0d8 (2026-10-02)
+    files: COPYING
+
+freetype2
+    https://github.com/freetype/freetype.git
+    commit 25167984d2435930f9178e8d9d2ca3bdfa71a4e7 (2026-10-04)
+    files: LICENSE.TXT
+
+fribidi
+    https://github.com/fribidi/fribidi.git
+    commit 24f15eee832eafa5d63319b666d50e488668ce31 (2026-09-24)
+    files: COPYING
+
+glad
+    https://github.com/Dav1dde/glad.git
+    commit 0a7cf1af9e25e02821587bd4095807fc90b6426a (2026-09-28)
+    files: LICENSE
+
+glslang
+    https://github.com/KhronosGroup/glslang.git
+    commit c8095022ee39c7482071bc3177f93f4bca42a6d9 (2026-09-30)
+    files: LICENSE.txt, LICENSES_AML-glslang.txt, LICENSES_Apache-2.0.txt, LICENSES_BSD-2-Clause.txt, LICENSES_BSD-3-Clause.txt, LICENSES_Bison-exception-2.2.txt, LICENSES_GPL-3.0-or-later.txt, LICENSES_MIT-Khronos-old.txt, LICENSES_MIT.txt
+
+graphengine
+    https://github.com/sekrit-twc/graphengine.git
+    commit 91c6af4c795c5396d8b974f24b4d2e2ecca04e2d (2026-08-01)
+    files: COPYING
+
+harfbuzz
+    https://github.com/harfbuzz/harfbuzz.git
+    commit 12ee77ee00514c442bcd28f9aa9d56b708c37382 (2026-10-04)
+    files: COPYING
+
+highway
+    https://github.com/google/highway.git
+    commit 989aec45b21ccf717a8f9799ff83572efef26439 (2026-10-03)
+    files: LICENSE
+
+lame
+    https://gitlab.com/shinchiro/lame.git
+    commit 9a5b35c430a2e6d150d65a96c7d7acdd64962a8f (2022-09-28)
+    files: COPYING, LICENSE
+
+lcms2
+    https://github.com/mm2/Little-CMS.git
+    commit 9f9b52021eff2a9e59cfb3c83baa20c66ceec836 (2026-10-02)
+    files: LICENSE
+
+libarchive
+    https://github.com/libarchive/libarchive.git
+    commit c71118aa177a1a6a7a7ead35131e1659d8f807ff (2026-10-04)
+    files: COPYING
+
+libaribcaption
+    https://github.com/xqq/libaribcaption.git
+    commit c64c23b8905ba514b87c9789269e9f66f949ffe0 (2026-07-25)
+    files: LICENSE
+
+libass
+    https://github.com/libass/libass.git
+    commit f61db567e6593df3470e91594bcd4ad2d0473aff (2026-09-17)
+    files: COPYING
+
+libbluray
+    https://code.videolan.org/videolan/libbluray.git
+    commit a24f4fad4d62893de647abc8671397747b2359dd (2026-08-31)
+    files: COPYING
+
+libbs2b
+    https://github.com/alexmarsev/libbs2b.git
+    commit 5ca2d59888df047f1e4b028e3a2fd5be8b5a7277 (2014-10-17)
+    files: COPYING
+
+libdvdcss
+    https://code.videolan.org/videolan/libdvdcss.git
+    commit 811ce97a1d4d1c9d936f4b2707f533a9ef768251 (2026-07-28)
+    files: COPYING
+
+libdvdnav
+    https://code.videolan.org/videolan/libdvdnav.git
+    commit 8147ccd35e5aae4afdd21171cf7b6b4d8f179d28 (2026-08-21)
+    files: COPYING
+
+libdvdread
+    https://code.videolan.org/videolan/libdvdread.git
+    commit 0f30df53125b564ef45903714403ce0a1e6c5e9e (2026-08-21)
+    files: COPYING
+
+libiconv
+    https://ftp.gnu.org/pub/gnu/libiconv/libiconv-1.18.tar.gz
+    commit (release (tarball))
+    files: COPYING, COPYING.LIB
+
+libjpeg
+    https://github.com/libjpeg-turbo/libjpeg-turbo.git
+    commit da20b14ff0db8785a0cabb2b8a71b5dc033d4006 (2026-10-04)
+    files: LICENSE.md
+
+libjxl
+    https://github.com/libjxl/libjxl.git
+    commit 8ec4d2e8e3a4012481ec48a44873d14abc2b17f8 (2026-10-04)
+    files: LICENSE
+
+libmodplug
+    https://github.com/Konstanty/libmodplug.git
+    commit 1f0c3f3d540daea4b53043ce310b4806f59d0cea (2026-08-31)
+    files: COPYING
+
+libmysofa
+    https://github.com/hoene/libmysofa.git
+    commit 648eed03472e6720a1ea45d1a1f86c4efb569ff9 (2026-09-08)
+    files: LICENSE
+
+libopenmpt
+    https://lib.openmpt.org/files/libopenmpt/src/libopenmpt-0.7.12+release.autotools.tar.gz
+    commit (release (tarball))
+    files: LICENSE
+
+libplacebo
+    https://github.com/haasn/libplacebo.git
+    commit 92b5ac6db79f4d680eb656692f7bf51e9606f42a (2026-10-01)
+    files: LICENSE
+
+libpng
+    https://github.com/glennrp/libpng.git
+    commit f6ae8535a31544706ccb93b7027cd56c1e1b93b9 (2026-10-02)
+    files: LICENSE.md, LICENSES_MIT-0.txt, LICENSES_MIT.txt
+
+libpsl
+    https://github.com/rockdaboot/libpsl.git
+    commit a629c831d09011f76974d931be7f6167be90673e (2026-09-14)
+    files: COPYING, LICENSE
+
+libsamplerate
+    https://github.com/libsndfile/libsamplerate.git
+    commit 0844c208f683527c08ea8a80acc13b398aa9c8bf (2026-08-13)
+    files: COPYING
+
+libsdl2
+    https://github.com/libsdl-org/SDL.git
+    commit 4c2d9014afda49553c76f7045529207bb593f9b5 (2026-10-02)
+    files: LICENSE.txt
+
+libsixel
+    https://github.com/saitoha/libsixel.git
+    commit a0151d940af8bb0733dac77248bd55ae86949e56 (2026-06-16)
+    files: LICENSE, LICENSE.images, LICENSE.mesa, LICENSE.pngsuite, LICENSE.pnmcolormap, LICENSE.sdump, LICENSE.sixel, LICENSE.stb
+
+libsoxr
+    https://gitlab.com/shinchiro/soxr.git
+    commit 945b592b70470e29f917f4de89b4281fbbd540c0 (2018-02-24)
+    files: COPYING.LGPL, LICENCE
+
+libsrt
+    https://github.com/Haivision/srt.git
+    commit b1551573c74b529b8fdc4d93f1eee4c947017bf9 (2026-10-02)
+    files: LICENSE
+
+libssh
+    https://gitlab.com/libssh/libssh-mirror.git
+    commit ee5627aaf630fc0c304b12757e6654773f4c1033 (2026-09-29)
+    files: COPYING
+
+libudfread
+    https://code.videolan.org/videolan/libudfread.git
+    commit b0bc6957e7e07d5f35391f210596d9eb71cffdd9 (2026-08-30)
+    files: COPYING
+
+libunibreak
+    https://github.com/adah1972/libunibreak.git
+    commit 28a2756b864c343f438cd22537d49d394d4666a5 (2026-09-15)
+    files: LICENCE
+
+libva
+    https://github.com/intel/libva.git
+    commit f3fefceb192ca28abf588aadf2392350aebf46ce (2026-09-23)
+    files: COPYING
+
+libvpl
+    https://github.com/intel/libvpl.git
+    commit 674d015bcb294bc39fa276e99a652ea045423e82 (2026-07-13)
+    files: LICENSE
+
+libvpx
+    https://chromium.googlesource.com/webm/libvpx.git
+    commit 0a6f769e44989222d99ded46daa1e9763637cc19 (2026-09-30)
+    files: LICENSE
+
+libwebp
+    https://chromium.googlesource.com/webm/libwebp.git
+    commit b4d85eea95fcd080d5669aed26cfebfb9c086d03 (2026-10-02)
+    files: COPYING
+
+libxml2
+    https://github.com/GNOME/libxml2.git
+    commit 698b4186a077af318f611190ec678136dc110490 (2026-09-27)
+    files: Copyright
+
+libzimg
+    https://github.com/sekrit-twc/zimg.git
+    commit 67e0603271c080e22c8429856dd4a8a56587e61e (2026-09-03)
+    files: COPYING
+
+libzvbi
+    https://github.com/zapping-vbi/zvbi.git
+    commit d3a5ee9f2b047bf16cd1ee5ccf6ec05ee75409d0 (2026-08-12)
+    files: COPYING.md
+
+luajit
+    https://github.com/openresty/luajit2.git
+    commit f75bf45e8b869a8ee4562ab0183322c3ebf2d9f3 (2026-09-17)
+    files: COPYRIGHT
+
+lzo
+    https://www.oberhumer.com/opensource/lzo/download/lzo-2.10.tar.gz
+    commit (release (tarball))
+    files: COPYING
+
+mpv
+    https://github.com/mpv-player/mpv.git
+    commit c1529642089bfebfc928a1c1664638a7a5d219ba (2026-10-04)
+    files: Copyright, LICENSE.GPL, LICENSE.LGPL
+
+mujs
+    https://codeberg.org/ccxvii/mujs.git
+    commit 8a32c397b28fe45747ac4e9e4f3dca049825eda7 (2026-08-19)
+    files: COPYING
+
+nghttp2
+    https://github.com/nghttp2/nghttp2.git
+    commit 7a6d122aac527b65434314c2a115f07281e08dbf (2026-10-03)
+    files: COPYING, LICENSE
+
+nghttp3
+    https://github.com/ngtcp2/nghttp3.git
+    commit 2304973e5a0c8b1fa4bb380b47945a000357f87f (2026-09-17)
+    files: COPYING
+
+ngtcp2
+    https://github.com/ngtcp2/ngtcp2.git
+    commit b9fc4d55ce6035a4cc76dc456ced6371e98f9214 (2026-10-04)
+    files: COPYING
+
+nvcodec-headers
+    https://github.com/FFmpeg/nv-codec-headers.git
+    commit eddcea9e27f6b772057c9b3f87de2cc1737faffc (2026-07-15)
+    files: dynlink_cuda.h-license.txt
+
+ogg
+    https://github.com/xiph/ogg.git
+    commit 06a5e0262cdc28aa4ae6797627a783b5010440f0 (2026-03-02)
+    files: COPYING
+
+openal-soft
+    https://github.com/kcat/openal-soft.git
+    commit 3a2753eedf56421b3d2b904378d70aefffa86d11 (2026-10-04)
+    files: COPYING, LICENSE-pffft, LICENSE.Apache-2.0.txt, LICENSE.BSD-3-Clause.txt
+
+openssl
+    https://github.com/openssl/openssl.git
+    commit 4d25710dbfeacbb36d055592a3bc6811172248b1 (2026-10-02)
+    files: LICENSE.txt
+
+opus
+    https://github.com/xiph/opus.git
+    commit 503d81b138d76621aae4b12786e90de48aa8db3a (2026-09-11)
+    files: COPYING, LICENSE_PLEASE_READ.txt
+
+rubberband
+    https://github.com/breakfastquay/rubberband.git
+    commit e4296ac80b1170018a110bc326fd0d45a0eb27d6 (2025-02-27)
+    files: COPYING
+
+shaderc
+    https://github.com/google/shaderc.git
+    commit ba3e587dbc13d423c713e964ac08e094731a034d (2026-10-01)
+    files: LICENSE
+
+speex
+    https://github.com/xiph/speex.git
+    commit a1b872e6704cc5825750098ce0e0c0b4aacaef4d (2026-06-18)
+    files: COPYING
+
+spirv-cross
+    https://github.com/KhronosGroup/SPIRV-Cross.git
+    commit 38abe362c57311a77808b7ec4d1d0d9ceb8d9370 (2026-09-26)
+    files: LICENSE, LICENSES_Apache-2.0.txt, LICENSES_CC-BY-4.0.txt, LICENSES_LicenseRef-KhronosFreeUse.txt, LICENSES_MIT.txt
+
+spirv-headers
+    https://github.com/KhronosGroup/SPIRV-Headers.git
+    commit 86f980c731e62ae4eaf383d320449d71687936bf (2026-10-02)
+    files: LICENSE, LICENSES_CC-BY-4.0.txt, LICENSES_MIT.txt
+
+spirv-tools
+    https://github.com/KhronosGroup/SPIRV-Tools.git
+    commit 1ba1f5b8fe921e46091d18370f91fb46450ff786 (2026-10-02)
+    files: LICENSE
+
+subrandr
+    https://github.com/afishhh/subrandr.git
+    commit eaf47d947e754565fe60e88ffe9665a2a32b18d5 (2026-09-27)
+    files: LICENSE
+
+svtav1
+    https://gitlab.com/AOMediaCodec/SVT-AV1.git
+    commit 1394731134e0ca891e11db3cd98144d1aa9a7b72 (2026-10-02)
+    files: LICENSE-BSD2.md, LICENSE.md
+
+uavs3d
+    https://github.com/uavs3/uavs3d.git
+    commit 0e20d2c291853f196c68922a264bcd8471d75b68 (2025-12-13)
+    files: COPYING
+
+uchardet
+    https://gitlab.freedesktop.org/uchardet/uchardet.git
+    commit 06029ec3340cdf6bf9a6a537dafb3f39eda0560e (2025-08-08)
+    files: COPYING
+
+vapoursynth
+    https://github.com/vapoursynth/vapoursynth.git
+    commit dd11a9da6f8e2bb24ab4bb084d44bf01fb93612a (2026-10-04)
+    files: COPYING.LESSER
+
+vorbis
+    https://github.com/xiph/vorbis.git
+    commit 1b75110b5a2754ba1931d82dd83cb822b266a21d (2026-08-03)
+    files: COPYING
+
+vulkan
+    https://github.com/KhronosGroup/Vulkan-Loader.git
+    commit b82e310e99c20bfac8dd3123c9e939f81ce54b89 (2026-10-02)
+    files: LICENSE.txt, LICENSES_Apache-2.0.txt, LICENSES_CC-BY-4.0.txt, LICENSES_HPND-Kevlin-Henney.txt, LICENSES_MIT-Khronos-old.txt, LICENSES_MIT.txt
+
+vulkan-header
+    https://github.com/KhronosGroup/Vulkan-Headers.git
+    commit c46850864f4661461b0f6cb9922c058ffea4915e (2026-10-02)
+    files: LICENSE.md, LICENSES_Apache-2.0.txt, LICENSES_MIT.txt
+
+x264
+    https://code.videolan.org/videolan/x264.git
+    commit 0480cb05fa188d37ae87e8f4fd8f1aea3711f7ee (2025-09-10)
+    files: COPYING
+
+x265
+    https://github.com/Multicorewareinc/x265.git
+    commit ea8b761899ecf91cbd4f8b83e85d8444b1b94c80 (2026-09-30)
+    files: COPYING
+
+xxhash
+    https://github.com/Cyan4973/xxHash.git
+    commit 680bf463fa1ca0461b9a7c2dab7556e1f54cf4cf (2026-09-19)
+    files: LICENSE
+
+xz
+    https://github.com/tukaani-project/xz.git
+    commit 6d4309bd5fd8973109954a74e0eb87e14060e6b7 (2026-10-03)
+    files: COPYING, COPYING.0BSD, COPYING.GPLv2, COPYING.GPLv3, COPYING.LGPLv2.1
+
+zlib
+    https://github.com/zlib-ng/zlib-ng.git
+    commit 72aceeac37bdd0704df14aac1823b4f80f4a5cf3 (2026-10-04)
+    files: LICENSE.md
+
+zstd
+    https://github.com/facebook/zstd.git
+    commit 4267b2b7ab4b787fcb8ef3a3308526b67726d2fd (2026-10-01)
+    files: COPYING, LICENSE

@@ -2,9 +2,13 @@
 /majestic-media-player
 /majestic-media-player.exe
 /libmpv-2.dll
+/libopenmpt.dll
+/openmpt-*.dll
 *.pdb
 *.ilk
 /cpu/
 /tmp
 draft.txt
 ideas.txt
+/*.AppImage
+/.vscode

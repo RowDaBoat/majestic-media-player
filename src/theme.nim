@@ -54,3 +54,10 @@ const
   FontMain* = "Default"
   FontSmall* = "Small"
   FontTitle* = "Title"
+  MonoSizes* = [8, 9, 10, 11, 13, 15, 17, 20, 24, 28]  ## the tracker chart's zoom steps
+  FontMono* = "Mono13"          ## the tracker chart's cells
+  FontMonoSmall* = "Mono11"
+
+proc monoFont*(i: int): string =
+  ## The mono font at zoom step i (of MonoSizes).
+  "Mono" & $MonoSizes[clamp(i, 0, MonoSizes.high)]

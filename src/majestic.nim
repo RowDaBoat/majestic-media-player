@@ -4,10 +4,10 @@ import gpumem  # first: it picks the GL library before anything loads one
 import std/[os, strutils, strformat, times, math, osproc, unicode, sequtils, algorithm,
   random, tables, sets, streams, json]
 import silky, vmath, bumpy, chroma, pixie, opengl, jsony
-import mpv, videogl, xwin, config, dialogs, theme, ui, menutree, player, icons, debugscript,
+import appimage, mpv, videogl, xwin, config, dialogs, theme, ui, menutree, player, icons, debugscript,
   options, instance, playlists, peers, cmdlines, runlog, mediainfo, inhibit, spherical, keymap, mediactl,
   rectedit, syncdlg, ytdlp, websave, mediasave, mkvtoolnix, updater, ytthumb, ytboard, srv3,
-  netprobe
+  netprobe, tracker, trackerchart, modstream
 from std/uri import encodeUrl, decodeUrl, parseUri, decodeQuery, UriParseError
 
 const
@@ -16,6 +16,11 @@ const
   # Bytes, not a string: MSVC refuses a C string literal past 64 KB.
   FontData = block:
     const s = staticRead("../assets/fonts/IBMPlexSans-Regular.ttf")
+    var bytes: array[s.len, byte]
+    for i, c in s: bytes[i] = byte(c)
+    bytes
+  MonoFontData = block:
+    const s = staticRead("../assets/fonts/IBMPlexMono-Regular.ttf")
     var bytes: array[s.len, byte]
     for i, c in s: bytes[i] = byte(c)
     bytes
@@ -295,6 +300,17 @@ type
     thumb: ThumbJob           ## the YouTube link's thumbnail, for while no video track shows
     thumbTex: GLuint          ## it, uploaded
     thumbTexId: string        ## the video id thumbTex holds
+    chart: TrackerChart       ## the tracker module's chart, in the video frame
+    chartDrawn: float         ## when it was last drawn, to pace its scrolling
+    moduleFor: string         ## the path isModule was checked for
+    moduleIs: bool
+    tkOpen: bool              ## the tracker button's panel is shown
+    tkButton: Rect            ## the tracker button, where the panel opens from
+    tkPanel: Rect             ## the panel, as last drawn
+    tkTried: string           ## the module last switched to a stream (or failed to)
+    tkWas: bool               ## a module stream played: opened anew, it's tried again
+    tkFactor: float           ## the pitch factor the module streams have
+    tkCorrection: bool        ## audio-pitch-correction as set (true: mpv's default)
     board: BoardJob           ## the YouTube link's seek bar previews, fetched in the background
     upMode: UpdateMode
     upMsg: string             ## the Check for Updates window's text when it failed
@@ -475,6 +491,9 @@ type
     rotRefSet: bool
     rotPressPos: Vec2         ## window pixels where the press began
     panDrag: bool             ## Ctrl+Left drag is panning the zoomed frame
+    chartPanDrag: bool        ## Ctrl+Left drag is panning the tracker chart
+    chartPanLast: Vec2        ## the pointer when it last moved it (UI units)
+    chartZoomNotches: float32 ## Ctrl+Wheel notches on the chart not yet a zoom step
     panFrom: Vec2             ## window pixels where the pan drag began
     panStart: Vec2            ## pan when the drag began
     # 360° video camera, degrees
@@ -551,6 +570,101 @@ proc setlocale(category: cint, locale: cstring): cstring {.importc, header: "<lo
 var LC_NUMERIC {.importc, header: "<locale.h>".}: cint
 
 proc now(): float = epochTime()
+
+proc moduleStreamed(a: App): bool =
+  ## The open module plays through modstream, not FFmpeg.
+  a.player.source.startsWith("mmpmod://")
+
+proc isModule(a: App): bool =
+  ## A tracker module (MOD, XM, IT...) is open, read by libopenmpt.
+  let p = a.player
+  if not p.loaded or p.path.contains("://"): return false
+  if a.moduleStreamed: return true
+  if a.moduleFor != p.path:
+    let f = p.h.getStr("file-format")
+    if f.len == 0: return false  # not known yet
+    a.moduleFor = p.path
+    a.moduleIs = f == "libopenmpt"
+  a.moduleIs
+
+proc trackerCustom(a: App): bool =
+  ## The tracker button's settings differ from playing the module as it is.
+  a.cfg.trackerPitch != 0 or not a.cfg.trackerStretch
+
+proc trackerFactor(a: App): float =
+  ## libopenmpt's pitch factor: the pitch shift, and with samples not
+  ## stretched, the inverse of the speed, which mpv then resamples by (no
+  ## pitch correction): samples sound as written while the tempo follows.
+  result = pow(2.0, a.cfg.trackerPitch / 12)
+  if not a.cfg.trackerStretch and a.player.speed > 0: result /= a.player.speed
+
+proc syncTrackerAudio(a: App) =
+  ## The open module's sound as the tracker button has it. FFmpeg plays a
+  ## module until a setting differs; then it's opened again as a module
+  ## stream where it is, and stays one.
+  let p = a.player
+  let streamed = a.moduleStreamed
+  if streamed: a.tkWas = true
+  elif a.tkWas: (a.tkWas, a.tkTried) = (false, "")
+  let correction = not (streamed and not a.cfg.trackerStretch)
+  if correction != a.tkCorrection:
+    a.tkCorrection = correction
+    p.h.setProp("audio-pitch-correction", correction)
+  if not streamed and a.trackerCustom and a.isModule and p.duration > 0 and
+     a.tkTried != p.path:
+    a.tkTried = p.path
+    let url = modstream.prepare(p.path)
+    if url.len > 0:
+      a.tkFactor = a.trackerFactor
+      setPitchFactor(a.tkFactor)
+      p.source = url
+      p.reopen(p.threadless)
+    return
+  if not streamed: return
+  let f = a.trackerFactor
+  if f == a.tkFactor: return
+  setPitchFactor(f)
+  # mpv has read ahead with the old factor: what's buffered goes for a fresh
+  # read from where it plays, unless the change is a synchronized slave's
+  # small nudge.
+  let big = abs(f / a.tkFactor - 1) > 0.02
+  a.tkFactor = f
+  if big and p.loaded and not p.stopped: p.seek(p.timePos)
+
+proc setTrackerPanel(a: App, open: bool) =
+  ## Shows or hides the tracker button's panel; hidden, its field lets go.
+  a.tkOpen = open
+  if not open:
+    a.tkPanel = Rect()
+    if a.ui.focusId.startsWith("tk-"): a.ui.focusId = ""
+  a.dirtyUntil = max(a.dirtyUntil, now() + 0.1)
+
+proc chartShown(a: App): bool =
+  a.cfg.showTrackerChart and a.chart != nil and a.chart.song != nil and
+    a.chart.song.path == a.player.path and a.player.loaded and not a.player.stopped and
+    not a.player.hasVideo and a.chart.song.marks.len > 0
+
+proc pollTracker(a: App) =
+  ## Opens the module's chart, builds it a slice at a time, and paces the
+  ## redraws that scroll it while it plays.
+  let p = a.player
+  let module = a.isModule
+  a.syncTrackerAudio()
+  if a.chart == nil: a.chart = TrackerChart()
+  let c = a.chart
+  if c.song != nil and (c.song.path != p.path or not p.loaded):
+    c.close()
+  if c.tried != p.path: c.tried = ""  # another file: this one may be opened again later
+  if not module or not a.cfg.showTrackerChart or p.stopped: return
+  if c.song == nil and c.tried != p.path:
+    c.tried = p.path
+    c.song = openTracker(p.path)
+    a.dirtyUntil = max(a.dirtyUntil, now() + 0.1)
+  if c.song == nil: return
+  if c.song.build(0.004): a.dirtyUntil = max(a.dirtyUntil, now() + 0.02)
+  let t = now()
+  if p.playing and t - a.chartDrawn >= 1 / 144:
+    a.dirtyUntil = max(a.dirtyUntil, t + 0.001)
 
 # --- small helpers ----------------------------------------------------------
 
@@ -647,6 +761,11 @@ proc buildAtlas(scale: float32): (Image, SilkyAtlas) =
   b.addFont(fontPath, FontMain, 15 * scale, glyphs)
   b.addFont(fontPath, FontSmall, 13 * scale, glyphs)
   b.addFont(fontPath, FontTitle, 20 * scale, glyphs)
+  let monoPath = getTempDir() / "majestic-media-player-mono.ttf"
+  if not fileExists(monoPath) or getFileSize(monoPath) != MonoFontData.len:
+    writeFile(monoPath, MonoFontData)
+  for i, size in MonoSizes:
+    b.addFont(monoPath, monoFont(i), size.float32 * scale, AsciiGlyphs)
   b.addIcons(scale)
   discard b.addImage("crown96", renderIcon(crownPath, 24, px(96)))
   discard b.addImage("music96", renderIcon(musicPath, 24, px(96)))
@@ -3779,7 +3898,7 @@ proc ask(a: App, kind: DialogKind, purpose, title: string, start = "",
 
 proc openFileDialog(a: App) =
   a.ask(dkOpenFiles, "open", "Open File", exts = @MediaExtensions,
-    filterName = "Media files")
+    filterName = "Media files", extraFilters = @[("Tracker modules", @TrackerExtensions)])
 
 proc screenshot(a: App) =
   if not a.player.loaded: return
@@ -4670,6 +4789,7 @@ proc ytStatus(a: App): string =
   of ytInstall:
     result = "Installing yt-dlp"
     if j.progress >= 0: result.add &" {int(j.progress)}%"
+    if j.bytes > 0 and j.speed > 0: result.add " · " & fmtBytes(j.speed) & "/s"
   of ytCaptions, ytSubs, ytPlaylist, ytInfo, ytDownload: discard  # their own slots, quietly
 
 proc ytCurrentLink(a: App): string =
@@ -5657,11 +5777,17 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
   let fullScreen = view.children[^1]
 
   let grab = view.sub("Pan, Rotate && Zoom".replace("&&", "&"))
+  # On the tracker chart they pan and zoom it instead of the (absent) video.
   grab.item("Center", k(kaCenter), action = proc () =
+    if a.chartShown:
+      a.chart.pan = vec2(0, 0); a.osd("Pan: center"); return
     a.xf.pan = vec2(0, 0); a.xfChanged("Pan: center"))
   for (label, key, d) in [("Move Up", kaMoveUp, vec2(0, -1)), ("Move Down", kaMoveDown, vec2(0, 1)),
                           ("Move Left", kaMoveLeft, vec2(-1, 0)), ("Move Right", kaMoveRight, vec2(1, 0))]:
     grab.item(label, k(key), action = bindAct(proc (dir: Vec2) =
+      if a.chartShown:
+        a.chart.pan += dir * a.cfg.panStep.float32
+        a.osd("Pan"); return
       a.xf.pan += dir * a.cfg.panStep.float32
       a.xfChanged(&"Pan: {int(a.xf.pan.x)}, {int(a.xf.pan.y)}"), d))
   grab.sep()
@@ -5675,6 +5801,8 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
     a.xfChanged(&"Rotation: {a.xf.rotation:g}°"))
   grab.sep()
   grab.item("Restore Size", k(kaRestoreSize), action = proc () =
+    if a.chartShown:
+      a.chart.resetView(); a.osd("Zoom: fit"); return
     a.xf.zoom = 1; a.xf.scaleX = 1; a.xf.scaleY = 1; a.xfChanged("Size: 100%"))
   let step = a.cfg.sizeStep.float32 / 100
   for (label, key, which, d) in [
@@ -5683,6 +5811,10 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
       ("Increase Height", kaHeightUp, 2, 1'f32), ("Decrease Height", kaHeightDown, 2, -1'f32)]:
     grab.item(label, k(key), action = bindAct(proc (wd: (int, float32)) =
       let (w, dd) = wd
+      if a.chartShown and w == 0:
+        let msg = a.chart.zoomBy(int(dd))
+        if msg.len > 0: a.osd(msg)
+        return
       case w
       of 0:
         a.xf.zoom = max(0.05, a.xf.zoom + dd * step)
@@ -5695,6 +5827,8 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
         a.xfChanged(&"Height: {int(round(a.xf.scaleY * 100))}%"), (which, d)))
   grab.sep()
   grab.item("Reset", k(kaPanReset), action = proc () =
+    if a.chartShown:
+      a.chart.resetView(); a.osd("Reset"); return
     a.xf = VideoTransform(); a.xfChanged("Reset"))
 
   let frame = view.sub("Video Frame")
@@ -5874,9 +6008,18 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
 
   # Right-click menu, built from the bar's nodes.
   let ctx = newMenuRoot()
+  # A tracker module has no cover: its chart instead (with libopenmpt).
+  let module = a.isModule
+  if module and a.chart != nil and (a.chart.song != nil or a.chart.tried != p.path or
+                                    not a.cfg.showTrackerChart):
+    ctx.check("Show Tracker Chart", checked = a.cfg.showTrackerChart, action = proc () =
+      a.cfg.showTrackerChart = not a.cfg.showTrackerChart
+      a.cfg.save()
+      a.dirtyUntil = max(a.dirtyUntil, now() + 0.1))
+    ctx.sep()
   # Only for audio files: not links (YouTube's have a thumbnail item of their
   # own) nor videos, even with their video track turned off.
-  if loaded and not a.player.path.contains("://") and
+  elif loaded and not a.player.path.contains("://") and
      not p.tracks.anyIt(it.kind == "video" and not it.albumArt):
     ctx.check("Show Front Cover", checked = a.cfg.showCover, action = proc () =
       a.cfg.showCover = not a.cfg.showCover
@@ -6087,7 +6230,8 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
     else:
       pl.item("Add Media File...", enabled = edit, action = proc () =
         a.ask(dkOpenFiles, "pladd", "Add Media File", exts = @MediaExtensions,
-          filterName = "Media files"))
+          filterName = "Media files",
+          extraFilters = @[("Tracker modules", @TrackerExtensions)]))
     pl.item("Remove Media File", k(kaRemoveFromPlaylist), enabled = hasSel and edit, action = proc () =
       a.removeSelected())
     pl.item("Duplicate", "Ctrl+D", enabled = hasSel and edit, action = proc () =
@@ -6501,6 +6645,10 @@ proc handleKeys(a: App) =
   let pressed = w.buttonPressed
   if a.rectKeys(): return
 
+  # The tracker panel's field takes the keys while it's being typed in.
+  if a.tkOpen and a.ui.focusId.startsWith("tk-"):
+    if pressed[KeyEscape]: a.setTrackerPanel(false)
+    return
   if pressed[KeyEscape]:
     # A text field being edited takes Escape itself.
     if a.overlay == ovOptions: a.closeOptions(false)
@@ -6508,6 +6656,7 @@ proc handleKeys(a: App) =
     elif a.overlay in {ovCommands, ovSync, ovYtdlp, ovEmbed, ovUpdate}: discard  # their windows handle Escape
     elif a.overlay != ovNone: a.overlay = ovNone
     elif a.menus.isOpen: a.menus.close()
+    elif a.tkOpen: a.setTrackerPanel(false)
     elif a.fullscreen: a.setFullscreen(false)
     return
   if a.overlay == ovProperties:
@@ -7394,13 +7543,19 @@ proc controlsVolumeW(a: App): float32 =
   let pct = &"{int(round(a.player.volume))}%"
   a.ui.textSize(pct, FontSmall).x + 6 + CtlButtonW + 6 + CtlVolumeW + 16
 
+proc trackerButton(a: App): bool =
+  ## A tracker module plays, and libopenmpt is here to play it with settings.
+  a.isModule and modstream.available()
+
 proc controlsTier(a: App, w: float32): int =
   ## How much a controls bar w wide drops as the window narrows: 0 keeps
-  ## everything, 1 hides the status bar's key hints, 2 the Repeat and
-  ## Equalizer buttons (and a link's quality one), 3 the rate buttons, 4
-  ## previous/next.
+  ## everything, 1 hides the status bar's key hints, 2 the Repeat,
+  ## Equalizer and Tracker buttons (and a link's quality one), 3 the rate
+  ## buttons, 4 previous/next.
   let quality = if a.player.path.isWebLink: CtlStep else: 0
-  let need = [6 + 3 * CtlStep, CtlSepW + 2 * CtlStep, 2 * CtlStep, CtlSepW + 2 * CtlStep + quality]
+  let tracker = if a.trackerButton: CtlSepW + CtlStep else: 0
+  let need = [6 + 3 * CtlStep, CtlSepW + 2 * CtlStep, 2 * CtlStep,
+              CtlSepW + 2 * CtlStep + quality + tracker]
   var full = a.controlsVolumeW + 10
   for n in need: full += n
   if w >= full + CtlHintsMargin: return 0
@@ -7468,6 +7623,14 @@ proc controls(a: App, r: Rect) =
       btn("quality", "gear", "Quality", p.loaded, shown):
         a.ctxMenu = cmQuality
         a.menus.openContext(gearR.xy, sticky = true, keep = gearR, above = true)
+    # A module's pitch and how its samples follow the speed (trackerPanel).
+    if a.trackerButton:
+      divider()
+      a.tkButton = rect(x, y, bw, bh)
+      let custom = a.trackerCustom
+      btn("tracker", "tracker", "Tracker playback", true, a.tkOpen or custom,
+          if custom: colEqualizer else: colAccent):
+        a.setTrackerPanel(not a.tkOpen)
 
   # Volume on the right, never over the buttons.
   let vx = max(r.x + r.w - a.controlsVolumeW, x + 4)
@@ -7543,6 +7706,7 @@ proc modifierHints(a: App): seq[seq[KeyHint]] =
       # 360° view: the wheel changes the field of view; Ctrl swaps what a drag does.
       mouse = @[("Wheel", "Field Of View"),
         ("Drag", if a.cfg.sphereDragMovesWindow: "Look Around" else: "Move Window")]
+    elif a.chartShown: mouse = @[("Wheel", "Zoom Chart"), ("Drag", "Pan Chart")]
     else: mouse = @[("Wheel", "Zoom At Cursor"), ("Drag", "Pan Zoomed Video")]
     if plShown: mouse.add ("LMB", "Toggle Playlist Entry")
   elif mods == {kmAlt}: mouse = @[("MDrag", "Rotate Frame"), ("MMB", "Reset Rotation")]
@@ -8303,7 +8467,12 @@ proc idleScreen(a: App, area: Rect) =
   if a.holding or a.thumbShown: return  # a frame is up (another quality opening)
   let ui = a.ui
   let c = area.xy + area.wh / 2
-  if a.player.loaded and not a.player.hasVideo and not a.player.stopped:
+  if a.chartShown:
+    let t = now()
+    a.chart.draw(ui, area, a.chart.clock(a.player.timePos, a.player.speed, a.player.playing,
+                                           a.player.jumps, t))
+    a.chartDrawn = t
+  elif a.player.loaded and not a.player.hasVideo and not a.player.stopped:
     ui.icon("music96", c - vec2(0, 30), colAccentDim)
     let name = ui.ellipsize(a.player.path.extractFilename, area.w - 40)
     ui.textIn(name, rect(area.x, c.y + 30, area.w, 30), colTextDim, h = CenterAlign)
@@ -8794,14 +8963,26 @@ proc renderYtdlp(a: App, shot: string) =
         &"{a.ytCurrent}). Update it now?"
     of ymBusy, ymFailed: a.ytMsg
   var y = 14'f32
-  for line in ui.wrapText(text, W - 32, 5):
+  let j = a.ytJob
+  let installing = a.ytMode == ymBusy and j.running and j.task == ytInstall
+  for line in ui.wrapText(text, W - 32, if installing: 3 else: 5):
     ui.textIn(line, rect(16, y, W - 32, 22), colText)
     y += 22
-  let j = a.ytJob
   if a.ytMode == ymBusy and j.running:
-    let r = rect(16, min(y + 10, H - 56), W - 32, 6)
+    # Room under the bar for the install's sizes and speed.
+    let r = rect(16, min(y + 10, H - (if installing: 82 else: 56)), W - 32, 6)
     ui.rect(r, colTrack)
     if j.progress >= 0: ui.rect(rect(r.x, r.y, r.w * clamp(j.progress / 100, 0, 1), r.h), colAccent)
+    if j.task == ytInstall:
+      # How much of how big a file, how fast; the percentage on the right.
+      let tr = rect(16, r.y + 10, W - 32, 22)
+      var info =
+        if j.total > 0: fmtBytes(j.bytes.float) & " of " & fmtBytes(j.total.float)
+        elif j.bytes > 0: fmtBytes(j.bytes.float)
+        else: "Connecting..."
+      if j.bytes > 0 and j.speed > 0: info.add " · " & fmtBytes(j.speed) & "/s"
+      ui.textIn(info, tr, colTextDim)
+      if j.progress >= 0: ui.textIn(&"{int(j.progress)}%", tr, colTextDim, h = RightAlign)
   let bw = 100'f32
   let br = rect(W - 16 - bw, H - 44, bw, 28)
   var ok, cancel = false
@@ -9188,6 +9369,9 @@ proc shortcutColumns(a: App): array[2, seq[ShortcutGroup]] =
       ("360° video: look around / move window", "Drag / Ctrl+Drag video"),
       ("360° video: field of view", "Ctrl+Wheel"),
       ("360° video: reset view", "Middle-click video"),
+      ("Tracker chart: zoom at cursor", "Ctrl+Wheel"),
+      ("Tracker chart: pan", "Ctrl+Drag video"),
+      ("Tracker chart: fit to the frame", "Middle-click video"),
       ("Toggle seek snapping", "Shift+Drag seek bar"),
       ("Repeat options", "Right-click loop button"),
       ("Select word / all in a text field", "Double / Triple-click"),
@@ -9240,6 +9424,63 @@ proc aboutOverlay(a: App) =
 
 # --- frame ------------------------------------------------------------------
 
+proc trackerCapture(a: App) =
+  ## Call at the start of the frame, before other widgets: the tracker panel
+  ## claims the mouse over it (as last drawn), and a click elsewhere, but on
+  ## its button, closes it.
+  let ui = a.ui
+  if not a.tkOpen or ui.captured: return
+  if ui.mouse.inside(a.tkPanel):
+    ui.captured = true
+  elif (ui.pressed() or ui.pressed(MouseRight)) and not ui.mouse.inside(a.tkButton):
+    a.setTrackerPanel(false)
+    if ui.pressed(): ui.consumeClick()
+
+proc trackerPanel(a: App) =
+  ## The tracker button's panel, above it: the pitch shift, and whether the
+  ## samples stretch with the speed.
+  let ui = a.ui
+  if not a.tkOpen: return
+  if a.tkButton.w <= 0 or not a.trackerButton:  # the button went (narrow bar, other file)
+    a.setTrackerPanel(false)
+    return
+  const Pad = 12'f32
+  const RowH = 26'f32
+  let label = "Pitch shift"
+  let lw = ui.textSize(label).x
+  let stretch = "Stretch sample playback"
+  let pw = max(lw + 10 + 120 + 8 + ui.textSize("semitones").x, 24 + ui.textSize(stretch).x) + 2 * Pad
+  let ph = Pad + RowH + 10 + 22 + Pad
+  let px = clamp(a.tkButton.x, 4, max(4'f32, ui.size.x - pw - 4))
+  let py = a.tkButton.y - 4 - ph
+  let r = rect(px, py, pw, ph)
+  a.tkPanel = r
+  let was = ui.captured
+  ui.captured = was and not ui.mouse.inside(r)
+  ui.sk.pushLayer(PopupsLayer)
+  ui.rect(r, colPopup)
+  ui.border(r, colBorder)
+  var y = py + Pad
+  ui.textIn(label, rect(px + Pad, y, lw + 2, RowH), colText)
+  var pitch = a.cfg.trackerPitch
+  if ui.numberField("tk-pitch", rect(px + Pad + lw + 10, y, 120, RowH), pitch, 1, -24, 24):
+    a.cfg.trackerPitch = round(pitch)
+    let v = a.cfg.trackerPitch
+    a.osd(if v == 0: "Pitch shift: none"
+          else: (if v > 0: "+" else: "") & $int(v) & " semitone" & (if abs(v) == 1: "" else: "s"))
+  ui.textIn("semitones", rect(px + Pad + lw + 10 + 128, y, 80, RowH), colTextDim)
+  y += RowH + 10
+  var on = a.cfg.trackerStretch
+  if ui.checkbox("tk-stretch", vec2(px + Pad, y), stretch, on):
+    a.cfg.trackerStretch = on
+    a.osd("Stretch sample playback: " & (if on: "on" else: "off"))
+  ui.tip(rect(px + Pad, y, pw - 2 * Pad, 22),
+    "Off: samples play at their own speed and pitch, only the tempo follows the playback speed")
+  ui.sk.popLayer()
+  # Clicks on the panel stay on it.
+  if ui.mouse.inside(r) and ui.pressed(): ui.consumeClick()
+  ui.captured = was
+
 proc frame(a: App) =
   let w = a.window
   let ui = a.ui
@@ -9269,7 +9510,7 @@ proc frame(a: App) =
   let revealZone = H - bottomH - 48
   let mouseIn = ui.fakeMouse.x >= 0 or w.mouseInside
   let bottomVisible = not fs or ui.mouse.y >= revealZone and mouseIn or
-    a.seekDragging or ui.activeId == "volume" or
+    a.seekDragging or ui.activeId == "volume" or a.tkOpen or
     a.menus.contextOpen and a.ctxMenu == cmQuality  # over its gear button
   let bottomRect = rect(0, H - bottomH, W, bottomH)
   let plRect =
@@ -9282,6 +9523,7 @@ proc frame(a: App) =
     ui.captured = true
   else:
     a.menus.captureInput(ui)
+    a.trackerCapture()
 
   # GL video pass (beneath the UI).
   a.sk.beginUi(w, fb)
@@ -9329,7 +9571,10 @@ proc frame(a: App) =
   if ui.hover(videoArea) and not (fs and bottomVisible and ui.mouse.y >= H - bottomH) and
      not (a.cfg.showPlaylist and ui.mouse.inside(plRect)) and
      not (a.cfg.showRunLog and ui.mouse.inside(rlRect)):
-    if ui.pressed() and w.ctrl and not a.player.isSpherical and
+    if ui.pressed() and w.ctrl and a.chartShown and a.rectEdit == nil:
+      a.chartPanDrag = true
+      a.chartPanLast = ui.mouse
+    elif ui.pressed() and w.ctrl and not a.player.isSpherical and
        a.rectEdit == nil and a.canPan(a.px(videoArea)):
       a.panDrag = true
       a.panFrom = ui.mouse * a.sk.uiScale
@@ -9348,11 +9593,21 @@ proc frame(a: App) =
       # Unfocused, the keyboard (and Ctrl) goes elsewhere: ask the system.
       let ctrl = w.ctrl or (not w.focused and ctrlHeld())
       if ctrl and a.player.isSpherical: a.changeFov(ui.wheelNotches)
+      elif ctrl and a.chartShown:
+        # Wheel up zooms in; smooth wheels add up to whole steps.
+        a.chartZoomNotches -= ui.wheelNotches
+        let steps = int(a.chartZoomNotches)
+        if steps != 0:
+          a.chartZoomNotches -= steps.float32
+          let msg = a.chart.zoomBy(steps, ui.mouse)
+          if msg.len > 0: a.osd(msg)
       elif ctrl: a.zoomAt(a.px(videoArea), ui.mouse * a.sk.uiScale, ui.wheelNotches)
       else: a.volumeStep(ui.scroll() < 0)
       ui.scrollConsumed = true
     if ui.pressed(MouseMiddle) and a.player.isSpherical:
       a.resetLook(); a.osd("View reset")
+    elif ui.pressed(MouseMiddle) and a.chartShown:
+      if a.chart.zoomed: a.chart.resetView(); a.osd("Zoom: fit")
     elif ui.pressed(MouseMiddle) and w.alt:
       a.beginRotate(a.px(videoArea), ui.mouse * a.sk.uiScale, w.ctrl)
     elif ui.pressed(MouseMiddle) and (a.xf.zoom != 1 or a.xf.pan != vec2(0, 0)):
@@ -9363,6 +9618,12 @@ proc frame(a: App) =
       if not a.rotMoved:  # Alt+Middle-click
         a.xf.rotation = 0; a.xfChanged("Rotation: 0°")
     else: a.rotateDrag(a.px(videoArea), ui.mouse * a.sk.uiScale, w.shift)
+  if a.chartPanDrag:
+    if not ui.down() or not a.chartShown: a.chartPanDrag = false
+    elif ui.mouse != a.chartPanLast:
+      a.chart.pan += ui.mouse - a.chartPanLast
+      a.chartPanLast = ui.mouse
+      a.dirtyUntil = max(a.dirtyUntil, now() + 0.02)
   if a.panDrag:
     if not ui.down(): a.panDrag = false
     else: a.panDragTo(a.px(videoArea), ui.mouse * a.sk.uiScale)
@@ -9392,6 +9653,7 @@ proc frame(a: App) =
   if a.cfg.showPlaylist: a.playlistPanel(plRect)
   else: a.plListRect = Rect()
   if a.cfg.showRunLog: a.runLogPanel(rlRect)
+  a.tkButton = Rect()
   if bottomVisible and bottomH > 0:
     var y = H - bottomH
     if a.cfg.showSeekBar:
@@ -9406,6 +9668,7 @@ proc frame(a: App) =
   else:
     a.showPreview = false
     a.seekDragging = false
+  a.trackerPanel()
   if menuH > 0:
     a.menus.drawBar(ui, root, rect(0, 0, W, MenuBarHeight))
 
@@ -9607,6 +9870,12 @@ proc runScriptStep(a: App, st: ScriptStep) =
     else:
       gains[parseInt(st.args[0])] = parseFloat(st.args[1])
       a.changeEqualizer(on, gains)
+  of "tracker": a.setTrackerPanel(arg == "1")  # the tracker button's panel, shown or hidden
+  of "tkpitch": a.cfg.trackerPitch = parseFloat(arg)  # semitones, as typed in the panel
+  of "tkstretch": a.cfg.trackerStretch = arg == "1"
+  of "tkdump": stderr.writeLine "tk source=", a.player.source, " factor=", a.tkFactor,
+    " correction=", a.player.h.getStr("audio-pitch-correction"), " speed=", a.player.speed,
+    " pos=", a.player.timePos, " module=", a.isModule, " button=", a.tkButton, " panel=", a.tkPanel
   of "eqdump": stderr.writeLine "eq ", a.equalizer, " saved=", a.eqSaved, " af=", a.player.h.getStr("af")
   of "cmdcard":  # name [value|reference [content]]: a card at the caret
     let kind = if st.args.len > 1 and st.args[1] == "reference": ckReference else: ckValue
@@ -9769,7 +10038,7 @@ proc main() =
   discard setlocale(LC_NUMERIC, "C")
   when defined(windows): attachStdio()
   let a = App(plIndex: -1, plSelected: -1, optionsDlg: newOptionsDialog(),
-    cmdDlg: newCmdDialog(), pickDlg: newPickDialog())
+    cmdDlg: newCmdDialog(), pickDlg: newPickDialog(), tkCorrection: true)
   a.cfg = loadConfig()
   discard a.cfg.reloadRecent()
   a.script = loadScript()
@@ -9780,6 +10049,8 @@ proc main() =
   # Restarted into an update: what it was doing comes back.
   let (resumed, rs) = if ResumeArg in params: takeResume() else: (false, ResumeState())
   removeOld()
+  # An AppImage's launcher entry follows it when it's moved or renamed.
+  when defined(linux): discard integrate(always = false)
   # Debug scripts must not hand their files to (or take files from) a real
   # player the user has open.
   let scripted = a.script.steps.len > 0
@@ -9825,7 +10096,7 @@ proc main() =
     a.instance.close()
     a.peers.close()
     try:
-      startProcess(getAppFilename(), args = params.stripRenderArgs & (RenderArg & "cpu"),
+      startProcess(selfExe(), args = params.stripRenderArgs & (RenderArg & "cpu"),
         options = {poParentStreams, poDaemon}).close()
     except OSError as e: stderr.writeLine "cannot restart: ", e.msg
     return
@@ -10080,6 +10351,7 @@ proc main() =
 
     let t = now()
     a.pollVideoFrame()
+    a.pollTracker()
     a.updateOsdApart()
     let wantDraw = a.renderNow or a.lfDue or a.previewFlag or a.osdFlag or changed or t < a.dirtyUntil or
       t - lastFrame > 0.25 or a.dialog != nil and t - lastFrame > 0.1

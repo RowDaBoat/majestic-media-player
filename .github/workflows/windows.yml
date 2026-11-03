@@ -1,6 +1,6 @@
 # Builds the Windows release on every push with tools/windows.sh, the same
-# way it's built locally from Git Bash. The .exe + libmpv-2.dll are attached
-# to the run as an artifact; pushing a v* tag also publishes a GitHub Release.
+# way it's built locally from Git Bash. What ships (the .exe, its DLLs and
+# licenses, see tools/windows.sh stage) is attached to the run as an artifact; pushing a v* tag also publishes a GitHub Release.
 name: Windows build
 
 on:
@@ -36,9 +36,7 @@ jobs:
         run: |
           name="majestic-media-player-$(cat VERSION)-windows-x64"
           [[ $GITHUB_REF == refs/tags/* ]] || name+="-${GITHUB_SHA::7}"
-          mkdir "$name"
-          cp majestic-media-player.exe libmpv-2.dll "$name/"
-          cp -r cpu "$name/"  # Mesa's software OpenGL (Options > System > Rendering)
+          tools/windows.sh stage "$name"
           7z a "$name.zip" "$name" >/dev/null
           echo "name=$name" >> "$GITHUB_OUTPUT"
 

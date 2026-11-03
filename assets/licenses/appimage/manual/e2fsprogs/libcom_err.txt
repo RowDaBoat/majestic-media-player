@@ -1,0 +1,15 @@
+libcom_err (lib/et of e2fsprogs 1.47.4), from the header of lib/et/com_err.c
+https://git.kernel.org/pub/scm/fs/ext2/e2fsprogs.git/tree/lib/et?h=v1.47.4
+(Arch's e2fsprogs package lists "GPL LGPL MIT" and ships no license file;
+e2fsprogs' NOTICE puts lib/et under this MIT-style license.)
+
+Copyright 1987, 1988 by MIT Student Information Processing Board.
+
+Permission to use, copy, modify, and distribute this software and
+its documentation for any purpose is hereby granted, provided that
+the names of M.I.T. and the M.I.T. S.I.P.B. not be used in
+advertising or publicity pertaining to distribution of the software
+without specific, written prior permission.  M.I.T. and the
+M.I.T. S.I.P.B. make no representations about the suitability of
+this software for any purpose.  It is provided "as is" without
+express or implied warranty.

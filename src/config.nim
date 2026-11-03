@@ -130,6 +130,11 @@ type
     ytThumbnail*: bool = true      # a YouTube link's thumbnail while no video track shows
     ytSeekPreview*: bool = true    # seek bar previews on YouTube links, from its storyboards
     showCover*: bool = true        # an audio file's front cover in the video frame
+    showTrackerChart*: bool = true # a tracker module's patterns in the video frame
+    trackerPitch*: float = 0       # the tracker button's pitch shift, semitones
+    trackerStretch*: bool = true   # samples stretched with the speed (mpv's time
+                                   # stretching); off, they play as written, only the
+                                   # tempo following the speed (modstream)
     coverNames*: string = "folder\nalbum"  # pictures beside an audio file taken as its
                                    # cover when it has none in it: names without the
                                    # extension, one per line, first found wins
@@ -783,7 +788,24 @@ const AudioExtensions* = [
   "mp3", "flac", "ogg", "opus", "m4a", "aac", "wav", "wma", "alac", "ape",
   "wv", "mka", "aiff", "dts", "ac3"]
 
-const MediaExtensions* = @VideoExtensions & @AudioExtensions
+const TrackerExtensions* = [
+  ## Music modules, played by FFmpeg's libopenmpt demuxer: libopenmpt's own
+  ## list, minus extensions other common formats use (.ppm images, .stp CAD,
+  ## .amf and .mdl 3D models, .sfx archives, .etx text, .fmt, .mus, .xmf).
+  "mptm", "mod", "s3m", "xm", "it", "667", "669", "ams", "c67", "cba",
+  "dbm", "digi", "dmf", "dsm", "dsym", "dtm", "far", "fc", "fc13", "fc14",
+  "fst", "ftm", "imf", "ims", "ice", "j2b", "m15", "med", "mms", "mt2", "mtm",
+  "nst", "okt", "plm", "psm", "pt36", "ptm", "puma", "rtm", "sfx2", "smod",
+  "st26", "stk", "stm", "stx", "symmod", "tcb", "gmc", "gtk", "gt2", "ult",
+  "unic", "wow", "gdm", "mo3", "oxm", "umx", "xpk", "mmcmp"]
+
+const AssocTrackerExtensions* = [
+  ## The tracker types offered in File Associations: the common ones, not
+  ## dozens of rarities (on Linux most aren't in the MIME database anyway).
+  "mptm", "mod", "s3m", "xm", "it", "mo3", "669", "mtm", "med", "stm", "ult",
+  "okt", "umx"]
+
+const MediaExtensions* = @VideoExtensions & @AudioExtensions & @TrackerExtensions
 
 const SubtitleExtensions* = ["srt", "ass", "ssa", "vtt", "sub", "sup", "idx", "smi"]
 

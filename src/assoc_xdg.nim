@@ -2,7 +2,7 @@
 ## mimeapps.list in the user's config directory, per MIME type, so extensions
 ## sharing one (mp4, m4v, f4v) move together.
 
-import std/[strutils, tables]
+import std/[strutils, tables, sequtils]
 
 const DesktopId* = "majestic-media-player.desktop"
 
@@ -79,9 +79,14 @@ proc setEntries(lines: var seq[string], section, key: string, values: seq[string
 proc loadAssocItems*(): seq[AssocItem] =
   let mimes = extensionMimes()
   let lines = readLines(mimeappsPath())
-  for (exts, video) in [(@VideoExtensions, true), (@AudioExtensions, false)]:
+  for (exts, video) in [(@VideoExtensions, true), (@AudioExtensions, false),
+                        (@AssocTrackerExtensions, false)]:
     for ext in exts:
-      var it = AssocItem(ext: ext, mimes: mimes.getOrDefault(ext), video: video)
+      var m = mimes.getOrDefault(ext)
+      # *.mod is also application/x-object (compiled objects): only the
+      # music types, so associating a module doesn't take .o files along.
+      if ext in AssocTrackerExtensions: m.keepItIf(it.startsWith("audio/"))
+      var it = AssocItem(ext: ext, mimes: m, video: video)
       it.current = it.mimes.len > 0
       for m in it.mimes:
         let d = lines.entries(DefaultSection, m)
@@ -96,6 +101,12 @@ proc applyAssociations*(items: var seq[AssocItem]): string =
   ## default (kept after it) takes over again. Returns an error, or "".
   let path = mimeappsPath()
   var lines = readLines(path)
+  # An AppImage has no launcher entry for the defaults to name until it makes one.
+  for it in items:
+    if it.checked and not it.current:
+      let err = integrate()
+      if err.len > 0: return err
+      break
   for it in items:
     if it.checked == it.current: continue
     for m in it.mimes:

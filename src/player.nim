@@ -3,7 +3,7 @@
 ## and a lightweight instance that renders seek-bar thumbnails.
 
 import std/[algorithm, atomics, json, osproc, sequtils, strutils, os, tables, times]
-import mpv, videogl, spherical, gpumem, coverart
+import mpv, videogl, spherical, gpumem, coverart, modstream
 from config import AudioExtensions
 from ytdlp import YtdlSubLangs, linkSphere, hlsSphere
 
@@ -238,6 +238,7 @@ proc newPlayer*(volume: float, muted, osd: bool): Player =
   h.setOpt("ytdl-raw-options", "sub-langs=%" & $YtdlSubLangs.len & "%" &
     YtdlSubLangs & ",no-playlist=")  # %n%: n bytes taken as they are
   check mpv_initialize(h), "mpv_initialize"
+  register(h)  # module streams (modstream)
   # mpv's log goes to stderr only when MMP_DEBUG is set; load failures surface
   # in the status bar regardless. Errors come in anyway, for yt-dlp's
   # (hookError).
@@ -466,7 +467,8 @@ proc handleProp(p: Player, id: Prop, ev: ptr MpvEventProperty) =
   of pCacheState:
     p.buffered.setLen 0
     p.cacheAhead = -1
-    if d != nil and ev.format == fmtNode:
+    # A module stream (modstream) is rendered as it's read, not downloaded.
+    if d != nil and ev.format == fmtNode and not p.source.startsWith("mmpmod://"):
       let j = cast[ptr MpvNode](d)[].toJson
       for r in j{"seekable-ranges"}.getElems:
         p.buffered.add (r{"start"}.getFloat, r{"end"}.getFloat)
@@ -1236,7 +1238,10 @@ proc audioBitrate(h: MpvHandle, tracks: JsonNode, video: bool): float =
   ## audio in there, the average over the whole file.
   for t in tracks:
     if t{"type"}.getStr != "audio": continue
-    result = t{"demux-bitrate"}.getFloat
+    # A tracker module's "bit rate" is libopenmpt's rendered PCM (3 Mb/s):
+    # the file's own average says more.
+    if h.getStr("file-format") != "libopenmpt":
+      result = t{"demux-bitrate"}.getFloat
     if result <= 0 and t.hasKey("metadata"):
       for k, v in t["metadata"].pairs:
         if k.toLowerAscii == "bps":

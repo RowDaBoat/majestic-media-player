@@ -46,7 +46,9 @@ type
     lines*: seq[string]       ## output lines, stdout and stderr together
     code*: int = -1           ## exit code once finished; -1 while running
     progress*: float = -1     ## percent done, as last printed
-    bytes*, total*: int64     ## ytDownload: bytes downloaded, of how many (0: unknown)
+    bytes*, total*: int64     ## ytDownload, ytInstall: bytes downloaded, of how
+                              ## many (0: unknown)
+    speed*: float             ## ytInstall: bytes a second, as curl last printed
     streamBase: int64         ## ytDownload: the streams downloaded before this one
     streamDone, streamTotal: int64  ## and this one's bytes, as last printed
     inStream: bool            ## ytDownload: a stream downloading (not a subtitle)
@@ -504,24 +506,41 @@ proc install*(): YtJob =
   let dest = managedPath()
   try: createDir(dest.parentDir)
   except OSError: discard
-  result = start(ytInstall, "curl", ["-fL", "--retry", "2", "-#",
+  # curl's progress meter, unlike -#, has the size and the speed in it.
+  result = start(ytInstall, "curl", ["-fL", "--retry", "2",
     "-o", dest & ".part", ReleaseUrl & name])
   result.dest = dest
 
-proc percentIn(s: string): float =
-  ## The number before the last '%' in s, else -1.
-  let e = s.rfind('%')
-  if e < 0: return -1
-  var b = e
-  while b > 0 and s[b - 1] in {'0' .. '9', '.'}: dec b
-  try: parseFloat(s[b ..< e]) except ValueError: -1
+proc meterSize(s: string): float =
+  ## A size in curl's progress meter ("39.25M": 1024-based), else -1.
+  if s.len == 0: return -1
+  var mult = 1.0
+  var n = s
+  let units = "kMGTP"
+  let u = units.find(s[^1])
+  if u >= 0:
+    mult = pow(1024.0, float(u + 1))
+    n = s[0 ..< ^1]
+  try: parseFloat(n) * mult except ValueError: -1
 
 proc addLine(j: YtJob, line: string) =
   let l = line.strip
   if l.len == 0: return
-  let pc = percentIn(l)
-  if j.task == ytInstall and l.startsWith("#"):
-    if pc >= 0: j.progress = pc
+  if j.task == ytInstall:
+    # "16 39.25M  16  6.38M   0  0  5.12M  0  00:07  00:01  00:06  6.39M":
+    # percent, total, percent and bytes received, ..., the current speed.
+    # Its headers and curl's errors aren't rows (an error is kept).
+    let f = l.splitWhitespace
+    if f.len >= 8 and f[0].allCharsInSet(Digits):
+      let total = meterSize(f[1])
+      let got = meterSize(f[3])
+      let speed = meterSize(f[^1])
+      if total > 0: j.total = max(int64(total), j.bytes)  # rounded to 4 digits
+      if got > 0: j.bytes = max(j.bytes, int64(got))
+      if speed >= 0: j.speed = speed
+      if j.total > 0: j.progress = min(j.bytes.float * 100 / j.total.float, 100)
+    elif not l.startsWith("%") and not l.startsWith("Dload"): j.lines.add l
+    return
   elif j.task == ytDownload and l.startsWith("MMPPROG "):
     if not j.inStream: return  # a subtitle file
     proc num(s: string): int64 =
@@ -601,8 +620,15 @@ proc finish(j: YtJob) =
 proc poll*(j: YtJob): bool =
   ## Reads what it printed and notes when it exits. True when anything changed.
   if not j.running: return
-  let before = (j.lines.len, j.progress, j.items.len, j.infos.len)
+  let before = (j.lines.len, j.progress, j.items.len, j.infos.len, j.speed)
   j.read()
+  if j.task == ytInstall:
+    # The file grows between curl's once-a-second rows.
+    try: j.bytes = max(j.bytes, getFileSize(j.dest & ".part"))
+    except OSError: discard
+    if j.total > 0:
+      j.total = max(j.total, j.bytes)  # curl's rounded total, a little short
+      j.progress = min(j.bytes.float * 100 / j.total.float, 100)
   let code = j.p.peekExitCode
   if code != -1:
     j.read()
@@ -612,7 +638,7 @@ proc poll*(j: YtJob): bool =
     j.code = code
     j.finish()
     return true
-  (j.lines.len, j.progress, j.items.len, j.infos.len) != before
+  (j.lines.len, j.progress, j.items.len, j.infos.len, j.speed) != before
 
 proc stop*(j: YtJob) =
   if not j.running: return

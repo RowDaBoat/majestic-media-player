@@ -81,12 +81,13 @@ proc registerApp() =
   regSet(AppKey & r"\Capabilities", "ApplicationName", AppTitle)
   regSet(AppKey & r"\Capabilities", "ApplicationDescription",
     "Dark-themed media player built on mpv")
-  for ext in MediaExtensions:
+  for ext in @VideoExtensions & @AudioExtensions & @AssocTrackerExtensions:
     regSet(AppKey & r"\Capabilities\FileAssociations", "." & ext, ProgId)
   regSet(r"Software\RegisteredApplications", AppTitle, AppKey & r"\Capabilities")
 
 proc loadAssocItems*(): seq[AssocItem] =
-  for (exts, video) in [(@VideoExtensions, true), (@AudioExtensions, false)]:
+  for (exts, video) in [(@VideoExtensions, true), (@AudioExtensions, false),
+                        (@AssocTrackerExtensions, false)]:
     for ext in exts:
       # Each extension is its own type here; the "MIME" shown is ".ext".
       var it = AssocItem(ext: ext, mimes: @["." & ext], video: video)

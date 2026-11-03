@@ -15,6 +15,7 @@ Majestic's aim is to be the video player I wish I had.
 - **Bookmarks** on the seek bar: snap to them, use them in commands, or embed them as MKV chapters.
 - **Seek bar previews** of the spot under the cursor, YouTube videos included.
 - **Seek bar shows what's downloaded** of online videos: parts skipped over are striped.
+- **Tracker music** (MOD, S3M, XM, IT, MPTM and dozens more) through libopenmpt, with its patterns scrolling in the video frame as they play, a pitch shift, and samples that can keep their own speed while the tempo changes.
 - **A silent delay after very short audio files**, shown on the seek bar past a `]` mark.
 - **Synchronized players**, for footage recorded from several angles.
 - **VR / 360° videos**, YouTube's included (360°, VR180 and 3D).
@@ -27,7 +28,11 @@ Hold Ctrl, Shift or Alt to see what else you can do, or press F1 for every short
 
 ## Install
 
-### Linux (CachyOS / Arch)
+### Linux (any distribution): AppImage
+
+Download the `.AppImage` from the [latest release](https://github.com/arkl1te/majestic-media-player/releases/latest), make it executable (right-click → Properties → Allow executing, or `chmod +x`) and run it. It needs nothing installed: it brings everything it uses along. Making it the default player in Options > Formats also adds it to your application launcher, and Help > Check for Updates replaces it with the new release in place.
+
+### Linux from source (CachyOS / Arch)
 
 ```sh
 git clone https://github.com/arkl1te/majestic-media-player.git

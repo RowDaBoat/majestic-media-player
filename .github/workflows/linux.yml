@@ -1,0 +1,177 @@
+# Builds the Linux AppImage on every push with tools/appimage.sh, in an Arch
+# Linux container (the packages it bundles come from Arch's archive as of
+# the date pinned there). The AppImage is attached to the run as an
+# artifact; pushing a v* tag also adds it to the GitHub Release, the one the
+# Windows build makes (whichever finishes first creates it).
+name: Linux build
+
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: docker.io/library/archlinux:latest
+    outputs:
+      name: ${{ steps.pkg.outputs.name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # The archive is slow: its packages are kept between runs, for as long
+      # as the pinned date (in tools/appimage.sh) stays the same.
+      - name: Pinned date
+        id: date
+        run: echo "date=$(sed -n 's|^ARCH_DATE=||p' tools/appimage.sh | tr / -)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          path: /var/cache/pacman/pkg
+          key: pacman-${{ steps.date.outputs.date }}-${{ hashFiles('tools/appimage.sh') }}
+          restore-keys: pacman-${{ steps.date.outputs.date }}-
+
+      - name: Dependencies
+        run: tools/appimage.sh deps
+
+      - name: Build
+        run: tools/appimage.sh build
+
+      - name: Package
+        id: pkg
+        run: |
+          name="majestic-media-player-$(cat VERSION)"
+          [[ $GITHUB_REF == refs/tags/* ]] || name+="-${GITHUB_SHA::7}"
+          name+="-x86_64"
+          tools/appimage.sh bundle "$name"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+        shell: bash
+
+      # When the AppImage holds a package assets/licenses/appimage/INDEX.txt
+      # lacks (a new ARCH_DATE, or quick-sharun brought in more): that folder
+      # rewritten, to commit.
+      - name: Licenses to commit
+        if: failure() && steps.pkg.outcome == 'failure'
+        run: tools/appimage.sh licenses vendor/appimage/AppDir
+      - uses: actions/upload-artifact@v4
+        if: failure() && steps.pkg.outcome == 'failure'
+        with:
+          name: licenses-appimage
+          path: assets/licenses/appimage
+
+      # A clip for the tests below: 5 s of a test pattern and a tone.
+      - name: Test clip
+        run: ffmpeg -v error -f lavfi -i testsrc2=size=640x360:rate=30 -f lavfi -i sine=frequency=440 -t 5 -c:v libx264 -pix_fmt yuv420p -c:a aac test.mp4
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pkg.outputs.name }}
+          path: ${{ steps.pkg.outputs.name }}.AppImage
+          compression-level: 0  # already compressed
+      - uses: actions/upload-artifact@v4
+        with:
+          name: test-clip
+          path: test.mp4
+
+  # The AppImage on systems other than the one it was made on, nothing of
+  # Arch's on them: it plays the clip in a virtual X display, saves what the
+  # player shows and quits. Containers have no FUSE, so the AppImage's
+  # runtime goes without it, as it must on systems lacking it.
+  test:
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - ubuntu:22.04  # glibc 2.35, the oldest here (Linux Mint 21's base)
+          - ubuntu:24.04  # Linux Mint 22's base
+          - debian:12
+          - fedora:latest
+    container: docker.io/library/${{ matrix.image }}
+    steps:
+      # Xvfb for a display; python3 to serve a web page; CA certificates,
+      # which every desktop has and these images lack.
+      - name: Xvfb
+        run: |
+          if command -v apt-get >/dev/null; then
+            apt-get update -q && DEBIAN_FRONTEND=noninteractive apt-get install -y -q xvfb python3 ca-certificates
+          else
+            dnf install -y -q xorg-x11-server-Xvfb python3 ca-certificates
+          fi
+          Xvfb :99 -screen 0 1280x800x24 -nolisten tcp >/dev/null 2>&1 &
+          echo DISPLAY=:99 >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build.outputs.name }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: test-clip
+      - name: Plays
+        shell: bash
+        run: |
+          f=$PWD/${{ needs.build.outputs.name }}.AppImage
+          chmod +x "$f"
+          export XDG_CONFIG_HOME=$PWD/config XDG_CACHE_HOME=$PWD/cache
+          export MMP_SCRIPT="1:open $PWD/test.mp4;3:dump width height;4:shot $PWD/shot.png;6:quit"
+          timeout 90 "$f" 2>&1 | tee play.log
+          test -s shot.png
+          grep -qx 'dump width = 640' play.log
+          grep -qx 'dump height = 360' play.log
+
+      # A link: mpv can't open the page by itself, so the player offers to
+      # install yt-dlp; the script says yes (Install), the player downloads it
+      # (with the AppImage's curl) and mpv opens the page through it. The
+      # title is the one yt-dlp found, the size the video's.
+      - name: Installs yt-dlp and opens a link with it
+        shell: bash
+        run: |
+          f=$PWD/${{ needs.build.outputs.name }}.AppImage
+          mkdir -p www home
+          cp test.mp4 www/
+          echo '<!doctype html><html><head><title>Test page</title></head><body><video controls src="test.mp4"></video></body></html>' > www/index.html
+          (cd www && exec python3 -m http.server 8765 --bind 127.0.0.1 >/dev/null 2>&1) &
+          sleep 2
+          export HOME=$PWD/home XDG_CONFIG_HOME=$PWD/home/.config XDG_CACHE_HOME=$PWD/home/.cache
+          export MMP_SCRIPT="1:open http://127.0.0.1:8765/index.html;10:ytdlp 1;50:dump media-title width height;51:shot $PWD/shot-link.png;53:quit"
+          timeout 120 "$f" 2>&1 | tee link.log
+          test -x home/.local/bin/yt-dlp
+          grep -q '^dump media-title = Test page' link.log
+          grep -qx 'dump width = 640' link.log
+          grep -qx 'dump height = 360' link.log
+      - name: Shot name
+        id: shot
+        if: always()
+        run: echo "name=shot-$(echo '${{ matrix.image }}' | tr ':/' '--')" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ${{ steps.shot.outputs.name }}
+          path: shot*.png
+          if-no-files-found: ignore
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build, test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build.outputs.name }}
+      # Release notes = the annotated tag's message, as the Windows build does:
+      # checkout only fetches the tagged commit, so the tag object itself is
+      # fetched to read its message.
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=$GITHUB_REF_NAME
+          f=${{ needs.build.outputs.name }}.AppImage
+          git fetch --force --depth=1 origin "refs/tags/$tag:refs/tags/$tag"
+          git tag -l --format='%(contents)' "$tag" > release-notes.md
+          # Whichever of the Windows and Linux builds is first makes the release.
+          gh release create "$tag" --verify-tag --title "$tag" --notes-file release-notes.md "$f" ||
+            gh release upload "$tag" "$f" --clobber

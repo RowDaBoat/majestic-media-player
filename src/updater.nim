@@ -1,13 +1,13 @@
 ## Help > Check for Updates: looks up the player's latest release on GitHub
 ## and, when asked to, gets it ready in the background: on Windows the
-## release's .zip, unpacked; elsewhere (releases carry no Linux build) the
-## release's source, built with make as install.sh does. Then installs it in
-## place of the running program (which can be replaced while it runs), for
-## the app to restart into (relaunch).
+## release's .zip, unpacked; as an AppImage, the release's AppImage; else
+## the release's source, built with make as install.sh does. Then installs it
+## in place of the running program (which can be replaced while it runs),
+## for the app to restart into (relaunch).
 
 import std/[os, osproc, json, strutils]
 when not defined(windows): import std/posix
-import runlog
+import runlog, appimage
 
 const
   Repo = "arkl1te/majestic-media-player"
@@ -120,7 +120,13 @@ proc parseRelease(j: UpJob) =
       if a{"name"}.getStr.endsWith("-windows-x64.zip"):
         j.url = a{"browser_download_url"}.getStr
   else:
-    j.url = r{"tarball_url"}.getStr
+    if appImageFile.len > 0:
+      const arch = when defined(arm64): "-aarch64.AppImage" else: "-x86_64.AppImage"
+      for a in r{"assets"}.getElems:
+        if a{"name"}.getStr.endsWith(arch):
+          j.url = a{"browser_download_url"}.getStr
+    else:
+      j.url = r{"tarball_url"}.getStr
   if j.version.len == 0: j.fail("couldn't find the latest release")
   else: j.code = 0
 
@@ -128,6 +134,16 @@ proc download*(j: UpJob) =
   ## Gets the release checked for ready to install: done (code 0) once it is.
   if j.url.len == 0:
     j.fail("the release " & j.version & " has no download for this system")
+    return
+  if appImageFile.len > 0:
+    # Next to it, for the rename over it to be one step.
+    j.archive = appImageFile.parentDir / ("." & appImageFile.extractFilename & ".update")
+    try: writeFile(j.archive, "")
+    except IOError:
+      j.fail("can't write to " & appImageFile.parentDir & ": move the AppImage to a folder of yours")
+      return
+    j.progress = -1
+    j.run(upDownload, "curl", ["-fL", "--retry", "2", "-#", "-o", j.archive, j.url])
     return
   let need = canBuild()
   if need.len > 0:
@@ -235,10 +251,24 @@ proc poll*(j: UpJob): bool =
   j.p = nil
   if code != 0:
     j.code = code
+    if j.stage == upDownload and appImageFile.len > 0:
+      try: removeFile(j.archive)
+      except OSError: discard
     return true
   case j.stage
   of upLatest: j.parseRelease()
-  of upDownload: j.extract()
+  of upDownload:
+    if appImageFile.len > 0:
+      # The running one keeps its copy: the mount holds it open.
+      j.stage = upInstall
+      try:
+        setFilePermissions(j.archive, getFilePermissions(appImageFile) +
+          {fpUserExec, fpUserRead})
+        moveFile(j.archive, appImageFile)
+        j.code = 0
+      except OSError, IOError:
+        j.fail(getCurrentExceptionMsg())
+    else: j.extract()
   of upExtract:
     try: removeFile(j.archive)
     except OSError: discard
@@ -258,6 +288,9 @@ proc stop*(j: UpJob) =
   except OSError: discard
   j.p = nil
   j.code = 130
+  if j.stage == upDownload and appImageFile.len > 0:
+    try: removeFile(j.archive)
+    except OSError: discard
 
 proc errorText*(j: UpJob): string =
   ## What went wrong: its last line.
@@ -283,7 +316,7 @@ proc relaunch*(extra: varargs[string]) =
   else: delEnv("MMP_SCRIPT")
   delEnv("MMP_RESUME_SCRIPT")
   try:
-    let p = startProcess(exePath, args = @[ResumeArg] & @extra, options = {poParentStreams, poDaemon})
+    let p = startProcess(selfExe(), args = @[ResumeArg] & @extra, options = {poParentStreams, poDaemon})
     p.close()
   except OSError as e:
     stderr.writeLine "cannot restart: ", e.msg
