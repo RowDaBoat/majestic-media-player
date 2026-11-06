@@ -1,3 +1,6 @@
+# Ported from Advanced Visualization Studio 2.81d, Copyright 2005 Nullsoft, Inc.
+# BSD license: assets/licenses/AVS-Nullsoft-BSD.txt
+
 ## The AVS engine's common ground (r_defs.h, linedraw.cpp, matrix.cpp, rlib.cpp):
 ## pixels, blending as the MMX build did it, line drawing, the global buffers
 ## and the effect base type.

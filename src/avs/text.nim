@@ -1,3 +1,6 @@
+# Ported from Advanced Visualization Studio 2.81d, Copyright 2005 Nullsoft, Inc.
+# BSD license: assets/licenses/AVS-Nullsoft-BSD.txt
+
 ## Render / Text (r_text.cpp): words from the preset's text, one at a time,
 ## drawn in the font it names. GDI drew them into a bitmap filled with a
 ## "clip color", and every pixel that isn't that color went onto the frame;

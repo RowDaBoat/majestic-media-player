@@ -1,3 +1,6 @@
+# Ported from Advanced Visualization Studio 2.81d, Copyright 2005 Nullsoft, Inc.
+# BSD license: assets/licenses/AVS-Nullsoft-BSD.txt
+
 ## AVS 2.81d's built-in APEs: Channel Shift, Color Reduction, Multiplier,
 ## Video Delay, Multi Delay (r_chanshift.cpp, r_colorreduction.cpp,
 ## r_multiplier.cpp, r_videodelay.cpp, r_multidelay.cpp).

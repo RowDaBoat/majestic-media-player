@@ -1,3 +1,6 @@
+# Ported from Advanced Visualization Studio 2.81d, Copyright 2005 Nullsoft, Inc.
+# BSD license: assets/licenses/AVS-Nullsoft-BSD.txt
+
 ## EEL, the expression language of AVS presets, as AVS 2.81d's NS-EEL runs it.
 ##
 ## NS-EEL compiled each statement to x86 code working on pointers to doubles:

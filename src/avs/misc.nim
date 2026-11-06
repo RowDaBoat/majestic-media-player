@@ -1,3 +1,6 @@
+# Ported from Advanced Visualization Studio 2.81d, Copyright 2005 Nullsoft, Inc.
+# BSD license: assets/licenses/AVS-Nullsoft-BSD.txt
+
 ## Misc effects: Clear Screen, OnBeat Clear, Custom BPM, Set Render Mode,
 ## Comment, Buffer Save (r_clear.cpp, r_nfclr.cpp, r_bpm.cpp, r_linemode.cpp,
 ## r_comment.cpp, r_stack.cpp).

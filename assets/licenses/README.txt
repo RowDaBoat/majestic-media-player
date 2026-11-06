@@ -58,5 +58,8 @@ Source: https://github.com/IBM/plex
 
 The visualizer (Advanced Visualization Studio) and its built-in presets
 -----------------------------------------------------------------------
-AVS 2.81d by Nullsoft, ported, and the Winamp presets that came with it:
-BSD-style license (AVS-Nullsoft-BSD.txt). Source: https://github.com/visbot/vis_avs
+AVS 2.81d, ported from the source Nullsoft released under a BSD license in 2005, and the
+presets that came with it. Some third-party effects follow grandchild's fork, and the
+Convolution Filter is also Copyright 2002 Tom Holden. BSD licenses (AVS-Nullsoft-BSD.txt).
+Sources: https://github.com/visbot/vis_avs, https://github.com/grandchild/vis_avs and
+https://github.com/tholden/AVSConvolutionFilter

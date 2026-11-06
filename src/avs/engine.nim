@@ -1,3 +1,6 @@
+# Ported from Advanced Visualization Studio 2.81d, Copyright 2005 Nullsoft, Inc.
+# BSD license: assets/licenses/AVS-Nullsoft-BSD.txt
+
 ## An AVS instance: a preset, its two frame buffers, and the audio data it
 ## sees each frame (main.cpp's render thread and Winamp's vis feed).
 ##

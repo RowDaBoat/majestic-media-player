@@ -1,3 +1,6 @@
+# Ported from Advanced Visualization Studio 2.81d, Copyright 2005 Nullsoft, Inc.
+# BSD license: assets/licenses/AVS-Nullsoft-BSD.txt
+
 ## Render effects: Rotating Stars, Dot Fountain, Dot Grid, Moving Particle,
 ## Starfield, Bass Spin, Timescope (r_rotstar.cpp, r_dotfnt.cpp, r_dotgrid.cpp,
 ## r_parts.cpp, r_stars.cpp, r_bspin.cpp, r_timescope.cpp).

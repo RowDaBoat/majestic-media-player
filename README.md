@@ -17,7 +17,7 @@ Majestic's aim is to be the video player I wish I had.
 - **Seek bar shows what's downloaded** of online videos: parts skipped over are striped.
 - **Tracker music** (MOD, S3M, XM, IT, MPTM and dozens more) through libopenmpt, with its patterns scrolling in the video frame as they play, a pitch shift, and samples that can keep their own speed while the tempo changes.
 - **MIDI music** (MID, RMI, KAR, and DOS games' HMI and XMI songs, played the way their sound engines did) through FluidSynth with a SoundFont from the file's folder or Options, laid out like tracker patterns as it plays.
-- **A Winamp AVS visualizer** for music without a picture: Winamp's Advanced Visualization Studio rebuilt, running Winamp's own presets and any `.avs` preset you add, to the sound you hear. Rate presets with up to five stars and search them by name, author, file name or rating. Presets made on slower computers that play too fast can be slowed down, each to a frame rate of its own.
+- **A visualizer that plays AVS presets** for music without a picture, a callback to the Winamp era: a port of Advanced Visualization Studio 2.81d from the source Nullsoft released under a BSD license in 2005, with the presets that came with it and any `.avs` preset you add, playing to the sound you hear ([links to AVS downloads are here!](AVS.md)). Rate presets with up to five stars and search them by name, author, file name or rating. Presets made on slower computers that play too fast can be slowed down, each to a frame rate of its own.
 - **Animated covers** for music (GIF, APNG and WebP), moving at their own pace, whether the picture is in the file's tags or beside it. A picture named after the song (`song.jpg` beside `song.mp3`) can be shown instead of the folder's `folder.jpg`.
 - **Quick covers**: drop a picture on the video frame, or paste one (a file or a copied image), while music plays (or a video with its video track off) and it shows as the cover, still or animated. Save Quick Cover in the right-click menu brings it back whenever that file opens.
 - **Cue sheets**: an album ripped to one file (FLAC, WAV, APE...) with a .cue beside it shows up in the playlist as its tracks, with their titles, artists and lengths, whether you open the .cue, the audio file or the folder. Sheets naming a .wav that was later compressed to FLAC work too.
@@ -70,7 +70,15 @@ Majestic shows up in the Start menu.
 
 To update a source install, `git pull` and run `./install.sh` again. `./install.sh --uninstall` removes it.
 
-More details in [TECHNICAL.md](TECHNICAL.md).
+## More reading
+
+- [TECHNICAL.md](TECHNICAL.md): install options, building by hand, how the player works inside, the source layout and debugging tips.
+- [AVS.md](AVS.md): where to get the AVS preset packs I rated highest, for the visualizer.
+- [CLAUDE.md](CLAUDE.md): the original brief Majestic was built from (menus, layout and behavior).
+
+## Credits
+
+The AVS visualizer is ported from the source of Advanced Visualization Studio 2.81d that Nullsoft released under a BSD license in 2005 ([visbot/vis_avs](https://github.com/visbot/vis_avs)), with some third-party effects following [grandchild's fork](https://github.com/grandchild/vis_avs) and the Convolution Filter by [Tom Holden](https://github.com/tholden/AVSConvolutionFilter). Their licenses are in [assets/licenses/AVS-Nullsoft-BSD.txt](assets/licenses/AVS-Nullsoft-BSD.txt). Majestic isn't affiliated with or endorsed by Winamp or Nullsoft.
 
 ---
 

@@ -1,3 +1,7 @@
+# Ported from grandchild's fork of AVS (https://github.com/grandchild/vis_avs), Copyright 2005
+# Nullsoft, Inc. and its contributors; Texer II and Picture II by Steven Wittens. The Convolution
+# Filter is also Copyright 2002 Tom Holden. BSD licenses: assets/licenses/AVS-Nullsoft-BSD.txt
+
 ## More third-party APEs, ported from grandchild's BSD port (vis_avs), its
 ## MMX code reproduced byte for byte: Texer II (Acko.net), Texer, Holden's
 ## Convolution Filter, Add Borders (Virtual Effect) and Picture II. Their

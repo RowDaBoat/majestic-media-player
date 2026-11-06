@@ -1,3 +1,6 @@
+# Ported from Advanced Visualization Studio 2.81d, Copyright 2005 Nullsoft, Inc.
+# BSD license: assets/licenses/AVS-Nullsoft-BSD.txt
+
 ## Trans effects: Blitter Feedback, Roto Blitter, Colorfade, Color Clip,
 ## Brightness, Fast Brightness, Invert, Mirror, Interleave (r_blit.cpp,
 ## r_rotblit.cpp, r_colorfade.cpp, r_contrast.cpp, r_bright.cpp,

@@ -1,3 +1,6 @@
+# Ported from Advanced Visualization Studio 2.81d, Copyright 2005 Nullsoft, Inc.
+# BSD license: assets/licenses/AVS-Nullsoft-BSD.txt
+
 ## Trans effects: Grain, Mosaic, Scatter, Unique Tone, Interferences, Dynamic
 ## Shift, Dynamic Distance Modifier (r_grain.cpp, r_mosaic.cpp, r_scat.cpp,
 ## r_onetone.cpp, r_interf.cpp, r_shift.cpp, r_ddm.cpp).

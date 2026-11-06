@@ -1,3 +1,6 @@
+# Ported from Advanced Visualization Studio 2.81d, Copyright 2005 Nullsoft, Inc.
+# BSD license: assets/licenses/AVS-Nullsoft-BSD.txt
+
 ## Render effects: Simple, SuperScope, Dot Plane, Oscilloscope Star, Ring
 ## (r_simple.cpp, r_sscope.cpp, r_dotpln.cpp, r_oscstar.cpp, r_oscring.cpp).
 

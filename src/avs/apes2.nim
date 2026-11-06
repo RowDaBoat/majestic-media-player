@@ -1,3 +1,7 @@
+# Color Map and Multi Filter follow grandchild's fork of AVS (https://github.com/grandchild/vis_avs),
+# Copyright 2005 Nullsoft, Inc. and its contributors; FyrewurX is our own.
+# BSD license: assets/licenses/AVS-Nullsoft-BSD.txt
+
 ## Third-party APEs that late presets lean on, written from their saved
 ## configs and the behaviour grandchild's BSD port (vis_avs) gives them:
 ## Color Map and Jheriko's Multi Filter. And FyrewurX, whose source was never released: our own fireworks

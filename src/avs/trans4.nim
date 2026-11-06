@@ -1,3 +1,6 @@
+# Ported from Advanced Visualization Studio 2.81d, Copyright 2005 Nullsoft, Inc.
+# BSD license: assets/licenses/AVS-Nullsoft-BSD.txt
+
 ## Trans effects: Color Modifier, Water, Water Bump, Bump (r_dcolormod.cpp,
 ## r_water.cpp, r_waterbump.cpp, r_bump.cpp).
 

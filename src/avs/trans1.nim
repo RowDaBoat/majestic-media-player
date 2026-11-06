@@ -1,3 +1,6 @@
+# Ported from Advanced Visualization Studio 2.81d, Copyright 2005 Nullsoft, Inc.
+# BSD license: assets/licenses/AVS-Nullsoft-BSD.txt
+
 ## Trans effects: Fadeout, Blur, Movement, Dynamic Movement
 ## (r_fadeout.cpp, r_blur.cpp, r_trans.cpp, r_dmove.cpp).
 
