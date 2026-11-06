@@ -2,13 +2,16 @@
 
 import gpumem  # first: it picks the GL library before anything loads one
 import std/[os, strutils, strformat, times, math, osproc, unicode, sequtils, algorithm,
-  random, tables, sets, streams, json]
+  random, tables, sets, streams, json, hashes]
 import silky, vmath, bumpy, chroma, pixie, opengl, jsony
 import appimage, mpv, videogl, xwin, config, dialogs, theme, ui, menutree, player, icons, debugscript,
   options, instance, playlists, peers, cmdlines, runlog, mediainfo, inhibit, spherical, keymap, mediactl,
   rectedit, syncdlg, ytdlp, websave, mediasave, mkvtoolnix, updater, ytthumb, ytboard, srv3,
-  netprobe, tracker, trackerchart, modstream
+  netprobe, tracker, trackerchart, modstream, midisong, midistream, midichart, rgscan, tagdlg, avsdlg,
+  avsview, plmanager, cue, animpic
+from coverart import pictures
 from std/uri import encodeUrl, decodeUrl, parseUri, decodeQuery, UriParseError
+when defined(posix): from std/posix import access, W_OK
 
 const
   AppName = "Majestic Media Player"
@@ -43,6 +46,7 @@ const
   PlaylistMinColW = 24'f32  ## narrowest a resized column gets
   PlaylistColumnGrip = 4'f32  ## pixels either side of a column's right edge that resize it
   PlaylistColumnDrag = 4'f32  ## pixels a press moves to drag its column, not sort by it
+  PlaylistRowDrag = 4'f32     ## pixels a press on a row moves to drag the selection
   # An empty sample: a text column, which shares the width the others leave.
   PlaylistFields: array[PlaylistField, tuple[label, sample: string]] = [
     pfName: ("Name", ""),
@@ -56,6 +60,15 @@ const
     pfYear: ("Year", "9999"),
     pfAlbum: ("Album", "")]
   PlaylistGripW = 5'f32     ## draggable left edge of the playlist
+  PlaylistFindH = 30'f32    ## the search bar under the playlist's header (Ctrl+F)
+  PlaylistTabH = 26'f32     ## a row of the playlist tabs
+  PlaylistTabMinW = 44'f32  ## narrowest a tab gets, and widest:
+  PlaylistTabMaxW = 170'f32
+  PlaylistTabRenameW = 150'f32  ## a tab being renamed, at least
+  PlaylistTabDrag = 4'f32   ## pixels a press on a tab moves to drag it
+  PlaylistTabHover = 0.6    ## seconds rows dragged over a tab wait to show it
+  PlaylistSideMinW = 80'f32 ## the side column of playlists, narrowest, and
+  PlaylistSideRest = 120'f32  ## at least what it leaves the entries
   RunLogHeaderH = 28'f32
   RunLogRowH = 18'f32
   RunLogGripH = 5'f32       ## draggable bottom edge of the run log
@@ -73,7 +86,7 @@ const
 type
   Overlay = enum
     ovNone, ovOptions, ovProperties, ovShortcuts, ovAbout, ovRename, ovCommands, ovSync,
-    ovYtdlp, ovEmbed, ovUpdate
+    ovYtdlp, ovEmbed, ovUpdate, ovTags, ovPalette
 
   YtMode = enum
     ymInstall, ymUpdate, ymBusy, ymFailed  ## what the yt-dlp window asks or shows
@@ -84,8 +97,17 @@ type
   EmbedMode = enum
     emAsk, emInstall, emBusy, emFailed  ## what the Embed As MKV Chapters window asks or shows
 
+  PaletteItem = object
+    ## A menu command or submenu as the command palette (F3) lists it.
+    label, shortcut: string
+    path: seq[string]         ## the menus leading to it, from the palette's top
+    kind: MenuKind            ## mkSub: a submenu, which running opens in the palette
+    checked, enabled: bool
+    action: proc ()
+    trail: seq[(string, int)] ## mkSub: label and index of each submenu down to it
+
   ContextMenu = enum
-    cmVideo, cmVideoShift, cmTime, cmStatus, cmSeekBar, cmPlaylist, cmPlaylistColumns, cmRepeat, cmRunLog, cmQuality  ## where the right-click menu was opened
+    cmVideo, cmVideoShift, cmTime, cmStatus, cmSeekBar, cmPlaylist, cmPlaylistTab, cmPlaylistColumns, cmRepeat, cmRunLog, cmQuality, cmReplayGain  ## where the right-click menu was opened
 
   PointerShape = enum
     ptArrow, ptHidden, ptResize, ptResizeV, ptResizeNWSE, ptResizeNESW, ptCross, ptMove,
@@ -144,6 +166,13 @@ type
     alignY: int = 2           ## 0 top, 1 middle, 2 bottom
     offset: Vec2              ## screen pixels, +x right, +y down
     scale: float32 = 1
+
+  GapNext = object
+    ## What mpv goes on to by itself at the end of the file playing.
+    path: string              ## "" for nothing
+    folder: bool              ## the next file in the folder (Play > After playback)
+    tab, i: int               ## else that playlist's (id) entry
+    start: float              ## where it starts (Remember position)
 
   App = ref object
     window: Window
@@ -235,12 +264,39 @@ type
     sfPlainAt: float          ## when it last stepped the plain way
     preview: Preview
     cfg: Config
+    # The playlist shown is in `playlist` and the pl* fields stashTab moves;
+    # the others wait in tabs, the shown one's slot there stale.
+    tabs: seq[PlaylistTab]    ## every playlist, in tab order
+    tabView: int              ## the one shown
+    tabPlaying: int = -1      ## the one playing (next/previous/the end go on in it), -1 none
+    closedTabs: seq[PlaylistTab]  ## closed playlists, the latest last, for Restore
+    queue: seq[tuple[tab: int, path: string, at: int]]  ## the playback queue: playlist id, entry and where it was
+    tabRects: seq[Rect]       ## the tabs as last drawn, and the + button after them
+    tabPlus: Rect
+    tabStrip: Rect
+    tabFrom: tuple[index: int, x: float32, moved: bool]  ## the tab pressed, while "pltab" is active (x is y in the side column)
+    tabScroll: float32        ## the side column of playlists (playlistTabsSide), scrolled
+    tabSeen: int = -1         ## the playlist shown when it was last drawn: another is scrolled into view
+    sideResizeFrom: (float32, float32)  ## pointer x and the side column's width when its edge drag began
+    tabRename: int            ## the id of the playlist being renamed, 0 none
+    tabRenameText: string
+    ctxTab: int = -1          ## the tab right-clicked, -1 for the strip around them
+    rowDragTab: int           ## while "plrow" is active: the id of the playlist the rows are from
+    rowDragPaths: seq[string] ## and those rows
+    rowDragOver: tuple[tab: int, since: float]  ## the tab they're over, and since when
+    plDialogTab: int          ## the id of the playlist Load/Save Playlist was asked from
+    ytListTab: int            ## the id of the playlist a YouTube playlist is listed into
     playlist: seq[string]
     plIndex: int
     plSelected: int
     plMarks: seq[int]         ## the whole selection, sorted, when more than plSelected
     plFocused: bool           ## the playlist was clicked last: it takes its keys
     plArrows: bool            ## clicked and the pointer has not left it since: Up/Down select
+    plFindOpen: bool          ## the playlist's search bar is shown (Ctrl+F)
+    plFind: string            ## its text
+    plFindHits: seq[int]      ## the entries matching it, as of the last frame
+    plFindFrom: int           ## the entry selected when searching began: typing finds from there
+    plFindKeep: bool          ## Enter stepped to a match: the field keeps the keyboard
     plScroll: float32
     plReveal: bool            ## scroll the selected entry into view
     plFollow: bool            ## as plReveal, paging on when it lands on the bottom row
@@ -250,11 +306,19 @@ type
     prober: Prober            ## created on the first sort that needs it
     mediaInfo: Table[string, MediaInfo]  ## probe results, for columns and sorting
     plColumnFrom: tuple[index: int, x: float32, moved: bool]  ## the header pressed, while "plcolumn" is active
-    plWidthFrom: tuple[index: int, x, left, right: float32, filler: int, moved: bool]  ## while "plwidth" is active: the columns beside the edge dragged, and the one left filling the panel
+    plRowFrom: tuple[index: int, y: float32, moved, reselect: bool, at: float]  ## while "plrow" is active: the row pressed, the pointer's y, whether it left the press, whether a click without a drag selects only that row, and when the list last auto-scrolled
+    plWidthFrom: tuple[index: int, x, left, room: float32, filler: int, moved: bool]  ## while "plwidth" is active: the column whose edge is dragged, how far the columns right of it can give way, and the one left filling the panel
     plOverEdge: bool          ## the pointer is on a column header's resizable edge
     plDurSeconds: bool        ## the Duration column in plain seconds: nothing lasts over a minute
     fileSizes: Table[string, int64]      ## -1 for streams and unreadable files
     plResizeFrom: (float32, float32)     ## pointer x and width when the drag began
+    plFile: string            ## the playlist file the playlist was loaded from or saved to, "" for a new one
+    plFileList: seq[string]   ## the entries as last read from or written to plFile
+    plFileWritable: bool      ## plFile can be written (it, or its folder when it's gone)
+    plAutosaveAt: float       ## when the playlist was last checked for changes to autosave
+    plAutosaveFailed: bool    ## the last autosave failed (said on screen once)
+    plAutosaveAsk: bool       ## Save Playlist was asked for by ticking Autosave
+    plOnline: bool            ## playlistOnline, as of the last autosave check
     xf: VideoTransform
     subs: SubLayout
     subsKey: string           ## mpv subtitle placement last pushed
@@ -269,8 +333,11 @@ type
     atlas: SilkyAtlas
     cfgBefore: Config         ## config when Options opened, restored on Cancel
     settingsKey: string       ## player-facing settings last pushed to mpv
+    rgKey: string             ## the ReplayGain settings last pushed to mpv
+    rgRect: Rect              ## the controls' ReplayGain button, as last drawn
     coverSynced: bool         ## the cover settings below were pushed to mpv
-    coverShown: bool          ## and what they were: Show Front Cover
+    coverShown: bool          ## and what they were: Show Front Cover,
+    fileCoverShown: bool      ## Show Front Cover (file)
     coverNames: string        ## Options' folder picture names
     positions: Positions      ## remembered playback positions
     subScales: SubScales      ## remembered subtitle sizes, per file
@@ -300,9 +367,42 @@ type
     thumb: ThumbJob           ## the YouTube link's thumbnail, for while no video track shows
     thumbTex: GLuint          ## it, uploaded
     thumbTexId: string        ## the video id thumbTex holds
+    anim: AnimPic             ## the cover's frames, when it moves (GIF, APNG, WebP): drawn
+                              ## over mpv's still first one (animOn)
+    animKey: string           ## what it was read from (wantedAnim), read or not
+    animOn: bool              ## it shows now
+    animFrame: int            ## its frame due
+    animNext: float           ## when the one after is
+    animTex: GLuint           ## the frame, uploaded
+    animTexFrame: int = -1    ## the frame animTex holds, -1 for none
+    quickCovers: QuickCovers  ## quick covers saved, by file (Save Quick Cover)
+    qcImage: string           ## the quick cover: a picture dropped or pasted on the file
+                              ## playing while it showed none; "" for none
+    qcTrack: string           ## the file mpv shows for it: the picture, or for an
+                              ## animated WebP (FFmpeg can't read one) its first frame
+    qcFor: string             ## the file playing it's on
+    qcPrevVid: string         ## the video track before it ("no" for none): back when hidden
+    qcHooked: tuple[path, image, track: string]  ## the saved one last added as a file opened
+    qcTex: GLuint             ## the quick cover as mpv shows it (screenshotRaw): drawn at once
+    qcTexSize: IVec2          ## on Show Quick Cover, while mpv sets the picture up again
+    qcSnapConfigs: int = -1   ## taking it: the player's videoConfigs when asked (-1: not asked)
+    qcSnapDue: float          ## when it's taken (the picture up a moment), 0 until known
+    qcSnapAsked: float        ## when it was asked for
+    qcBridge: bool            ## drawing qcTex until mpv shows the quick cover again
+    qcBridgeConfigs: int      ## the player's videoConfigs then
+    qcBridgeAt, qcBridgeEnd: float  ## when it started, and ends (0 until mpv's is up)
+    animStash: tuple[key: string, pic: AnimPic]  ## a hidden quick cover's frames, kept
+    qcSeen: bool              ## its track has been in the player's track list
+    qcSetAt: float            ## when it was put on
     chart: TrackerChart       ## the tracker module's chart, in the video frame
     chartDrawn: float         ## when it was last drawn, to pace its scrolling
+    avs: AvsView              ## the visualizer, for sound without a picture (nil until shown)
+    avsArea: Vec2             ## the frame's size it last drew at, in pixels
+    soundBefore: bool         ## the file before was sound without a picture (see soundOnly)
     moduleFor: string         ## the path isModule was checked for
+    midiFont: string          ## the SoundFont the open MIDI file plays with
+    midiError: string         ## why the MIDI file at midiErrorFor didn't play
+    midiErrorFor: string
     moduleIs: bool
     tkOpen: bool              ## the tracker button's panel is shown
     tkButton: Rect            ## the tracker button, where the panel opens from
@@ -355,6 +455,10 @@ type
     savedCfg: string          ## config.json as last written by autosave
     autosaveAt: float         ## when the remembered state was last checked
     instance: InstanceServer  ## receives files from later launches
+    shielded: bool            ## the shield button: later launches don't hand
+                              ## their files here (off in every new player)
+    instanceRetry: float      ## when listening for later launches was last tried
+    scripted: bool            ## run by a debug script: never shares files
     peers: PeerNet            ## other players, for Synchronize
     syncMaster: int           ## pid of our group's master, 0 when not synchronized
     syncMembers: seq[int]     ## the group, master included
@@ -390,6 +494,16 @@ type
     syncWin: Window
     syncSk: Silky
     syncUi: Ui
+    tagDlg: TagDialog         ## the playlist's Properties, its window created on first use
+    avsDlg: AvsDialog         ## Visualizer Preset > Visualizers..., a window of its own
+    avsWin: Window            ## shown beside the player, not over it (like the Equalizer)
+    avsMenus: MenuSystem      ## its context menus (popups of their own, like the main ones)
+    avsMenuOpenedAt: float
+    avsSk: Silky
+    avsUi: Ui
+    tagWin: Window
+    tagSk: Silky
+    tagUi: Ui
     ytJob: YtJob              ## yt-dlp at work: a check, update or install
     ytUrl: string             ## the link it works for
     ytWatch: bool             ## the link being opened goes to yt-dlp if it fails
@@ -415,6 +529,9 @@ type
     recWritten: float         ## rec.stop as last written to the index
     ytSubs: YtJob             ## a saved link's subtitles being downloaded
     saveJob: SaveJob          ## File > Save, while saving
+    rgJob: RgJob              ## the playlist's ReplayGain > Analyze and Apply ..., while measuring
+    rgShown: int              ## its percent as the status bar last drew it
+    rgOpenTagged: bool        ## it tagged the open file, whose values mpv reads on opening
     saveSrc: string           ## the file or link File > Save asked where to save
     ytRetry: string           ## a link to open again at ytRetryAt
     ytRetryAt: float
@@ -481,9 +598,24 @@ type
     frameInset: IVec2         ## content minus frame top-left while decorated (for compact mode)
     ctxMenu: ContextMenu
     ctxShift: bool            ## Shift was held when the right button went down on the video
+    # the command palette (F3)
+    palText: string           ## what's typed; kept for the next time it opens
+    palItems: seq[PaletteItem]  ## the commands found, best first, as last drawn
+    palSel: int               ## the highlighted one, in palItems
+    palSelKey: string         ## its key (paletteKey), to keep it as the list changes
+    palScroll: int            ## first row shown
+    palFollow: bool           ## scroll palSel into view (moved by the keyboard)
+    palRows: int              ## rows shown, for Page Up / Down
+    palPress: int             ## row a click began on, -1: none
+    palTrail: seq[(string, int)]  ## the submenu open in it (PaletteItem.trail), @[]: the top
+    palBack: seq[tuple[trail: seq[(string, int)], text: string]]  ## where opening submenus came from
+    palTextNext: string       ## set after the field this frame (a key going back may edit it)
+    palTextSet: bool
     # mouse interaction with the video frame
     videoPress: bool
     videoPressPos: Vec2
+    ctlPress: bool            ## left button went down on the controls bar's empty part
+    ctlPressPos: Vec2
     rotDrag: bool             ## Alt+Middle drag is turning the frame
     rotPivot: Vec2            ## window pixels the frame turns around
     rotStart: VideoTransform  ## transform when the drag began
@@ -533,6 +665,9 @@ type
     pingPongLast: float       ## its position the pass before, for crossing A or B
     plDir: int = 1            ## ping-pong playlist: the way it goes next
     reopening: bool           ## the file opens again (Player.reopen)
+    gapNext: GapNext          ## gapless: the entry queued in mpv (queueGapless)
+    gapCheckAt: float         ## when to look at what comes next again
+    adopting: bool            ## playIndex: mpv already plays the file (adoptGapless)
     reopenTracks: seq[Track]  ## its added tracks then, to add back
     reopenSel: seq[(string, int)]  ## and the tracks selected
     lastDragSeekAt: float
@@ -575,12 +710,19 @@ proc moduleStreamed(a: App): bool =
   ## The open module plays through modstream, not FFmpeg.
   a.player.source.startsWith("mmpmod://")
 
+proc isMidi(a: App): bool =
+  ## A MIDI file is open, playing through FluidSynth (midistream).
+  a.player.loaded and a.player.source.startsWith("mmpmidi://")
+
 proc isModule(a: App): bool =
   ## A tracker module (MOD, XM, IT...) is open, read by libopenmpt.
   let p = a.player
   if not p.loaded or p.path.contains("://"): return false
   if a.moduleStreamed: return true
   if a.moduleFor != p.path:
+    # Opening another file, mpv may still tell the last one's format (loaded
+    # stays on meanwhile): the answer is kept for the path, so wait for it.
+    if p.opening: return false
     let f = p.h.getStr("file-format")
     if f.len == 0: return false  # not known yet
     a.moduleFor = p.path
@@ -644,6 +786,13 @@ proc chartShown(a: App): bool =
     a.chart.song.path == a.player.path and a.player.loaded and not a.player.stopped and
     not a.player.hasVideo and a.chart.song.marks.len > 0
 
+proc soundOnly(a: App): bool
+proc avsShown(a: App): bool
+proc avsStep(a: App, how: int)
+proc showAvsList(a: App)
+proc addAvs(a: App, paths: seq[string])
+proc avsRateMenu(a: App, m: MenuNode, ids: seq[string])
+
 proc pollTracker(a: App) =
   ## Opens the module's chart, builds it a slice at a time, and paces the
   ## redraws that scroll it while it plays.
@@ -655,10 +804,11 @@ proc pollTracker(a: App) =
   if c.song != nil and (c.song.path != p.path or not p.loaded):
     c.close()
   if c.tried != p.path: c.tried = ""  # another file: this one may be opened again later
-  if not module or not a.cfg.showTrackerChart or p.stopped: return
+  let midi = a.isMidi
+  if not (module or midi) or not a.cfg.showTrackerChart or p.stopped: return
   if c.song == nil and c.tried != p.path:
     c.tried = p.path
-    c.song = openTracker(p.path)
+    c.song = if midi: openMidiChart(openMidi(p.path), a.midiFont) else: openTracker(p.path)
     a.dirtyUntil = max(a.dirtyUntil, now() + 0.1)
   if c.song == nil: return
   if c.song.build(0.004): a.dirtyUntil = max(a.dirtyUntil, now() + 0.02)
@@ -694,7 +844,15 @@ proc osd(a: App, msg: string, secs = 1.5) =
   else:
     a.player.osd(msg, secs)
 
-proc fileTitle(path: string): string = path.extractFilename
+proc fileTitle(path: string): string =
+  ## The file's name, or a cue track's title.
+  let t = path.cueTitle
+  if t.len > 0: t else: path.extractFilename
+
+proc entryExists(path: string): bool =
+  ## A playlist entry that still plays: a link, a file there, a cue track
+  ## whose sheet and audio file are there.
+  path.contains("://") or fileExists(path) or path.cueEntryExists
 
 proc bottomHeight(a: App): float32 =
   (if a.cfg.showSeekBar: SeekBarHeight else: 0) +
@@ -715,6 +873,23 @@ proc px(a: App, v: IVec2): IVec2 =
 proc px(a: App, r: Rect): Rect =
   let s = a.sk.uiScale
   rect(r.x * s, r.y * s, r.w * s, r.h * s)
+
+proc avsWinSize(a: App): IVec2 =
+  ## The Visualizers window's size in UI units: as last resized, else AvsSize.
+  let c = a.cfg
+  if c.avsWindowW >= AvsMinSize.x and c.avsWindowH >= AvsMinSize.y:
+    ivec2(c.avsWindowW.int32, c.avsWindowH.int32)
+  else: AvsSize
+
+proc rememberAvsWinSize(a: App): bool =
+  ## Keeps the open Visualizers window's size in the config for next time,
+  ## in UI units; true when it changed (the config is left to be saved).
+  if a.avsWin == nil or not a.avsWin.visible: return
+  let s = a.avsWin.size.vec2 / a.sk.uiScale
+  let (w, h) = (int(round(s.x)), int(round(s.y)))
+  if w < AvsMinSize.x or h < AvsMinSize.y or a.avsWinSize == ivec2(w.int32, h.int32): return
+  (a.cfg.avsWindowW, a.cfg.avsWindowH) = (w, h)
+  true
 
 proc minWindow(a: App): IVec2 =
   if a.cfg.compactMode: MinCompactWindow else: a.px(MinWindow)
@@ -747,7 +922,7 @@ proc videoAspect(a: App): float =
 proc glyphSet(): seq[string] =
   result = AsciiGlyphs
   for cp in 0xA0 .. 0x17F: result.add $Rune(cp)
-  for s in ["…", "–", "—", "•", "‘", "’", "“", "”", "→", "←", "×", "°", "·", "▸"]:
+  for s in ["…", "–", "—", "•", "‘", "’", "“", "”", "→", "←", "×", "°", "·", "▸", "›", "‹"]:
     result.add s
 
 proc buildAtlas(scale: float32): (Image, SilkyAtlas) =
@@ -998,11 +1173,13 @@ proc clampTime(a: App, t: float): float =
 proc loopReady(a: App): bool =
   a.hasLoopA and a.hasLoopB and a.loopB > a.loopA
 
+proc playingCount(a: App): int
+
 proc pingPongFile(a: App): bool =
   ## Repeat > Ping-Pong on a file repeating forever: back and forth through
   ## it. Not in a synchronize group, whose clock only runs forward.
   a.cfg.repeatPingPong and a.cfg.repeatForever and not a.synced and
-    (a.cfg.repeatMode == rmFile or a.playlist.len <= 1)
+    (a.cfg.repeatMode == rmFile or a.playingCount <= 1)
 
 proc pingPongAb(a: App): bool =
   ## Repeat > Ping-Pong on the A-B loop: back and forth between A and B.
@@ -1013,6 +1190,21 @@ proc applyLoop(a: App) =
     if a.cfg.repeatForever and a.cfg.repeatMode == rmFile and not a.pingPongFile: "inf"
     else: "no")
 
+proc repeatOsd(a: App) =
+  ## Names the repeat now set: what repeats, and whether it goes back and forth.
+  if not a.cfg.repeatForever:
+    a.osd("Repeat off")
+    return
+  var msg = "Repeat: " & (if a.cfg.repeatMode == rmFile: "File" else: "Playlist")
+  if a.cfg.repeatPingPong: msg.add " (ping-pong)"
+  a.osd(msg)
+
+proc toggleRepeat(a: App) =
+  ## Repeat > Enabled and the Controls menu's Repeat.
+  a.cfg.repeatForever = not a.cfg.repeatForever
+  a.applyLoop()
+  a.repeatOsd()
+
 proc applyAbLoop(a: App) =
   a.sbPlayingB = NaN  # seamless loops: set again from this
   if a.isSlave:  # the master's loop rules; following sets it
@@ -1021,6 +1213,26 @@ proc applyAbLoop(a: App) =
   let on = a.abLoop and a.loopReady and not a.pingPongAb
   for (prop, t) in [("ab-loop-a", a.loopA), ("ab-loop-b", a.loopB)]:
     if on: a.player.h.setProp(prop, t) else: a.player.h.setProp(prop, "no")
+
+proc cycleLoop(a: App) =
+  ## The loop button: off, then Repeat, then Loop A-B (when both marks are
+  ## set), then back to off. Leaving the A-B loop keeps its marks.
+  if a.abLoop and a.loopReady:
+    a.abLoop = false
+    a.cfg.repeatForever = false
+  elif a.cfg.repeatForever:
+    a.cfg.repeatForever = false
+    if a.loopReady: a.abLoop = true
+  else:
+    a.cfg.repeatForever = true
+  a.applyLoop()
+  a.applyAbLoop()
+  if a.abLoop and a.loopReady:
+    var msg = "Loop A-B"
+    if a.cfg.repeatPingPong: msg.add " (ping-pong)"
+    a.osd(msg)
+  else:
+    a.repeatOsd()
 
 proc clearLoopMarks(a: App) =
   a.hasLoopA = false
@@ -1060,10 +1272,36 @@ proc savePosition(a: App) =
     a.positions.del(p.path)
   a.positions.save()
 
-proc listedLinks(a: App): seq[string] =
-  ## The playlist's YouTube links fully listed: their videos are its entries,
-  ## not to be added again next run.
-  a.playlist.filterIt(it in a.ytListed and not (a.ytList.running and a.ytList.url == it))
+proc fileWritable(path: string): bool =
+  ## Whether the file can be written: the file, or its folder when it's gone.
+  if not fileExists(path):
+    let dir = path.parentDir
+    if not dirExists(dir): return false
+    when defined(posix): return access(dir.cstring, W_OK) == 0
+    else: return true
+  when defined(posix): access(path.cstring, W_OK) == 0
+  else:
+    try: fpUserWrite in getFilePermissions(path) except OSError: false
+
+proc bindPlaylist(a: App, path: string) =
+  ## The playlist is now the one in this file ("" for a new playlist, kept in
+  ## no file): Autosave writes its changes there.
+  a.plFile = if path.len > 0: path.absolutePath else: ""
+  a.plFileList = a.playlist
+  a.plFileWritable = a.plFile.len > 0 and a.plFile.fileWritable
+  a.plAutosaveFailed = false
+
+proc playlistAutosaves(a: App): bool =
+  a.plFile.len > 0 and a.plFile in a.cfg.playlistAutosave
+
+proc listedLinks(a: App, entries: seq[string]): seq[string] =
+  ## The YouTube links among entries fully listed: their videos are entries
+  ## too, not to be added again next run.
+  entries.filterIt(it in a.ytListed and not (a.ytList.running and a.ytList.url == it))
+
+proc listedLinks(a: App): seq[string] = a.listedLinks(a.playlist)
+
+proc savePlaylistStore(a: App)
 
 proc rememberState(a: App) =
   ## Copies the state kept between runs (volume, window, pan/rotate/scale,
@@ -1076,17 +1314,14 @@ proc rememberState(a: App) =
     let (pos, size) = (a.window.framePos, a.window.size)
     (a.cfg.windowX, a.cfg.windowY, a.cfg.windowW, a.cfg.windowH) =
       (pos.x.int, pos.y.int, size.x.int, size.y.int)
-  if a.cfg.rememberPlaylist:
-    a.cfg.playlist = a.playlist
-    a.cfg.playlistIndex = if a.plIndex >= 0: a.plIndex else: a.plSelected
-    a.cfg.playlistTitles.clear()
-    for f in a.playlist:
-      if f in a.linkTitles: a.cfg.playlistTitles[f] = a.linkTitles[f]
-    a.cfg.playlistListed = a.listedLinks
-  else:
-    (a.cfg.playlist, a.cfg.playlistIndex) = (newSeq[string](), -1)
-    a.cfg.playlistTitles.clear()
-    a.cfg.playlistListed.setLen 0
+  discard a.rememberAvsWinSize()
+  # The playlists go to playlists.json, all of them (Remember playlist is
+  # about the Default one, at start); the config's playlist was older versions'.
+  a.savePlaylistStore()
+  (a.cfg.playlist, a.cfg.playlistIndex) = (newSeq[string](), -1)
+  a.cfg.playlistTitles.clear()
+  a.cfg.playlistListed.setLen 0
+  a.cfg.playlistFile = ""
   discard a.cfg.reloadRecent()  # another player's changes
   proc titles(a: App): Table[string, string] =
     for r in a.cfg.recentFiles:
@@ -1319,6 +1554,415 @@ proc plSelection(a: App): seq[int] =
 proc plIsSelected(a: App, i: int): bool =
   if a.plMarks.len == 0: i == a.plSelected else: a.plMarks.binarySearch(i) >= 0
 
+# --- playlists (tabs) ---------------------------------------------------------
+
+proc autosavePlaylist(a: App, force = false)
+proc playIndex(a: App, i: int, start = -1.0)
+
+proc stashTab(a: App) =
+  ## The shown playlist's live fields go back into its tab, left empty.
+  let t = addr a.tabs[a.tabView]
+  t.entries = move a.playlist
+  t.index = a.plIndex
+  t.selected = a.plSelected
+  t.marks = move a.plMarks
+  t.scroll = a.plScroll
+  t.reveal = a.plReveal
+  t.follow = a.plFollow
+  t.file = a.plFile
+  t.fileList = move a.plFileList
+  t.fileWritable = a.plFileWritable
+  t.autosaveFailed = a.plAutosaveFailed
+  t.online = a.plOnline
+  t.dir = a.plDir
+
+proc unstashTab(a: App, i: int) =
+  ## Tab i's playlist into the live fields, as the one shown. Only the
+  ## playing playlist has an entry playing.
+  a.tabView = i
+  let t = addr a.tabs[i]
+  a.playlist = move t.entries
+  a.plIndex = if i == a.tabPlaying: t.index else: -1
+  a.plSelected = t.selected
+  a.plMarks = move t.marks
+  a.plScroll = t.scroll
+  a.plReveal = t.reveal
+  a.plFollow = t.follow
+  a.plFile = t.file
+  a.plFileList = move t.fileList
+  a.plFileWritable = t.fileWritable
+  a.plAutosaveFailed = t.autosaveFailed
+  a.plOnline = t.online
+  a.plDir = t.dir
+
+template inTab(a: App, i: int, body: untyped) =
+  ## Runs body on tab i's playlist as if it were shown (the playlist fields
+  ## hold it), then shows the one that was; its Autosave sees the changes.
+  block:
+    let shownTab = a.tabView
+    let target = i
+    if target == shownTab:
+      body
+    elif target in 0 ..< a.tabs.len:
+      a.stashTab()
+      a.unstashTab(target)
+      try:
+        body
+      finally:
+        a.autosavePlaylist(force = true)
+        a.stashTab()
+        a.unstashTab(shownTab)
+
+template inPlaying(a: App, body: untyped) =
+  ## Body on the playing playlist: next, previous and the end of a file go
+  ## on there, whichever is shown. With none playing, the one shown.
+  a.inTab((if a.tabPlaying in 0 ..< a.tabs.len: a.tabPlaying else: a.tabView), body)
+
+proc tabAt(a: App, id: int): int =
+  ## The tab of the playlist with that id, -1 when it's gone.
+  result = -1
+  for i, t in a.tabs:
+    if t.id == id: return i
+
+proc shownId(a: App): int = a.tabs[a.tabView].id
+
+proc tabEntries(a: App, i: int): seq[string] =
+  ## A copy of playlist i's entries.
+  if i == a.tabView: a.playlist else: a.tabs[i].entries
+
+proc tabLen(a: App, i: int): int =
+  if i == a.tabView: a.playlist.len else: a.tabs[i].entries.len
+
+proc playingEntry(a: App): string =
+  ## The playlist entry playing ("" for none), whichever playlist is shown.
+  if a.tabPlaying == a.tabView:
+    if a.plIndex in 0 ..< a.playlist.len: return a.playlist[a.plIndex]
+  elif a.tabPlaying in 0 ..< a.tabs.len:
+    let t = addr a.tabs[a.tabPlaying]
+    if t.index in 0 ..< t.entries.len: return t.entries[t.index]
+
+proc playingCount(a: App): int =
+  ## Entries in the playing playlist (the shown one when none plays).
+  if a.tabPlaying in 0 ..< a.tabs.len: a.tabLen(a.tabPlaying) else: a.playlist.len
+
+proc playingIndex(a: App): int =
+  ## The entry playing in it, -1 for none.
+  if a.tabPlaying in 0 ..< a.tabs.len and a.tabPlaying != a.tabView: a.tabs[a.tabPlaying].index
+  else: a.plIndex
+
+proc claimPlaying(a: App) =
+  ## The shown playlist plays from now on; the one that did has no entry playing.
+  if a.tabPlaying != a.tabView and a.tabPlaying in 0 ..< a.tabs.len:
+    a.tabs[a.tabPlaying].index = -1
+  a.tabPlaying = a.tabView
+
+proc undoPoint(a: App, label: string) =
+  ## The shown playlist as it is, for Undo to bring back; called just
+  ## before an edit. Redo's steps are gone.
+  let t = addr a.tabs[a.tabView]
+  t.undo.add UndoStep(label: label, entries: a.playlist, selected: a.plSelected, marks: a.plMarks)
+  t.undo.trimUndo()
+  t.redo.setLen 0
+
+proc restoreStep(a: App, s: UndoStep) =
+  ## The shown playlist as an undo step has it. The entry playing stays the
+  ## playing one where it's still in the list.
+  let playing = if a.plIndex in 0 ..< a.playlist.len: a.playlist[a.plIndex] else: ""
+  let was = a.plIndex
+  a.playlist = s.entries
+  a.plIndex =
+    if playing.len == 0: -1
+    elif was in 0 ..< a.playlist.len and a.playlist[was] == playing: was
+    else: a.playlist.find(playing)
+  a.plSelected = if s.selected in 0 ..< a.playlist.len: s.selected else: -1
+  a.plMarks = if a.plSelected >= 0: s.marks.filterIt(it < a.playlist.len) else: @[]
+  a.plReveal = true
+
+proc undoRedo(a: App, redo: bool) =
+  ## Ctrl+Z / Ctrl+Y: the shown playlist one edit back, or forward again.
+  if a.editLocked: return
+  let t = addr a.tabs[a.tabView]
+  if (if redo: t.redo.len else: t.undo.len) == 0:
+    a.osd(if redo: "Nothing to redo" else: "Nothing to undo")
+    return
+  let s = if redo: t.redo.pop() else: t.undo.pop()
+  let cur = UndoStep(label: s.label, entries: a.playlist, selected: a.plSelected, marks: a.plMarks)
+  if redo: t.undo.add cur else: t.redo.add cur
+  a.restoreStep(s)
+  a.osd((if redo: "Redo: " else: "Undo: ") & s.label)
+
+proc countLabel(n: int, what = "item"): string =
+  if n == 1: "1 " & what else: $n & " " & what & "s"
+
+proc tabNames(a: App): seq[string] = a.tabs.mapIt(it.name)
+
+proc insertTab(a: App, t: PlaylistTab, at: int): int =
+  ## Puts the tab at `at` (the end when out of range); the shown and playing
+  ## ones stay what they were. Returns where it went.
+  result = if at in 0 .. a.tabs.len: at else: a.tabs.len
+  a.tabs.insert(t, result)
+  if a.tabView >= result: inc a.tabView
+  if a.tabPlaying >= result: inc a.tabPlaying
+
+proc showTab(a: App, i: int) =
+  ## Shows playlist i; playback goes on in the one playing.
+  if i == a.tabView or i notin 0 ..< a.tabs.len or a.playlistLocked: return
+  a.stashTab()
+  a.unstashTab(i)
+  a.tabRename = 0
+  if a.ui.focusId == "pl-tabname": a.ui.focusId = ""
+  a.plFindHits.setLen 0
+  a.plFindFrom = max(0, a.plSelected)
+  a.plArrows = false
+  a.dirtyUntil = max(a.dirtyUntil, now() + 0.1)
+
+proc newPlaylist(a: App, name = "", entries: seq[string] = @[], show = true): int =
+  ## A playlist after the others; returns its tab.
+  var t = newTab(a.tabNames.uniqueName(if name.len > 0: name else: NewName))
+  t.entries = entries
+  result = a.insertTab(t, -1)
+  if show: a.showTab(result)
+
+proc scratchTab(a: App): int =
+  ## The Default playlist, where opened files go: made when there's none.
+  for i, t in a.tabs:
+    if t.scratch: return i
+  a.insertTab(newTab(a.tabNames.uniqueName(DefaultName), scratch = true), -1)
+
+proc closeTab(a: App, i: int) =
+  ## Closes playlist i, kept for Restore; its file, if any, stays as it is.
+  ## The last one leaves an empty Default playlist. What plays goes on.
+  if i notin 0 ..< a.tabs.len or a.editLocked: return
+  a.autosavePlaylist(force = true)  # the shown one's last change
+  a.stashTab()                      # every tab holds its own from here
+  let viewId = a.shownId
+  var t = a.tabs[i]
+  t.closedAt = i  # its index stays: restored while its file still plays, it's the playing one again
+  a.closedTabs.add t
+  if a.closedTabs.len > ClosedKept: a.closedTabs.delete(0)
+  a.queue.keepItIf(it.tab != t.id)
+  let playId = if a.tabPlaying in 0 ..< a.tabs.len and a.tabPlaying != i: a.tabs[a.tabPlaying].id else: 0
+  a.tabs.delete(i)
+  if a.tabs.len == 0: a.tabs.add newTab(DefaultName, scratch = true)
+  a.tabPlaying = if playId != 0: a.tabAt(playId) else: -1
+  let v = if viewId == t.id: min(i, a.tabs.high) else: a.tabAt(viewId)
+  a.unstashTab(v)
+  a.tabRename = 0
+  a.plFindHits.setLen 0
+  a.osd("Closed " & t.name & " (" & countLabel(t.entries.len) & ")")
+
+proc restoreTab(a: App) =
+  ## Brings back the playlist closed last, where it was, and shows it. The
+  ## empty Default playlist closing the last one left goes.
+  if a.closedTabs.len == 0 or a.editLocked: return
+  var t = a.closedTabs.pop()
+  # It was playing, and nothing has played from a playlist since: it is again.
+  let playing = t.index in 0 ..< t.entries.len and a.tabPlaying < 0 and a.player.loaded
+  if not playing: t.index = -1
+  if a.tabs.len == 1 and a.tabs[0].scratch and a.playlist.len == 0 and a.tabPlaying != 0 and
+     a.tabs[0].undo.len == 0:  # the one tab, not playing
+    a.stashTab()
+    a.tabs.setLen 0
+    a.tabs.add t
+    a.tabPlaying = if playing: 0 else: -1
+    a.unstashTab(0)
+  else:
+    if t.scratch and a.tabs.anyIt(it.scratch): t.scratch = false  # one Default
+    if t.name in a.tabNames: t.name = a.tabNames.uniqueName(t.name)
+    let at = a.insertTab(t, t.closedAt)
+    if playing: a.tabPlaying = at
+    a.showTab(at)
+  a.osd("Restored " & t.name)
+
+proc moveTab(a: App, src, dst: int) =
+  ## Tab src to position dst (before the tab there now; tabs.len for last).
+  if src notin 0 ..< a.tabs.len or dst == src or dst == src + 1: return
+  let viewId = a.shownId
+  let playId = if a.tabPlaying in 0 ..< a.tabs.len: a.tabs[a.tabPlaying].id else: 0
+  let t = a.tabs[src]
+  a.tabs.delete(src)
+  a.tabs.insert(t, if dst > src: dst - 1 else: dst)
+  a.tabView = a.tabAt(viewId)
+  a.tabPlaying = if playId != 0: a.tabAt(playId) else: -1
+
+proc renameTab(a: App, i: int, name: string) =
+  ## Renamed, the Default playlist is the user's own: files opened go to a new Default.
+  let n = name.strip
+  if i notin 0 ..< a.tabs.len or n.len == 0 or n == a.tabs[i].name: return
+  a.tabs[i].name = a.tabs.filterIt(it.id != a.tabs[i].id).mapIt(it.name).uniqueName(n)
+  a.tabs[i].scratch = false
+
+proc startRename(a: App, i: int) =
+  if i notin 0 ..< a.tabs.len or a.playlistLocked: return
+  a.showTab(i)
+  a.tabRename = a.tabs[i].id
+  a.tabRenameText = a.tabs[i].name
+  a.ui.focusId = "pl-tabname"
+  a.ui.focusFresh = true
+  a.dirtyUntil = max(a.dirtyUntil, now() + 0.1)
+
+proc duplicateTab(a: App, i: int) =
+  if i notin 0 ..< a.tabs.len or a.editLocked: return
+  var t = newTab(a.tabNames.uniqueName(a.tabs[i].name))
+  t.entries = a.tabEntries(i)
+  (t.columns, t.columnWidths) = (a.tabs[i].columns, a.tabs[i].columnWidths)
+  a.showTab(a.insertTab(t, i + 1))
+
+proc ownColumns(a: App): bool =
+  ## The shown playlist has columns of its own ("Override columns for this playlist").
+  a.tabView in 0 ..< a.tabs.len and a.tabs[a.tabView].columns.len > 0
+
+proc plColumns(a: App): var seq[PlaylistField] =
+  ## The shown playlist's columns, left to right: its own, else the config's.
+  if a.ownColumns: return a.tabs[a.tabView].columns
+  a.cfg.playlistColumns
+
+proc plColumnWidths(a: App): var Table[string, float] =
+  ## And their widths resized by hand, by field name.
+  if a.ownColumns: return a.tabs[a.tabView].columnWidths
+  a.cfg.playlistColumnWidths
+
+proc saveColumns(a: App) =
+  ## The shown columns changed: saved where they're kept.
+  if a.ownColumns: a.savePlaylistStore() else: a.cfg.save()
+
+proc stepTab(a: App, step: int) =
+  ## Ctrl+Tab / Ctrl+Shift+Tab: the next or previous playlist, round the end.
+  if a.tabs.len > 1: a.showTab((a.tabView + step + a.tabs.len) mod a.tabs.len)
+
+proc sortTabs(a: App) =
+  ## The tabs in name order.
+  let viewId = a.shownId
+  let playId = if a.tabPlaying in 0 ..< a.tabs.len: a.tabs[a.tabPlaying].id else: 0
+  a.tabs.sort(proc (x, y: PlaylistTab): int = naturalCmp(x.name.toLower, y.name.toLower))
+  a.tabView = a.tabAt(viewId)
+  a.tabPlaying = if playId != 0: a.tabAt(playId) else: -1
+
+proc showPlaying(a: App) =
+  ## The playing playlist, its entry playing selected and in view.
+  if a.tabPlaying in 0 ..< a.tabs.len: a.showTab(a.tabPlaying)
+  if a.tabPlaying == a.tabView and a.plIndex in 0 ..< a.playlist.len:
+    a.selectOnly(a.plIndex)
+    a.plReveal = true
+
+# --- the playback queue --------------------------------------------------------
+
+proc queuePositions(a: App, i: int): seq[int] =
+  ## Every place the shown playlist's entry i has in the queue, from 1; empty
+  ## when it has none. An entry queued again is in it once more each time.
+  if a.queue.len == 0: return
+  let id = a.shownId
+  let p = a.playlist[i]
+  for k, q in a.queue:
+    if q.tab == id and q.path == p: result.add k + 1
+
+proc queuePos(a: App, i: int): int =
+  ## Where the shown playlist's entry i is first in the queue, from 1; 0 when not.
+  let ps = a.queuePositions(i)
+  if ps.len > 0: ps[0] else: 0
+
+proc queueSelected(a: App) =
+  ## The selection, in order, at the end of the queue: it plays next.
+  if a.editLocked: return
+  let sel = a.plSelection
+  if sel.len == 0: return
+  let id = a.shownId
+  for i in sel: a.queue.add (id, a.playlist[i], i)
+  a.osd(&"Queued {countLabel(sel.len)} ({a.queue.len} in the queue)")
+
+proc unqueueSelected(a: App) =
+  ## Takes the selection out of the queue, every time it was queued.
+  let id = a.shownId
+  let paths = a.plSelection.mapIt(a.playlist[it])
+  let was = a.queue.len
+  a.queue.keepItIf(not (it.tab == id and it.path in paths))
+  if a.queue.len < was:
+    a.osd(&"Unqueued {countLabel(was - a.queue.len)} ({a.queue.len} in the queue)")
+
+proc playQueued(a: App): bool =
+  ## Plays the first entry in the queue still there, in its own playlist;
+  ## false when the queue has none.
+  while a.queue.len > 0:
+    let q = a.queue[0]
+    a.queue.delete(0)
+    let ti = a.tabAt(q.tab)
+    if ti < 0: continue
+    var found = false
+    a.inTab(ti):
+      let j = if q.at in 0 ..< a.playlist.len and a.playlist[q.at] == q.path: q.at
+              else: a.playlist.find(q.path)
+      if j >= 0:
+        found = true
+        a.playIndex(j)
+    if found: return true
+
+# --- playlists.json --------------------------------------------------------------
+
+proc playlistStore(a: App): PlaylistStore =
+  ## Every playlist as saved: entries, selection, file, and the entry playing.
+  for i, t in a.tabs:
+    let shown = i == a.tabView
+    let entries = if shown: a.playlist else: t.entries
+    let index = if i != a.tabPlaying: -1 elif shown: a.plIndex else: t.index
+    var sp = t.toSaved(entries, index, if shown: a.plSelected else: t.selected)
+    if shown: sp.file = a.plFile
+    for e in entries:
+      if e in a.linkTitles: result.titles[e] = a.linkTitles[e]
+    for l in a.listedLinks(entries):
+      if l notin result.listed: result.listed.add l
+    result.playlists.add sp
+  result.shown = a.shownId
+  result.playing = if a.tabPlaying in 0 ..< a.tabs.len: a.tabs[a.tabPlaying].id else: 0
+
+proc savePlaylistStore(a: App) = savePlaylists(a.playlistStore)
+
+proc loadTabs(a: App) =
+  ## The playlists as playlists.json has them, or older versions' one
+  ## playlist as Default; shown is the one that was playing (its entry
+  ## selected, for Play to start), else the one that was shown. With
+  ## Remember playlist off, Default starts empty.
+  let c = a.cfg
+  let (ok, st) = loadPlaylists()
+  a.tabs.setLen 0
+  var playing = 0
+  if ok:
+    for sp in st.playlists:
+      var t = sp.toTab
+      t.file = sp.file
+      if sp.index in 0 ..< t.entries.len: (t.selected, playing) = (sp.index, sp.id)
+      a.tabs.add t
+    for k, v in st.titles: a.linkTitles[k] = v
+    for l in st.listed: a.ytListed.incl l
+  else:
+    var t = newTab(DefaultName, scratch = true)
+    if c.rememberPlaylist:
+      t.entries = c.playlist
+      t.file = c.playlistFile
+      if c.playlistIndex in 0 ..< c.playlist.len: t.selected = c.playlistIndex
+      for k, v in c.playlistTitles: a.linkTitles[k] = v
+      for l in c.playlistListed: a.ytListed.incl l
+    a.tabs.add t
+  if not a.tabs.anyIt(it.scratch): a.tabs.add newTab(a.tabNames.uniqueName(DefaultName), scratch = true)
+  for t in a.tabs.mitems:
+    if t.scratch:
+      if not c.rememberPlaylist: (t.entries, t.file, t.selected) = (newSeq[string](), "", -1)
+      else:
+        # Gone files leave Default, as they did the one playlist; a playlist
+        # of the user's own keeps them (Remove Dead Items takes them out).
+        let sel = if t.selected in 0 ..< t.entries.len: t.entries[t.selected] else: ""
+        t.entries = t.entries.filterIt(it.entryExists)
+        t.selected = if sel.len > 0: t.entries.find(sel) else: -1
+        if t.selected < 0 and t.entries.len > 0: t.selected = 0
+    t.fileList = t.entries  # bound to its file as it was
+    t.fileWritable = t.file.len > 0 and t.file.fileWritable
+  var shown = 0
+  for i, t in a.tabs:
+    if t.id == st.shown: shown = i
+  for i, t in a.tabs:
+    if c.rememberPlaylist and playing != 0 and t.id == playing: shown = i
+  a.tabPlaying = -1
+  a.unstashTab(shown)
+
 proc listYoutube(a: App, i: int): bool =
   ## Entry i is a YouTube playlist's link, or a video's with its list= id, not
   ## listed yet: the playlist's videos are looked up, joining around it as
@@ -1340,6 +1984,7 @@ proc listYoutube(a: App, i: int): bool =
   a.ytListed.incl link
   if a.ytList.running: a.ytList.stop()
   a.ytList = playlistItems(exe, link, a.ytCookies.getOrDefault(link))
+  a.ytListTab = a.shownId
   a.ytListUsed = 0
   a.ytListLast = ""
   if result:
@@ -1349,8 +1994,9 @@ proc listYoutube(a: App, i: int): bool =
 proc playIndex(a: App, i: int, start = -1.0) =
   ## Plays entry i from `start`, or from where it was left off when negative.
   if i < 0 or i >= a.playlist.len: return
+  a.claimPlaying()
   if a.listYoutube(i): return
-  a.savePosition()
+  if not a.adopting: a.savePosition()
   a.plIndex = i
   if a.cfg.playlistCursorFollows:
     a.selectOnly(i)
@@ -1381,11 +2027,32 @@ proc playIndex(a: App, i: int, start = -1.0) =
   let s = a.savedIn(path)
   let at = if a.resumedAt > 0 or not path.isWebLink: a.resumedAt else: path.linkStart
   let part = s.chainAt(at)
-  if path.isWebLink and part.stop > part.start and
+  if a.adopting: discard  # mpv went on to it by itself, gapless
+  elif path.isWebLink and part.stop > part.start and
      (s.complete or part.stop - at >= SavedMin):
     a.playSaved(path, at, part)
   elif path.isWebLink:
     a.streamLink(path, a.resumedAt, a.streamOpts(path).join(","))
+  elif path.isMidiPath:
+    # mpv has no synthesizer: FluidSynth plays it, with a SoundFont.
+    a.ytWatch = false
+    a.midiFont = soundFontFor(path, a.cfg.soundFont)
+    let url = if a.midiFont.len > 0: midistream.prepare(path, a.midiFont) else: ""
+    a.midiErrorFor = path
+    a.midiError =
+      if url.len > 0: ""
+      elif not midistream.available(): "MIDI needs FluidSynth (libfluidsynth), not found"
+      elif a.midiFont.len == 0: "no SoundFont: put a .sf2 in its folder or set one in Options > Audio Files"
+      else: "not a MIDI file it can read"
+    if a.midiError.len > 0: a.osd("Couldn't play it: " & a.midiError, OsdError)
+    # Without one, a stream that fails to open: FFmpeg would otherwise play
+    # it with libmodplug's own instruments (or none).
+    a.player.load(path, a.resumedAt, false, source = if url.len > 0: url else: "mmpmidi://0")
+  elif path.isCueEntry:
+    # Its stretch of the album's file, as a file of its own.
+    a.ytWatch = false
+    a.player.load(path, a.resumedAt, a.cfg.repeatPingPong,
+      opts = "force-media-title=" & quoted(path.fileTitle), source = path.cueSource)
   else:
     a.ytWatch = false
     a.player.load(path, a.resumedAt, a.cfg.repeatPingPong and not path.contains("://"))
@@ -1395,36 +2062,54 @@ proc playIndex(a: App, i: int, start = -1.0) =
   a.updateTitle()
 
 proc expandPaths(paths: seq[string]): seq[string] =
-  ## Files and URLs as given; directories become their media files.
+  ## Files and URLs as given; directories become their media files. An album
+  ## in one file with a cue sheet beside it becomes its tracks, as does the
+  ## sheet itself.
+  var files: seq[string]
   for p in paths:
-    if dirExists(p): result.add mediaFilesIn(p, isMediaFile)
-    elif p.contains("://"): result.add p.withoutTracking
-    elif fileExists(p): result.add p
+    if dirExists(p): files.add mediaFilesIn(p, isMediaFile)
+    elif p.contains("://"): files.add p.withoutTracking
+    elif fileExists(p) or p.cueEntryExists: files.add p
+  withCueTracks(files)
 
 proc openPaths(a: App, paths: seq[string]) =
   if a.editLocked: return
-  let files = expandPaths(paths)
+  # A cue track (from Open Recent) opens its album, playing from that track.
+  let track = if paths.len == 1 and paths[0].isCueEntry: paths[0] else: ""
+  let tracks = if track.len > 0: track.cueTrack.sheet.entries else: @[]
+  let files = if tracks.len > 0 and track in tracks: tracks else: expandPaths(paths)
   if files.len == 0:
     a.osd("Nothing playable found")
     return
+  # Into the Default playlist, so another one isn't replaced (Undo brings
+  # back what Default held).
+  a.showTab(a.scratchTab)
+  if a.playlist.len > 0: a.undoPoint("Open " & countLabel(files.len, "file"))
   a.playlist = files
+  a.bindPlaylist("")
   for f in files: a.ytListed.excl f  # opened anew: its videos aren't in here
   a.plScroll = 0
-  a.playIndex(0)
+  a.selectOnly(-1)
+  a.playIndex(max(files.find(track), 0))
 
 proc saveResume(a: App) =
-  ## What the player is doing, for it to restart into an update with.
+  ## What the player is doing, for it to restart into an update with: the
+  ## playing playlist's part (the playlists themselves are in playlists.json).
   let p = a.player
-  var r = ResumeState(playlist: a.playlist, index: (if p.loaded: a.plIndex else: -1),
-    selected: a.plSelected, time: p.timePos, paused: p.paused, stopped: p.stopped,
-    speed: p.speed, aid: p.selectedTrack("audio"), sid: p.selectedTrack("sub"),
-    vid: p.selectedTrack("video"), loopA: a.loopA, loopB: a.loopB,
-    hasLoopA: a.hasLoopA, hasLoopB: a.hasLoopB, abLoop: a.abLoop,
-    windowX: a.cfg.windowX, windowY: a.cfg.windowY, windowW: a.cfg.windowW,
-    windowH: a.cfg.windowH, maximized: a.window.maximized, fullscreen: a.fullscreen,
-    transform: a.cfg.transform, listed: a.listedLinks)
-  for f in a.playlist:
-    if f in a.linkTitles: r.titles[f] = a.linkTitles[f]
+  let shown = a.shownId
+  var r: ResumeState
+  a.inPlaying:
+    r = ResumeState(playlist: a.playlist, index: (if p.loaded: a.plIndex else: -1),
+      selected: a.plSelected, time: p.timePos, paused: p.paused, stopped: p.stopped,
+      speed: p.speed, aid: p.selectedTrack("audio"), sid: p.selectedTrack("sub"),
+      vid: p.selectedTrack("video"), loopA: a.loopA, loopB: a.loopB,
+      hasLoopA: a.hasLoopA, hasLoopB: a.hasLoopB, abLoop: a.abLoop,
+      windowX: a.cfg.windowX, windowY: a.cfg.windowY, windowW: a.cfg.windowW,
+      windowH: a.cfg.windowH, maximized: a.window.maximized, fullscreen: a.fullscreen,
+      transform: a.cfg.transform, listed: a.listedLinks, playlistFile: a.plFile,
+      playlistTab: a.shownId, shownTab: shown)
+    for f in a.playlist:
+      if f in a.linkTitles: r.titles[f] = a.linkTitles[f]
   # A link's captions come back by themselves (addCaptions).
   for t in p.tracks:
     if t.external and t.kind in ["sub", "audio"] and not t.file.contains("://"):
@@ -1432,21 +2117,31 @@ proc saveResume(a: App) =
   r.save()
 
 proc resumeState(a: App, r: ResumeState) =
-  ## The playlist and its file as they were before restarting into an
-  ## update: where it was, paused or stopped as it was (its tracks and loop
-  ## once it opens).
-  a.playlist = r.playlist.filterIt(fileExists(it) or it.contains("://"))
-  a.linkTitles = r.titles
-  a.ytListed = r.listed.toHashSet
+  ## The playing playlist and its file as they were before restarting into
+  ## an update: where it was, paused or stopped as it was (its tracks and
+  ## loop once it opens), with the playlist that was shown shown again.
+  for k, v in r.titles: a.linkTitles[k] = v
+  for l in r.listed: a.ytListed.incl l
   if r.fullscreen: a.setFullscreen(true)
-  let at = if r.index in 0 ..< r.playlist.len: a.playlist.find(r.playlist[r.index]) else: -1
-  if at < 0:
-    if r.selected in 0 ..< r.playlist.len: a.plSelected = a.playlist.find(r.playlist[r.selected])
-    return
-  a.resume = r
-  a.resuming = true
-  a.playIndex(at, r.time)
-  if r.paused or r.stopped: a.player.h.setProp("pause", true)
+  let ti = a.tabAt(r.playlistTab)
+  a.showTab(if ti >= 0: ti else: a.scratchTab)
+  if ti < 0 or a.tabs[a.tabView].scratch:
+    # The Default playlist as it was, should Remember playlist be off.
+    a.playlist = r.playlist.filterIt(it.entryExists)
+    a.bindPlaylist(r.playlistFile)
+  proc locate(e: seq[string], i: int): int =
+    ## Where entry i of the saved playlist is now, there first.
+    if i notin 0 ..< r.playlist.len: return -1
+    if i < e.len and e[i] == r.playlist[i]: i else: e.find(r.playlist[i])
+  let at = a.playlist.locate(r.index)
+  a.plSelected = a.playlist.locate(r.selected)
+  if at >= 0:
+    a.resume = r
+    a.resuming = true
+    a.playIndex(at, r.time)
+    if r.paused or r.stopped: a.player.h.setProp("pause", true)
+  let back = a.tabAt(r.shownTab)
+  if back >= 0: a.showTab(back)
 
 proc closeFile(a: App) =
   if a.editLocked: return
@@ -1455,9 +2150,16 @@ proc closeFile(a: App) =
   a.clearLoopMarks()
   a.player.close()
   a.preview.forget()
-  a.playlist.setLen 0
-  a.plIndex = -1
-  a.selectOnly(-1)
+  # The Default playlist empties with it (Undo brings it back); a playlist
+  # of the user's own stays.
+  a.inPlaying:
+    if a.tabs[a.tabView].scratch and a.playlist.len > 0:
+      a.undoPoint("Close")
+      a.playlist.setLen 0
+      a.bindPlaylist("")
+      a.selectOnly(-1)
+    a.plIndex = -1
+  a.tabPlaying = -1
   a.updateTitle()
 
 proc onWayland(): bool =
@@ -1471,8 +2173,9 @@ proc fileUri(path: string): string =
 
 proc copyToClipboard(a: App) =
   ## The opened file goes on the clipboard as a file (text/uri-list), so a
-  ## file manager pastes the file itself; streams go as their URL.
-  let path = a.player.path
+  ## file manager pastes the file itself (a cue track's album file); streams
+  ## go as their URL.
+  let path = a.player.path.cueFile
   if not a.player.loaded or path.len == 0: return
   when defined(windows):
     if not path.contains("://"):
@@ -1499,8 +2202,8 @@ proc copyToClipboard(a: App) =
 
 proc copyTimeLink(a: App) =
   ## The YouTube link with the current position, so it opens right here.
-  if not a.player.loaded or a.plIndex notin 0 ..< a.playlist.len: return
-  let id = a.playlist[a.plIndex].youtubeId
+  if not a.player.loaded: return
+  let id = a.playingEntry.youtubeId
   if id.len == 0:
     a.osd("Not a YouTube video")
     return
@@ -1533,6 +2236,287 @@ proc pathOrLink(line: string): string =
     "https://" & e  # for yt-dlp
   else: e.expandTilde
 
+# --- quick cover ---------------------------------------------------------------
+# A picture dropped or pasted on the video frame while the file playing shows
+# none of its own (sound alone, or a video with its video track off) becomes
+# its cover, an album-art track mpv shows as it would the file's own (the
+# window fits it; screenshots and video filters see it). It goes with the
+# file unless saved (Save Quick Cover: quickcovers.json), and a saved one is
+# added as the file opens (the on_preloaded hook), before mpv shows another.
+
+proc quickCoverAllowed(a: App): bool =
+  ## Nothing but a cover or nothing at all shows: a picture can be dropped on.
+  let p = a.player
+  p.loaded and not p.opening and not p.hasRealVideo and not a.holding
+
+proc quickCoverShown(a: App): bool =
+  ## The quick cover is the picture shown (Show Quick Cover).
+  a.qcImage.len > 0 and a.player.tracks.anyIt(it.isQuickCover and it.selected and it.file == a.qcTrack)
+
+proc quickCoverStill(image: string): string =
+  ## The file mpv is to show for a quick cover picture: the picture, or for
+  ## an animated WebP (FFmpeg reads none) its first frame as a PNG in the
+  ## cache, moved on by animpic; "" when it can't be read (no libwebp).
+  try:
+    var head = newString(64)
+    let f = open(image)
+    head.setLen f.readChars(head.toOpenArray(0, head.high))
+    f.close()
+    if not head.isAnimatedWebp: return image
+    if getFileSize(image) > 256 shl 20: return ""
+    let data = readFile(image)
+    let pic = readAnimPic(data)
+    if pic == nil: return ""
+    let id = hash(image & "\n" & $getLastModificationTime(image).toUnixFloat & "\n" & $data.len)
+    let still = getCacheDir("majestic-media-player") / "quickcovers" / (cast[uint](id).toHex & ".png")
+    if not fileExists(still):
+      createDir(still.parentDir)
+      writeFile(still, pic.firstFramePng)
+    still
+  except CatchableError: ""
+
+proc forgetQuickCoverFile(a: App) =
+  ## The quick cover's picture deleted when it was pasted (a file of ours)
+  ## and no file keeps it.
+  let img = a.qcImage
+  if img.len == 0 or img.parentDir != quickCoverDir(): return
+  a.quickCovers = loadQuickCovers()  # another player may have saved it
+  for v in a.quickCovers.values:
+    if v == img: return
+  try: removeFile(img)
+  except OSError: discard
+
+proc dropQuickCoverSnap(a: App) =
+  if a.qcTex != 0:
+    makeContextCurrent(a.window)
+    glDeleteTextures(1, a.qcTex.addr)
+    a.qcTex = 0
+  (a.qcSnapConfigs, a.qcSnapDue, a.qcBridge) = (-1, 0.0, false)
+
+proc snapQuickCover(a: App) =
+  ## The quick cover's picture is to be taken as mpv shows it, once mpv has
+  ## set it up (its video set up anew).
+  a.dropQuickCoverSnap()
+  (a.qcSnapConfigs, a.qcSnapAsked) = (a.player.videoConfigs, now())
+
+proc clearQuickCover(a: App) =
+  a.forgetQuickCoverFile()
+  a.dropQuickCoverSnap()
+  a.animStash = ("", nil)
+  (a.qcImage, a.qcTrack, a.qcFor, a.qcPrevVid) = ("", "", "", "")
+
+proc quickCoverSaved(a: App): bool =
+  a.qcImage.len > 0 and a.quickCovers.getOrDefault(a.qcFor) == a.qcImage
+
+proc showQuickCover(a: App, on: bool) =
+  ## Show Quick Cover: the quick cover, or what showed before it (the file's
+  ## cover, or nothing: the visualizer, a video's track left off).
+  let p = a.player
+  var id = 0
+  for t in p.tracks:
+    if t.isQuickCover and t.file == a.qcTrack: id = t.id
+  if id == 0: return
+  if on:
+    if a.quickCoverShown: return
+    p.h.setProp("file-local-options/vid", $id)
+    # mpv takes a moment to set the picture up again: its snapshot till then.
+    if a.qcTex != 0:
+      (a.qcBridge, a.qcBridgeConfigs, a.qcBridgeAt, a.qcBridgeEnd) = (true, p.videoConfigs, now(), 0.0)
+    return
+  a.qcBridge = false
+  let back = a.qcPrevVid
+  let known = p.tracks.anyIt(it.kind == "video" and $it.id == back and not it.isQuickCover)
+  p.h.setProp("file-local-options/vid", if known: back else: "no")
+
+proc setQuickCover(a: App, image: string) =
+  ## The picture at image shown as the file's cover, in place of what showed
+  ## (nothing, a visualizer or a cover), until another file opens; it's kept
+  ## for the file instead when the one before was saved.
+  let p = a.player
+  let name = image.extractFilename
+  if a.qcImage.len > 0 and a.qcFor != p.path: a.clearQuickCover()
+  if image == a.qcImage:  # the same again: shown, if it was hidden
+    a.showQuickCover(true)
+    return
+  let track = quickCoverStill(image)
+  if track.len == 0:
+    let why = try: (if readFile(image).webpMissing: ": animated WebP needs libwebp" else: "")
+              except CatchableError: ""
+    a.osd("Can't show " & name & why, secs = 3)
+    return
+  let old = if a.qcImage.len > 0: p.quickCoverTrack(a.qcTrack) else: 0
+  let before = if a.qcImage.len > 0: a.qcPrevVid else: p.h.getStr("vid")
+  makeContextCurrent(a.window)  # it may need a render context
+  let id = p.addQuickCover(track)
+  if id == 0:
+    a.osd("Can't show " & name, secs = 3)
+    return
+  if old != 0 and old != id: p.h.command("video-remove", $old)
+  a.quickCovers = loadQuickCovers()
+  if a.quickCoverSaved:
+    a.quickCovers.remember(p.path, image)
+    a.quickCovers.save()
+  if a.qcImage != image: a.forgetQuickCoverFile()  # a pasted one it replaces
+  (a.qcImage, a.qcTrack, a.qcFor, a.qcPrevVid) = (image, track, p.path, before)
+  (a.qcSeen, a.qcSetAt) = (false, now())
+  a.animStash = ("", nil)
+  a.snapQuickCover()
+  a.osd("Quick cover: " & name)
+
+proc toggleSaveQuickCover(a: App) =
+  ## Save Quick Cover: the file opens with it from now on (the picture read
+  ## from where it is), or no more.
+  if a.qcImage.len == 0: return
+  a.quickCovers = loadQuickCovers()
+  if a.quickCovers.getOrDefault(a.qcFor) == a.qcImage:
+    a.quickCovers.del(a.qcFor)
+    a.osd("Quick cover no longer saved")
+  else:
+    a.quickCovers.remember(a.qcFor, a.qcImage)
+    a.osd("Quick cover saved for " & a.qcFor.fileTitle)
+  a.quickCovers.save()
+
+proc quickCoverHook(a: App, path: string): string =
+  ## For the on_preloaded hook: the file mpv is to show as the saved quick
+  ## cover of the file at path opening, "" for none.
+  a.quickCovers = loadQuickCovers()
+  let img = a.quickCovers.getOrDefault(path)
+  if img.len == 0 or not fileExists(img): return ""
+  result = quickCoverStill(img)
+  if result.len > 0: a.qcHooked = (path, img, result)
+
+proc pollQuickCover(a: App) =
+  ## The quick cover goes with its file (another opens, or it opens again),
+  ## and a saved one the hook added is taken up. Only the track list mpv
+  ## sent is read: a property read waits while mpv sets a picture up, and
+  ## would hold up the frames meant to hide that wait.
+  let p = a.player
+  if a.qcImage.len > 0:
+    let listed = p.tracks.anyIt(it.isQuickCover and it.file == a.qcTrack)
+    if listed: a.qcSeen = true
+    if p.path != a.qcFor or not p.loaded or (if a.qcSeen: not listed else: now() - a.qcSetAt > 5):
+      a.clearQuickCover()
+  let h = a.qcHooked
+  if a.qcImage.len == 0 and h.path.len > 0 and p.loaded and h.path == p.path:
+    if p.quickCoverTrack(h.track) != 0:
+      (a.qcImage, a.qcTrack, a.qcFor, a.qcPrevVid) = (h.image, h.track, h.path, p.ownVid)
+      (a.qcSeen, a.qcSetAt) = (false, now())
+      a.snapQuickCover()
+      if p.hasVideo and a.quickCoverShown: a.qcSnapDue = now() + 0.3  # up already
+    a.qcHooked = ("", "", "")
+  if a.qcImage.len == 0: return
+  let t = now()
+  # The snapshot: a moment after mpv set the quick cover up (the picture is
+  # still, so any time after will do).
+  if a.qcSnapConfigs >= 0:
+    if a.qcSnapDue == 0 and p.hasVideo and a.quickCoverShown and
+       (p.videoConfigs != a.qcSnapConfigs or t - a.qcSnapAsked > 5):
+      a.qcSnapDue = t + 0.3
+    if a.qcSnapDue > 0 and t >= a.qcSnapDue and not p.shotAsked and not p.shotDone:
+      if p.hasVideo and a.quickCoverShown: p.takeShot()
+      else:  # hidden meanwhile: next time it's set up
+        (a.qcSnapConfigs, a.qcSnapDue, a.qcSnapAsked) = (p.videoConfigs, 0.0, t)
+    if a.qcSnapDue > 0 and p.shotDone:
+      p.shotDone = false
+      if a.quickCoverShown:  # still the quick cover's
+        let shot = move p.shot
+        if shot.w > 0:
+          makeContextCurrent(a.window)
+          glGenTextures(1, a.qcTex.addr)
+          glBindTexture(GL_TEXTURE_2D, a.qcTex)
+          glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR.GLint)
+          glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR.GLint)
+          glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE.GLint)
+          glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE.GLint)
+          glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8.GLint, shot.w.GLsizei, shot.h.GLsizei, 0,
+            GL_RGBA, GL_UNSIGNED_BYTE, shot.pixels[0].addr)
+          glGenerateMipmap(GL_TEXTURE_2D)
+          glBindTexture(GL_TEXTURE_2D, 0)
+          a.qcTexSize = ivec2(shot.w.int32, shot.h.int32)
+        (a.qcSnapConfigs, a.qcSnapDue) = (-1, 0.0)
+      else: (a.qcSnapConfigs, a.qcSnapDue, a.qcSnapAsked) = (p.videoConfigs, 0.0, t)
+  # Show Quick Cover's snapshot ends a moment after mpv's picture is back.
+  if a.qcBridge:
+    if not a.quickCoverShown and t - a.qcBridgeAt > 0.5 or t - a.qcBridgeAt > 3:
+      a.qcBridge = false
+    elif a.qcBridgeEnd == 0 and p.hasVideo and p.videoConfigs != a.qcBridgeConfigs:
+      a.qcBridgeEnd = t + 0.1
+    elif a.qcBridgeEnd > 0 and t >= a.qcBridgeEnd:
+      a.qcBridge = false
+    if a.qcBridge: a.dirtyUntil = max(a.dirtyUntil, t + 0.05)
+    else: a.renderNow = true  # mpv's own picture, drawn now
+
+proc sweepQuickCovers(a: App) =
+  ## Pasted pictures no file keeps (left by a crash), and stills of animated
+  ## WebPs unused for a week.
+  a.quickCovers = loadQuickCovers()
+  var kept = initHashSet[string]()
+  for v in a.quickCovers.values: kept.incl v
+  try:
+    for f in walkFiles(quickCoverDir() / "*"):
+      if f notin kept and getLastModificationTime(f) < getTime() - initDuration(days = 1):
+        removeFile(f)
+    for f in walkFiles(getCacheDir("majestic-media-player") / "quickcovers" / "*.png"):
+      if getLastAccessTime(f) < getTime() - initDuration(days = 7) and
+         getLastModificationTime(f) < getTime() - initDuration(days = 7):
+        removeFile(f)
+  except OSError: discard
+
+proc commandBytes(exe: string, args: openArray[string]): string =
+  ## What the program writes, byte for byte (execCmdEx rejoins lines with
+  ## "\n", which breaks a PNG's signature); "" when it fails.
+  try:
+    let p = startProcess(exe, args = args, options = {poUsePath})
+    p.inputStream.close()
+    result = p.outputStream.readAll()
+    if p.waitForExit() != 0: result = ""
+    p.close()
+  except CatchableError: result = ""
+
+proc clipboardImage(): tuple[data, ext: string] =
+  ## A picture on the clipboard itself (a browser's Copy Image), not a file:
+  ## its bytes and their extension. Animated kinds first.
+  const kinds = [("image/gif", "gif"), ("image/webp", "webp"), ("image/png", "png"),
+                 ("image/jpeg", "jpg"), ("image/bmp", "bmp")]
+  when not defined(windows):
+    var (exe, list, get) = ("", @[""], @[""])
+    if onWayland(): (exe, list, get) = ("wl-paste", @["--list-types"], @["--no-newline", "--type"])
+    elif findExe("xclip").len > 0:
+      (exe, list, get) = ("xclip", @["-selection", "clipboard", "-o", "-t", "TARGETS"],
+                          @["-selection", "clipboard", "-o", "-t"])
+    if exe.len > 0:
+      let have = commandBytes(exe, list).splitLines.mapIt(it.strip)
+      for (mime, ext) in kinds:
+        if mime notin have: continue
+        let data = commandBytes(exe, get & mime)
+        if data.len > 0: return (data, ext)
+  try:
+    let img = getClipboardImage()  # Windows: windy's (none on X11)
+    if img != nil: return (img.encodeImage(PngFormat), "png")
+  except CatchableError: discard
+
+proc pasteQuickCover(a: App, paths: seq[string]): bool =
+  ## A picture file on the clipboard, or a picture itself, as the quick
+  ## cover; false when there's neither.
+  if paths.len == 1:
+    let f = paths[0]
+    if f.contains("://") or not f.isImageFile or not fileExists(f): return false
+    a.setQuickCover(f.absolutePath)
+    return true
+  if paths.len > 0: return false
+  let (data, ext) = clipboardImage()
+  if data.len == 0: return false
+  # Named after its bytes: the same picture pasted again is the same file.
+  let file = quickCoverDir() / ("pasted-" & cast[uint](hash(data)).toHex & "." & ext)
+  try:
+    createDir(file.parentDir)
+    if not fileExists(file): writeFile(file, data)
+  except CatchableError:
+    a.osd("Can't keep the pasted picture", secs = 3)
+    return true
+  a.setQuickCover(file)
+  true
+
 proc clipboardPaths(a: App): seq[string] =
   ## Files and URLs on the clipboard: a file manager's text/uri-list (on
   ## Windows, Explorer's file list), or plain text holding paths or URLs, one
@@ -1554,8 +2538,13 @@ proc clipboardPaths(a: App): seq[string] =
     if p.len > 0: result.add p
 
 proc openFromClipboard(a: App) =
-  if a.editLocked: return
+  ## A file showing no picture takes a picture (or picture file) on the
+  ## clipboard as its quick cover; anything else opens.
+  let quick = a.quickCoverAllowed
+  if a.editLocked and not quick: return
   let paths = a.clipboardPaths()
+  if quick and a.pasteQuickCover(paths): return
+  if a.editLocked: return
   if paths.len == 0:
     a.osd("Clipboard has no file to open")
     return
@@ -1570,7 +2559,7 @@ proc reopenLast(a: App): bool =
     return true
   if a.playlistLocked: return false
   for r in a.cfg.recentFiles:
-    if fileExists(r) or r.contains("://"):
+    if r.entryExists:
       a.openPaths(@[r])
       return true
 
@@ -1601,7 +2590,11 @@ proc play(a: App) =
   if restart: a.syncSend("seek", "0", "true")
   a.syncSend("play")
 
-proc pause(a: App) =
+proc pause(a: App, report = true) =
+  ## report: say "Paused" on the OSD if it was playing.
+  let p = a.player
+  if report and p.loaded and not p.stopped and (not p.paused or a.padRunning):
+    a.osd("Paused")
   if a.padLen > 0:
     a.padHold(true)
     return
@@ -1639,7 +2632,7 @@ proc goToEnd(a: App) =
   let p = a.player
   if not p.loaded or p.duration <= 0: return
   (a.padLen, a.padHeld) = (0.0, false)
-  a.pause()
+  a.pause(report = false)
   p.holdEnd()
   a.seekTo(p.duration)
 
@@ -1650,22 +2643,42 @@ proc folderNeighbor(a: App, dir: int): string =
   let j = (if i < 0: files.find(a.player.path) else: i) + dir
   if j >= 0 and j < files.len: files[j] else: ""
 
-proc navigateLocal(a: App, dir: int) =
-  ## Previous/next: walks the playlist, or the folder when it is the sole item.
-  if a.playlist.len > 1:
-    var j = a.plIndex + dir
-    if j < 0 or j >= a.playlist.len:
-      if a.cfg.repeatForever and a.cfg.repeatMode == rmPlaylist:
-        j = (j + a.playlist.len) mod a.playlist.len
-      else: return
-    a.playIndex(j)
+proc playFolderFile(a: App, f: string) =
+  ## A file beside the one playing, whose playlist held only it: it plays
+  ## alone in the Default playlist, shown when the playing one was. Not
+  ## inside inTab: it may show a playlist.
+  let s = a.scratchTab
+  let shown = a.tabPlaying notin 0 ..< a.tabs.len or a.tabPlaying == a.tabView
+  template go() =
+    if a.playlist.len > 1: a.undoPoint("Next file in folder")
+    a.playlist = @[f]
+    a.bindPlaylist("")
+    a.selectOnly(-1)
+    a.playIndex(0)
+  if shown:
+    a.showTab(s)
+    go()
   else:
+    a.inTab(s): go()
+
+proc navigateLocal(a: App, dir: int) =
+  ## Previous/next: walks the playing playlist (the queue first, going on),
+  ## or the folder when the file is all it holds.
+  if dir > 0 and a.playQueued(): return
+  var folder = false
+  a.inPlaying:
+    if a.playlist.len > 1:
+      var j = a.plIndex + dir
+      if j < 0 or j >= a.playlist.len:
+        j = if a.cfg.repeatForever and a.cfg.repeatMode == rmPlaylist:
+              (j + a.playlist.len) mod a.playlist.len
+            else: -1
+      if j >= 0: a.playIndex(j)
+    else: folder = true
+  if folder:
     let f = a.folderNeighbor(dir)
-    if f.len > 0:
-      a.playlist = @[f]
-      a.playIndex(0)
-    else:
-      a.osd(if dir > 0: "Last file in folder" else: "First file in folder")
+    if f.len > 0: a.playFolderFile(f)
+    else: a.osd(if dir > 0: "Last file in folder" else: "First file in folder")
 
 proc navigate(a: App, dir: int) =
   # Each player has its own file; the folder step would rewrite a locked playlist.
@@ -1681,7 +2694,7 @@ proc mediaUrl(path: string): string =
 proc mediaState(a: App): MediaState =
   let p = a.player
   result = MediaState(rate: p.speed, volume: p.volume / 100, position: p.timePos,
-    duration: p.duration, url: p.path.mediaUrl,
+    duration: p.duration, url: p.path.cueFile.mediaUrl,
     # As the Controls bar's buttons.
     canPlay: p.loaded or a.cfg.recentFiles.len > 0, canPause: p.loaded,
     canSeek: p.loaded and p.duration > 0)
@@ -1728,6 +2741,18 @@ proc syncMediaControls(a: App) =
 
 # --- playlist editing -------------------------------------------------------
 
+proc insertEntries(a: App, entries: seq[string], at = -1, label = "Add"): int =
+  ## Puts entries in the shown playlist at `at` (the end when out of range),
+  ## as one undo step; returns where they went.
+  result = if at < 0 or at > a.playlist.len: a.playlist.len else: at
+  if entries.len == 0: return
+  a.undoPoint(label & " " & countLabel(entries.len))
+  a.playlist.insert(entries, result)
+  if a.plIndex >= result: a.plIndex += entries.len
+  if a.plSelected >= result: a.plSelected += entries.len
+  for m in a.plMarks.mitems:
+    if m >= result: m += entries.len
+
 proc addToPlaylist(a: App, paths: seq[string], at = -1) =
   ## Inserts at `at` (appends when out of range) without touching playback;
   ## starts playing them when nothing is open.
@@ -1736,27 +2761,84 @@ proc addToPlaylist(a: App, paths: seq[string], at = -1) =
   if files.len == 0:
     a.osd("Nothing playable found")
     return
-  let first = if at < 0 or at > a.playlist.len: a.playlist.len else: at
-  a.playlist.insert(files, first)
-  if a.plIndex >= first: a.plIndex += files.len
-  if a.plSelected >= first: a.plSelected += files.len
-  for m in a.plMarks.mitems:
-    if m >= first: m += files.len
+  let first = a.insertEntries(files, at)
   if not a.player.loaded: a.playIndex(first)
   else: a.osd(if files.len == 1: "Added to playlist" else: &"Added {files.len} files to playlist")
 
-proc removeSelected(a: App) =
-  if a.editLocked: return
-  let sel = a.plSelection
+proc removeEntries(a: App, sel: seq[int], label = "Remove") =
+  ## Takes out entries sel (in order) as one undo step; the selection goes
+  ## to the entry after them.
   if sel.len == 0: return
+  a.undoPoint(label & " " & countLabel(sel.len))
   for i in countdown(sel.high, 0): a.playlist.delete(sel[i])
   if a.plIndex in sel: a.plIndex = -1
   else: a.plIndex -= sel.countIt(it < a.plIndex)
   a.selectOnly(min(sel[0], a.playlist.len - 1))
 
-proc reorderPlaylist(a: App, order: seq[int]) =
+proc removeSelected(a: App) =
+  if a.editLocked: return
+  a.removeEntries(a.plSelection)
+
+proc cropToSelection(a: App) =
+  ## Keeps only the selected entries.
+  if a.editLocked: return
+  let sel = a.plSelection
+  if sel.len == 0: return
+  var keep = newSeq[bool](a.playlist.len)
+  for i in sel: keep[i] = true
+  a.removeEntries(toSeq(0 ..< a.playlist.len).filterIt(not keep[it]), "Crop: remove")
+  a.plMarks = if a.playlist.len > 1: toSeq(0 ..< a.playlist.len) else: @[]
+  a.plSelected = if a.playlist.len > 0: 0 else: -1
+
+proc removeDuplicates(a: App) =
+  ## Each entry once, where it's first.
+  if a.editLocked: return
+  var seen: HashSet[string]
+  var dups: seq[int]
+  for i, p in a.playlist:
+    if seen.containsOrIncl(p): dups.add i
+  if dups.len == 0:
+    a.osd("No duplicates")
+    return
+  a.removeEntries(dups, "Remove duplicates:")
+  a.osd("Removed " & countLabel(dups.len, "duplicate"))
+
+proc removeDeadItems(a: App) =
+  ## The files that are gone (links stay).
+  if a.editLocked: return
+  var dead: seq[int]
+  for i, p in a.playlist:
+    if not p.entryExists: dead.add i
+  if dead.len == 0:
+    a.osd("No missing files")
+    return
+  a.removeEntries(dead, "Remove missing:")
+  a.osd("Removed " & countLabel(dead.len, "missing file"))
+
+proc sendSelected(a: App, target: int, move = false) =
+  ## The selection, in order, to the end of playlist `target` (a new one,
+  ## shown, for -1); moved rather than copied, it leaves this one.
+  if a.editLocked: return
+  let sel = a.plSelection
+  if sel.len == 0 or target == a.tabView: return
+  let paths = sel.mapIt(a.playlist[it])
+  if move: a.removeEntries(sel, "Move")
+  var name: string
+  if target notin 0 ..< a.tabs.len:
+    let ti = a.newPlaylist(show = false)
+    a.tabs[ti].entries = paths
+    name = a.tabs[ti].name
+    a.showTab(ti)
+  else:
+    a.inTab(target): discard a.insertEntries(paths, -1, "Add")
+    name = a.tabs[target].name
+  a.osd((if move: "Moved " else: "Copied ") & countLabel(paths.len) & " to " & name)
+
+proc reorderPlaylist(a: App, order: seq[int], label = "Move") =
   ## order[new position] = old index; the playing and selected entries follow.
   if a.editLocked: return
+  if order == toSeq(0 ..< a.playlist.len): return
+  a.undoPoint(label)
   let old = a.playlist
   var cur, sel = -1
   var marks: seq[int]
@@ -1803,9 +2885,7 @@ proc duplicateSelected(a: App) =
   if a.editLocked: return
   let sel = a.plSelection
   if sel.len == 0: return
-  let at = sel[^1] + 1
-  a.playlist.insert(sel.mapIt(a.playlist[it]), at)
-  if a.plIndex >= at: a.plIndex += sel.len
+  let at = a.insertEntries(sel.mapIt(a.playlist[it]), sel[^1] + 1, "Duplicate")
   a.plSelected = at + max(0, sel.find(a.plSelected))
   a.plMarks = if sel.len > 1: toSeq(at ..< at + sel.len) else: @[]
   a.plReveal = true
@@ -1911,8 +2991,8 @@ proc infoNext(a: App, visible: Slice[int]) =
   const Batch = 8
   if a.ytInfo.running: return
   a.readLinkInfos()
-  let wantSize = pfDimensions in a.cfg.playlistColumns
-  let wantBitrate = pfAudioBitrate in a.cfg.playlistColumns
+  let wantSize = pfDimensions in a.plColumns
+  let wantBitrate = pfAudioBitrate in a.plColumns
   var links: seq[string]
   let need = proc (p: string): bool =
     if p in a.ytInfoTried or p in links or p.youtubeId.len == 0: return false
@@ -1962,7 +3042,7 @@ proc rowName(a: App, path: string): string =
   elif path in a.linkTitles: a.linkTitles[path]
   elif path.isWebLink and a.saved.lookup(path).title.len > 0: a.saved.lookup(path).title
   elif a.mediaInfo.getOrDefault(path).title.len > 0: a.mediaInfo[path].title
-  else: path.extractFilename
+  else: path.fileTitle
 
 proc sortPlaylist(a: App, by: PlaylistField) =
   ## Sorts ascending, or descending when already in ascending order.
@@ -1994,11 +3074,12 @@ proc sortPlaylist(a: App, by: PlaylistField) =
   let ascending = (0 ..< n - 1).toSeq.allIt(byKey(it, it + 1) <= 0)
   var order = toSeq(0 ..< n)
   order.sort(byKey, if ascending: Descending else: Ascending)
-  a.reorderPlaylist(order)
+  a.reorderPlaylist(order, "Sort by " & PlaylistFields[by].label)
 
 proc clearPlaylist(a: App) =
   ## Empties the playlist; the open file keeps playing.
-  if a.editLocked: return
+  if a.editLocked or a.playlist.len == 0: return
+  a.undoPoint("Clear " & countLabel(a.playlist.len))
   a.playlist.setLen 0
   a.plIndex = -1
   a.selectOnly(-1)
@@ -2007,7 +3088,7 @@ proc clearPlaylist(a: App) =
 proc randomizePlaylist(a: App) =
   var order = toSeq(0 ..< a.playlist.len)
   order.shuffle()
-  a.reorderPlaylist(order)
+  a.reorderPlaylist(order, "Randomize")
 
 proc spawn(a: App, cmd: string, args: varargs[string]) =
   if findExe(cmd).len == 0:
@@ -2077,23 +3158,25 @@ proc runAfterPlayback(a: App) =
   of apNothing: discard
   of apNextInFolder:
     let f = a.folderNeighbor(1)
-    if f.len > 0:
-      a.playlist = @[f]
-      a.playIndex(0)
+    if f.len > 0: a.playFolderFile(f)
   of apExit: a.window.closeRequested = true
   else: a.runPowerAction()
 
 proc afterEof(a: App) =
-  if a.cfg.repeatForever and a.cfg.repeatMode == rmPlaylist and a.playlist.len > 0:
-    if a.cfg.repeatPingPong and a.playlist.len > 1:
-      # Ping-pong: back the other way from either end.
-      if a.plIndex + a.plDir notin 0 ..< a.playlist.len: a.plDir = -a.plDir
-      a.playIndex(clamp(a.plIndex + a.plDir, 0, a.playlist.len - 1))
-    else: a.playIndex((a.plIndex + 1) mod a.playlist.len)
-  elif a.plIndex + 1 < a.playlist.len:
-    a.playIndex(a.plIndex + 1)
-  else:
-    a.runAfterPlayback()
+  ## The file ended: the queue's next, else the playing playlist's.
+  if a.playQueued(): return
+  var over = false
+  a.inPlaying:
+    if a.cfg.repeatForever and a.cfg.repeatMode == rmPlaylist and a.playlist.len > 0:
+      if a.cfg.repeatPingPong and a.playlist.len > 1:
+        # Ping-pong: back the other way from either end.
+        if a.plIndex + a.plDir notin 0 ..< a.playlist.len: a.plDir = -a.plDir
+        a.playIndex(clamp(a.plIndex + a.plDir, 0, a.playlist.len - 1))
+      else: a.playIndex((a.plIndex + 1) mod a.playlist.len)
+    elif a.plIndex + 1 < a.playlist.len:
+      a.playIndex(a.plIndex + 1)
+    else: over = true
+  if over: a.runAfterPlayback()
 
 proc shortAudioPad(a: App): float =
   ## Seconds of silence owed after this file: it is a very short audio file
@@ -2103,7 +3186,8 @@ proc shortAudioPad(a: App): float =
      p.duration * 1000 >= a.cfg.shortAudioMs: return
   if p.partEnd > 0 or a.pingPongFile or a.abLoop or a.playlistLocked: return
   if a.cfg.repeatForever and a.cfg.repeatMode == rmFile: return  # mpv loops it: no end
-  let next = a.cfg.repeatForever and a.playlist.len > 0 or a.plIndex + 1 < a.playlist.len or
+  let n = a.playingCount
+  let next = a.queue.len > 0 or a.cfg.repeatForever and n > 0 or a.playingIndex + 1 < n or
     a.afterPlayback == apNextInFolder and a.folderNeighbor(1).len > 0
   if next: a.cfg.shortAudioMs / 1000 else: 0
 
@@ -2122,9 +3206,93 @@ proc tickPad(a: App) =
     a.afterEof()
   else: a.dirtyUntil = max(a.dirtyUntil, now() + 0.05)  # the stripes filling
 
+proc gaplessFile(path: string): bool =
+  ## Audio mpv can go on to by itself, gapless: a cue sheet's track, or an
+  ## audio file on disk (not MIDI or a module, played through streams of
+  ## their own, or a link).
+  if path.isCueEntry: return path.cueSource.len > 0
+  not path.contains("://") and fileExists(path) and
+    path.splitFile.ext.toLowerAscii.strip(chars = {'.'}) in AudioExtensions
+
+proc gaplessTarget(a: App): GapNext =
+  ## The entry afterEof would play at the end of this file, when both are
+  ## audio played straight through: mpv then goes on to it itself, with no
+  ## silence between. Path "" when the end is the app's to handle (videos,
+  ## loops, the queue, a short file's delay, synchronized players...).
+  let p = a.player
+  if not p.loaded or p.opening or p.stopped or p.backward or p.hidden or p.endHold or
+     p.partEnd > 0 or p.hasRealVideo or not p.path.gaplessFile or
+     p.source.len > 0 and not p.source.startsWith("edl://"): return
+  if a.queue.len > 0 or a.playlistLocked or a.abLoop or a.pingPongFile or
+     a.cfg.repeatPingPong or a.cfg.repeatForever and a.cfg.repeatMode == rmFile: return
+  if a.shortAudioPad > 0: return
+  let ti = if a.tabPlaying in 0 ..< a.tabs.len: a.tabPlaying else: a.tabView
+  let entries = a.tabEntries(ti)
+  let at = if ti == a.tabView: a.plIndex else: a.tabs[ti].index
+  let n = entries.len
+  let i = if at + 1 < n: at + 1
+          elif a.cfg.repeatForever and a.cfg.repeatMode == rmPlaylist and n > 0: 0
+          else: -1
+  if i >= 0: result = GapNext(path: entries[i], tab: a.tabs[ti].id, i: i)
+  elif a.afterPlayback == apNextInFolder: result = GapNext(path: a.folderNeighbor(1), folder: true)
+  if result.path.len == 0 or not result.path.gaplessFile: return GapNext()
+  if a.cfg.rememberTime: result.start = a.positions.getOrDefault(result.path, 0.0)
+
+proc queueGapless(a: App) =
+  ## Near the end of an audio file, the next one goes into mpv's playlist,
+  ## for mpv to play straight after it; looked at again as the playlist or
+  ## the settings may change meanwhile.
+  let p = a.player
+  let left = (p.duration - p.timePos) / max(p.speed, 0.01)
+  if p.nextPath.len == 0 and not (p.loaded and p.duration > 0 and left < 15):
+    p.queueNext("")  # gapless audio off, once a file it went on to plays
+    return
+  if now() < a.gapCheckAt: return
+  a.gapCheckAt = now() + 0.25
+  let t = a.gaplessTarget
+  if t.path.isCueEntry:
+    p.queueNext(t.path, t.start, "force-media-title=" & quoted(t.path.fileTitle), t.path.cueSource)
+  else: p.queueNext(t.path, t.start)
+  if p.nextPath == t.path: a.gapNext = t
+
+proc adoptGapless(a: App) =
+  ## mpv went on to the queued file by itself: it becomes the entry playing,
+  ## as afterEof would have had it, without being opened again.
+  let p = a.player
+  if not p.advanced: return
+  p.advanced = false
+  let t = a.gapNext
+  a.gapNext = GapNext()
+  a.gapCheckAt = 0
+  if a.cfg.rememberTime and p.endedPath.len > 0:  # played to its end: forgotten
+    a.positions = loadPositions()
+    a.positions.del(p.endedPath)
+    a.positions.save()
+  a.adopting = true
+  defer: a.adopting = false
+  if t.path == p.path and t.folder:
+    a.playFolderFile(t.path)
+    return
+  let ti = if t.path == p.path: a.tabAt(t.tab) else: -1
+  var found = false
+  if ti >= 0:
+    a.inTab(ti):
+      let j = if t.i in 0 ..< a.playlist.len and a.playlist[t.i] == t.path: t.i
+              else: a.playlist.find(t.path)
+      if j >= 0:
+        found = true
+        a.playIndex(j, t.start)
+  if not found:  # taken out of the playlist meanwhile: it plays all the same
+    a.resumedAt = t.start
+    a.cfg.addRecent(p.path)
+    a.updateTitle()
+
 proc handleEof(a: App) =
   let p = a.player
   a.tickPad()
+  # mpv goes on to the queued file itself (queueGapless); its end may show
+  # for a moment before.
+  if p.nextPath.len > 0: return
   if not (p.loaded and p.eofReached and not p.eofHandled and not p.stopped): return
   p.eofHandled = true
   if p.partEnd > 0:  # the end of a link's saved part: the stream goes on
@@ -2200,8 +3368,19 @@ proc cycleTrack(a: App, kind: string, up: bool) =
     else:
       a.player.h.commandStr("osd-msg cycle " & kind & (if up: " up" else: " down"))
 
+proc trackProp(prop: string): string =
+  ## The mpv property a track choice goes to. A video track's is the open
+  ## file's alone: turning it off mustn't hold for the files after (Always
+  ## Disable is for that).
+  if prop == "vid": "file-local-options/vid" else: prop
+
 proc setTrack(a: App, prop: string, id: int) =
-  a.player.h.setProp(prop, if id <= 0: "no" else: $id)
+  a.player.h.setProp(trackProp(prop), if id <= 0: "no" else: $id)
+
+proc applyNoVideo(a: App) =
+  ## Video Track > Always Disable, on both players: the standby may take over.
+  a.player.setNoVideo(a.cfg.noVideo)
+  if a.standby != nil: a.standby.setNoVideo(a.cfg.noVideo)
 
 proc frameStep(a: App, forward: bool) =
   let p = a.player
@@ -2529,7 +3708,7 @@ proc syncState(a: App): seq[string] =
   let p = a.player
   var (la, lb) = (0.0, 0.0)
   if a.abLoop and a.loopReady: (la, lb) = (a.loopA, a.loopB)
-  elif a.cfg.repeatForever and (a.cfg.repeatMode == rmFile or a.playlist.len <= 1):
+  elif a.cfg.repeatForever and (a.cfg.repeatMode == rmFile or a.playingCount <= 1):
     (la, lb) = (0.0, p.duration)
   # At the end mpv's time is the sound's, past the last frame.
   let pos = if p.eofReached: min(p.posNow, a.endFrame) else: p.posNow
@@ -2602,12 +3781,17 @@ proc leaveGroup(a: App) =
   a.leftGroup()
 
 proc joined(a: App) =
-  ## Just joined a group: the playlist empties (and stays locked); the open
-  ## file follows the master from where it is.
+  ## Just joined a group: the Default playlist is shown, empty (and stays
+  ## locked); the open file follows the master from where it is. The other
+  ## playlists wait as they are.
+  a.showTab(a.scratchTab)
+  if a.playlist.len > 0: a.undoPoint("Synchronize")
   a.playlist.setLen 0
+  a.bindPlaylist("")
   a.plIndex = -1
   a.selectOnly(-1)
   a.plScroll = 0
+  a.claimPlaying()
   a.clock = MasterClock()
   a.followRunning = a.player.playing
   a.followSought = NaN
@@ -2866,7 +4050,7 @@ proc mirrorStandby(a: App) =
       sb.h.commandAsync(t.kind & "-add", t.file, "auto", t.title, t.lang)
   for name in MirroredProps:
     if name in p.props and sb.props.getOrDefault(name) != p.props[name]:
-      sb.h.setProp(name, p.props[name])
+      sb.h.setProp(trackProp(name), p.props[name])
 
 proc standbyAt(a: App, path: string, start: float, opts = "") =
   ## Sends the standby (paused, muted) to `start` in `path`, opened with
@@ -3884,7 +5068,7 @@ proc setFollowOf(a: App, pid: int, offset: float, loop: bool) =
 proc startDir(a: App): string =
   let custom = a.cfg.openDir.expandPath  # Options > Player > Paths
   if custom.len > 0 and dirExists(custom): custom
-  elif a.player.path.len > 0 and fileExists(a.player.path): a.player.path.parentDir
+  elif a.player.path.len > 0 and fileExists(a.player.path.cueFile): a.player.path.cueFile.parentDir
   elif a.cfg.lastDir.len > 0 and dirExists(a.cfg.lastDir): a.cfg.lastDir
   else: getHomeDir()
 
@@ -3897,8 +5081,10 @@ proc ask(a: App, kind: DialogKind, purpose, title: string, start = "",
     if start.len > 0: start else: a.startDir, exts, filterName, extraFilters)
 
 proc openFileDialog(a: App) =
-  a.ask(dkOpenFiles, "open", "Open File", exts = @MediaExtensions,
-    filterName = "Media files", extraFilters = @[("Tracker modules", @TrackerExtensions)])
+  a.ask(dkOpenFiles, "open", "Open File", exts = @MediaExtensions & "cue",
+    filterName = "Media files", extraFilters = @[("Tracker modules", @TrackerExtensions),
+                                                 ("MIDI files", @MidiExtensions),
+                                                 ("Cue sheets", @["cue"])])
 
 proc screenshot(a: App) =
   if not a.player.loaded: return
@@ -3986,15 +5172,81 @@ proc cancelSave(a: App) =
   a.saveJob = nil
   a.osd("Saving cancelled")
 
+proc rgFiles(a: App): seq[string] =
+  ## The selected playlist items that are files, whose tags can be written.
+  for i in a.plSelection:
+    if not a.playlist[i].contains("://"): result.add a.playlist[i]
+
+proc saveReplayGain(a: App, mode: RgMode, files: seq[string]) =
+  ## Measures files and writes their ReplayGain values into their tags;
+  ## rmAlbum also gives them all the album gain of them together.
+  if a.rgJob.running: return
+  if files.len == 0: return
+  a.rgJob = rgscan.start(files, files.mapIt(a.mediaInfo.getOrDefault(it).duration), mode)
+  a.rgShown = -1
+  a.rgOpenTagged = false
+  a.osd(&"Analyzing ReplayGain of {files.len} file" & (if files.len == 1: "" else: "s"))
+
+proc rgReport(a: App, did: string, written, total: int, failed: seq[string], openTagged: bool) =
+  ## The OSD's word on a finished ReplayGain job: how many, the first file
+  ## that failed, and when the open file's change is heard.
+  let n = if total == 1: "1 file" else: &"{total} files"
+  let open = if openTagged: " (the open file's applies when it's opened again)" else: ""
+  if failed.len == 0: a.osd(&"ReplayGain {did} {n}{open}", 3)
+  else:
+    let more = if failed.len > 1: &" (and {failed.len - 1} more)" else: ""
+    a.osd(&"ReplayGain {did} {written} of {n}{open}. {failed[0]}{more}", 6)
+
+proc pollReplayGain(a: App) =
+  let j = a.rgJob
+  if not j.running: return
+  let changed = j.poll()
+  # A file tagged: the playlist's probe reads its new values (the open file
+  # gets them from mpv when it's opened again).
+  for path in j.tagged:
+    a.mediaInfo.del path
+    if path == a.player.path: a.rgOpenTagged = true
+  j.tagged.setLen 0
+  let pc = int(j.progress.percent)
+  if changed or pc != a.rgShown:
+    a.rgShown = pc
+    a.dirtyUntil = max(a.dirtyUntil, now() + 0.05)  # the status bar's progress
+  if not j.done: return
+  a.rgJob = nil
+  if j.cancelled:
+    a.osd(&"ReplayGain analysis cancelled: applied to {j.written} of {j.paths.len} files")
+  else: a.rgReport("applied to", j.written, j.paths.len, j.failed, a.rgOpenTagged)
+
+proc cancelReplayGain(a: App) =
+  if not a.rgJob.running: return
+  a.rgJob.cancel()
+
+proc removeReplayGain(a: App, files: seq[string]) =
+  ## Takes the ReplayGain values out of files' tags.
+  var failed: seq[string]
+  var openTagged = false
+  for f in files:
+    let err = rgscan.removeGain(f)
+    if err.len > 0: failed.add f.extractFilename & ": " & err
+    else:
+      a.mediaInfo.del f
+      if f == a.player.path: openTagged = true
+  a.rgReport("removed from", files.len - failed.len, files.len, failed, openTagged)
+
 const PlaylistFilters = @[("M3U playlist", @["m3u", "m3u8"]), ("PLS playlist", @["pls"])]
 
 proc loadPlaylistDialog(a: App) =
+  a.plDialogTab = a.shownId
   a.ask(dkOpenFile, "plload", "Load Playlist", exts = @PlaylistExtensions,
     filterName = "Playlists", extraFilters = PlaylistFilters)
 
-proc savePlaylistDialog(a: App) =
-  a.ask(dkSaveFile, "plsave", "Save Playlist", a.startDir / "Playlist.m3u",
-    extraFilters = PlaylistFilters)
+proc savePlaylistDialog(a: App, autosave = false) =
+  ## `autosave`: asked for by ticking Autosave, which comes on with the file.
+  ## What's saved is the playlist shown now, whichever is when it's answered.
+  a.plDialogTab = a.shownId
+  a.plAutosaveAsk = autosave
+  let start = if a.plFile.len > 0: a.plFile else: a.startDir / "Playlist.m3u"
+  a.ask(dkSaveFile, "plsave", "Save Playlist", start, extraFilters = PlaylistFilters)
 
 const ChapterFilters = @[("Matroska simple chapters", @["txt"])]
 
@@ -4042,9 +5294,17 @@ proc importBookmarks(a: App, path: string) =
       inc added)
   a.osd(if added == 1: "1 bookmark imported" else: $added & " bookmarks imported")
 
-proc loadPlaylist(a: App, path: string) =
-  ## Replaces the playlist with the file's entries and plays the first.
+proc loadPlaylist(a: App, path: string, play = true) =
+  ## The file's entries as a playlist of their own, named after it and bound
+  ## to it (an empty playlist shown takes them), and plays the first. A
+  ## playlist bound to the file already is shown instead.
   if a.editLocked: return
+  let full = path.absolutePath
+  for i in 0 ..< a.tabs.len:
+    if (if i == a.tabView: a.plFile else: a.tabs[i].file) == full:
+      a.showTab(i)
+      a.osd("Already open: " & a.tabs[i].name)
+      return
   var entries: seq[string]
   try: entries = readPlaylist(path)
   except IOError, OSError:
@@ -4054,27 +5314,77 @@ proc loadPlaylist(a: App, path: string) =
   if files.len == 0:
     a.osd("Nothing playable found")
     return
+  let name = path.splitFile.name
+  if a.playlist.len == 0 and a.plFile.len == 0:
+    a.renameTab(a.tabView, name)
+  else:
+    discard a.newPlaylist(name)
   a.playlist = files
+  a.bindPlaylist(path)
   a.plScroll = 0
-  a.playIndex(0)
+  a.selectOnly(0)
+  if play: a.playIndex(0)
 
-proc savePlaylist(a: App, path: string) =
-  ## M3U, or PLS for a .pls name; .m3u is added when there is no extension.
-  var p = path
-  if p.splitFile.ext.len == 0: p.add ".m3u"
-  var entries: seq[PlaylistEntry]
+proc playlistEntries(a: App): seq[PlaylistEntry] =
   for f in a.playlist:
     # durations only as already probed: probing every file here would stall
     let d = if f in a.mediaInfo and a.mediaInfo[f].duration > 0: a.mediaInfo[f].duration
             else: -1.0
-    let title = if f.contains("://"): a.linkTitles.getOrDefault(f, f) else: f.splitFile.name
-    entries.add PlaylistEntry(path: (if f.contains("://"): f else: f.absolutePath),
-                              title: title, duration: d)
+    let title = if f.contains("://"): a.linkTitles.getOrDefault(f, f)
+                elif f.isCueEntry: f.fileTitle
+                else: f.splitFile.name
+    result.add PlaylistEntry(path: (if f.contains("://"): f else: f.absolutePath),
+                             title: title, duration: d)
+
+proc savePlaylist(a: App, path: string) =
+  ## M3U, or PLS for a .pls name; .m3u is added when there is no extension.
+  ## The playlist is the file's from then on: Autosave keeps it up to date.
+  var p = path
+  if p.splitFile.ext.len == 0: p.add ".m3u"
   try:
-    writePlaylist(p, entries)
-    a.osd("Playlist saved: " & p.extractFilename)
+    writePlaylist(p, a.playlistEntries)
+    a.bindPlaylist(p)
+    if a.plAutosaveAsk and a.plFile notin a.cfg.playlistAutosave:
+      a.cfg.playlistAutosave.add a.plFile
+    a.osd((if a.playlistAutosaves: "Playlist saved, autosaving: " else: "Playlist saved: ") &
+      p.extractFilename)
   except IOError, OSError:
     a.osd("Cannot save playlist: " & p.extractFilename)
+  a.plAutosaveAsk = false
+
+proc playlistOnline(a: App): bool =
+  ## The playlist has a YouTube playlist still to list (or being listed): its
+  ## entries are the site's until saved to a file.
+  a.ytList.running and a.ytListTab == a.shownId or
+    a.playlist.anyIt(it.contains("youtu") and it.youtubeList.len > 0 and it notin a.ytListed)
+
+proc setPlaylistAutosave(a: App, on: bool) =
+  ## The Autosave checkbox: a playlist in no file asks for one first.
+  if a.plFile.len == 0:
+    if on: a.savePlaylistDialog(autosave = true)
+  elif on:
+    if a.plFile notin a.cfg.playlistAutosave: a.cfg.playlistAutosave.add a.plFile
+    a.autosavePlaylist(force = true)
+  else: a.cfg.playlistAutosave.keepItIf(it != a.plFile)
+
+proc autosavePlaylist(a: App, force = false) =
+  ## With Autosave on, writes the playlist to its file when it changed;
+  ## checked a few times a second (`force`: now).
+  let t = now()
+  if not force and t - a.plAutosaveAt < 0.25: return
+  a.plAutosaveAt = t
+  if a.plFile.len == 0:
+    a.plOnline = a.playlistOnline
+    return
+  a.plFileWritable = a.plFile.fileWritable  # it may change meanwhile
+  if not a.playlistAutosaves or a.playlist == a.plFileList or not a.plFileWritable: return
+  try:
+    writePlaylist(a.plFile, a.playlistEntries)
+    a.plFileList = a.playlist
+    a.plAutosaveFailed = false
+  except IOError, OSError:
+    if not a.plAutosaveFailed: a.osd("Cannot autosave playlist: " & a.plFile.extractFilename)
+    a.plAutosaveFailed = true
 
 proc askExternal(a: App)  # Run menu, below
 
@@ -4089,8 +5399,18 @@ proc handleDialogResult(a: App, purpose: string, paths: seq[string]) =
   of "open": a.openPaths(paths)
   of "opendir": a.openPaths(paths[0 .. 0])
   of "pladd": a.addToPlaylist(paths)
+  of "avsadd":
+    a.cfg.avsLastDir = paths[0].parentDir  # saved by addAvs
+    a.addAvs(paths)
+  of "avsadddir":
+    a.cfg.avsLastDir = paths[0]  # saved by addAvs
+    a.addAvs(paths[0 .. 0])
   of "plload": a.loadPlaylist(paths[0])
-  of "plsave": a.savePlaylist(paths[0])
+  of "plsave":
+    let ti = if a.plDialogTab == 0: a.tabView else: a.tabAt(a.plDialogTab)
+    if ti >= 0:
+      a.inTab(ti): a.savePlaylist(paths[0])
+    else: a.osd("The playlist to save was closed")
   of "savemedia": a.startSave(paths[0])
   of "bmexport": a.exportBookmarks(paths[0])
   of "bmimport": a.importBookmarks(paths[0])
@@ -4108,6 +5428,8 @@ proc handleDialogResult(a: App, purpose: string, paths: seq[string]) =
     if a.overlay == ovOptions: a.cfg.mkvpropedit = paths[0]
   of "optytdlp":  # Options' yt-dlp Browse... button
     if a.overlay == ovOptions: a.cfg.ytdlp = paths[0]
+  of "optsoundfont":  # Options' SoundFont Browse... button
+    if a.overlay == ovOptions: a.cfg.soundFont = paths[0]
   of "optshotdir", "optopendir", "optwebdir":  # Options' Browse... buttons
     if a.overlay == ovOptions:
       if purpose == "optshotdir": a.cfg.screenshotDir = paths[0]
@@ -4139,7 +5461,7 @@ proc pollDialog(a: App) =
 proc gatherProperties(a: App) =
   ## MediaInfo-style report, plus how this player is decoding the file.
   let h = a.player.h
-  a.props = gatherMediaInfo(h, a.player.path)
+  a.props = gatherMediaInfo(h, a.player.path.cueFile)
   a.propScroll = 0
   var p = InfoSection(title: "Playback")
   template add(k, v: string) =
@@ -4195,10 +5517,26 @@ proc syncSettings(a: App) =
   if not a.coverSynced or c.coverNames != a.coverNames:
     a.coverNames = c.coverNames
     a.player.setCoverNames(coverNameList(c.coverNames))
+  if not a.coverSynced or c.showFileCover != a.fileCoverShown:
+    a.fileCoverShown = c.showFileCover
+    if a.standby != nil: a.standby.fileCover = c.showFileCover
+    a.player.setFileCover(c.showFileCover)
   if not a.coverSynced or c.showCover != a.coverShown:
     a.coverShown = c.showCover
     a.player.showCover(c.showCover)
   a.coverSynced = true
+  # ReplayGain on every player that sounds: the loop sound and the standby
+  # taking over must keep the level. mpv applies the fallback gain even with
+  # ReplayGain off, so it's 0 then.
+  let rgKey = &"{c.replayGain}|{c.replayGainPreamp}|{c.replayGainFallback}|{c.replayGainNoClip}"
+  if rgKey != a.rgKey:
+    a.rgKey = rgKey
+    for p in [a.player, a.standby, a.lsound]:
+      if p == nil: continue
+      p.h.setProp("replaygain", ["no", "track", "album"][c.replayGain.ord])
+      p.h.setProp("replaygain-preamp", c.replayGainPreamp)
+      p.h.setProp("replaygain-clip", not c.replayGainNoClip)
+      p.h.setProp("replaygain-fallback", if c.replayGain == rgOff: 0.0 else: c.replayGainFallback)
   if key == a.settingsKey: return
   a.settingsKey = key
   a.applyOsd()
@@ -4263,15 +5601,18 @@ proc closeOptions(a: App, ok: bool) =
     a.optWin.visible = false
     a.window.activate()
 
-proc newDialogWindow(a: App, title: string, size: IVec2, modal = true): (Window, Silky, Ui) =
+proc newDialogWindow(a: App, title: string, size: IVec2, modal = true,
+                     resizable = false): (Window, Silky, Ui) =
   ## A hidden dialog window over the main one, with its own Silky and Ui.
-  let w = newWindow(title, size, style = Decorated, visible = false,
+  let w = newWindow(title, size, style = if resizable: DecoratedResizable else: Decorated,
+    visible = false,
     vsync = false)
   # Windy made the new window's own context current; it is drawn with the
   # main one instead (same visual), sharing the atlas texture and shaders.
   makeContextCurrent(a.window)
   w.icon = appIcon()
   w.setDialogFor(a.window, modal)
+  w.keepContentsOnResize(colPanel)
   let sk = newSilky(w, a.atlasImg, a.atlas)
   sk.uiScale = a.sk.uiScale
   sk.atlasScale = a.sk.atlasScale
@@ -4282,7 +5623,7 @@ proc newDialogWindow(a: App, title: string, size: IVec2, modal = true): (Window,
     a.inputPending = true
   w.onMouseMove = touch
   w.onFocusChange = touch
-  w.onResize = touch
+  w.onResize = input  # drawn at once, so the new size isn't shown empty
   w.onScroll = input
   w.onButtonPress = proc (b: Button) = input()
   w.onButtonRelease = proc (b: Button) = input()
@@ -4295,15 +5636,16 @@ proc ensureOptionsWindow(a: App) =
   if a.optWin != nil: return
   (a.optWin, a.optSk, a.optUi) = a.newDialogWindow("Options", OptionsSize)
 
-proc showDialog(a: App, w: Window, size: IVec2) =
+proc showDialog(a: App, w: Window, size: IVec2, minSize = ivec2(0, 0)) =
   ## Centres a dialog's frame on the main window's frame (both have the
-  ## same decorations), kept on the main window's monitor. size is in UI units.
+  ## same decorations), kept on the main window's monitor. size is in UI units,
+  ## as is minSize, which makes it resizable down to that.
   let size = a.px(size)
   var pos = a.window.framePos + (a.window.size - size) div 2
   let m = monitorAt(a.window.pos + a.window.size div 2)
   pos.x = clamp(pos.x, m.pos.x, max(m.pos.x, m.pos.x + m.size.x - size.x))
   pos.y = clamp(pos.y, m.pos.y, max(m.pos.y, m.pos.y + m.size.y - size.y))
-  w.placeDialog(pos, size)
+  w.placeDialog(pos, size, a.px(minSize))
   w.visible = true
   w.activate()
 
@@ -4314,9 +5656,11 @@ proc applyUiScale(a: App) =
   ## sized in UI units follow (the main window keeps its size).
   let s = a.uiScale
   if s == a.sk.uiScale: return
+  discard a.rememberAvsWinSize()  # at the old scale
   let (img, atlas) = buildAtlas(s)
   (a.atlasImg, a.atlas) = (img, atlas)
-  for sk in [a.sk, a.optSk, a.renSk, a.cmdSk, a.pickSk, a.syncSk, a.ytSk, a.embSk, a.upSk, a.eqSk]:
+  for sk in [a.sk, a.optSk, a.renSk, a.cmdSk, a.pickSk, a.syncSk, a.ytSk, a.embSk, a.upSk, a.eqSk,
+             a.tagSk, a.avsSk]:
     if sk == nil: continue
     (sk.image, sk.atlas, sk.builder) = (img, atlas, AtlasBuilder(nil))
     sk.uiScale = s
@@ -4324,8 +5668,11 @@ proc applyUiScale(a: App) =
     sk.uploadAtlas()
   for (w, size) in [(a.optWin, OptionsSize), (a.renWin, RenameSize), (a.cmdWin, CommandsSize),
                     (a.syncWin, SyncSize), (a.ytWin, YtdlpSize), (a.embWin, EmbedSize),
+                    (a.tagWin, TagSize),
                     (a.upWin, UpdateSize), (a.eqWin, EqualizerSize)]:
     if w != nil and w.visible: a.showDialog(w, size)
+  if a.avsWin != nil and a.avsWin.visible:
+    a.showDialog(a.avsWin, a.avsWinSize, AvsMinSize)
   if a.pickWin != nil and a.pickWin.visible:
     let (sw, sh) = a.pickDlg.size
     a.showDialog(a.pickWin, ivec2(sw, sh))
@@ -4380,6 +5727,8 @@ proc closeRename(a: App, keep = false) =
 const MatroskaExts = [".mkv", ".mka", ".mk3d", ".webm"]
 
 proc closeDialogs(a: App)  # below
+proc closePalette(a: App)  # below
+proc showPalette(a: App)  # below
 proc closeUpdate(a: App)  # Check for Updates, below
 proc shortPath(path: string): string  # yt-dlp, below
 
@@ -4516,9 +5865,8 @@ proc pollEmbed(a: App) =
   # The contents changed, so did their key: the bookmarks go under the new one.
   a.keyKnown(path, mediaKey(path))
   if a.embClear: a.editBookmarks(path, proc (marks: var seq[Bookmark]) = marks.setLen 0)
-  if a.player.loaded and a.player.path == path and
-     a.plIndex >= 0 and a.plIndex < a.playlist.len and a.playlist[a.plIndex] == path:
-    a.playIndex(a.plIndex, a.player.timePos)
+  if a.player.loaded and a.player.path == path and a.playingEntry == path:
+    a.inPlaying: a.playIndex(a.plIndex, a.player.timePos)
   a.osd("Chapters embedded" & (if a.embClear: ", bookmarks cleared" else: ""))
 
 proc showSyncProps(a: App) =
@@ -4538,6 +5886,113 @@ proc closeSyncProps(a: App) =
   if a.syncWin.visible:
     a.syncWin.visible = false
     a.window.activate()
+
+# --- Playlist > Properties ----------------------------------------------------
+# The selected files' tags, edited in a window of their own (tagdlg) and
+# written with TagLib (tagedit) on OK or Apply.
+
+proc tagPaths(a: App): seq[string] =
+  ## The selection's files on disk, in playlist order.
+  for i in a.plSelection:
+    let p = a.playlist[i]
+    if not p.contains("://") and fileExists(p) and p notin result: result.add p
+
+proc showTagProps(a: App) =
+  a.menus.close()
+  let paths = a.tagPaths
+  if paths.len == 0: return
+  if a.overlay notin {ovNone, ovTags}: a.closeDialogs()
+  if a.tagWin == nil:
+    (a.tagWin, a.tagSk, a.tagUi) = a.newDialogWindow("Properties", TagSize)
+  let pattern = if a.cfg.tagPatterns.len > 0: a.cfg.tagPatterns[0] else: ""
+  a.tagDlg = newTagDialog(paths, pattern, a.cfg.tagPatterns, a.cfg.tagNumberTotal, a.cfg.tagNumberPad)
+  a.tagDlg.colWidths = a.cfg.tagColumnWidths
+  a.tagUi.focusId = ""
+  a.showDialog(a.tagWin, TagSize)
+  a.overlay = ovTags
+
+proc closeTagProps(a: App) =
+  if a.tagDlg != nil:
+    (a.cfg.tagNumberTotal, a.cfg.tagNumberPad) = (a.tagDlg.numberTotal, a.tagDlg.numberPad)
+    a.cfg.save()
+  a.tagUi.focusId = ""
+  a.overlay = ovNone
+  if a.tagWin.visible:
+    a.tagWin.visible = false
+    a.window.activate()
+
+proc rekeyMedia(a: App, path, oldKey: string) =
+  ## path's contents changed (its tags): its bookmarks and saved equalizer,
+  ## kept under the key of its old contents, go under the new one's.
+  let key = mediaKey(path)
+  if key == oldKey or key == path: return
+  a.bookmarks = loadBookmarks()  # as another player may have left them
+  if oldKey in a.bookmarks and key notin a.bookmarks:
+    var e = a.bookmarks[oldKey]
+    e.path = path
+    a.bookmarks.del oldKey
+    a.bookmarks[key] = e
+    a.bookmarks.save()
+  if oldKey in a.equalizers and key notin a.equalizers:
+    let e = a.equalizers[oldKey]
+    a.equalizers.del oldKey
+    a.equalizers[key] = e
+    a.equalizers.save()
+  if a.bmPath == path: a.bmKey = key
+
+proc applyTags(a: App): bool =
+  ## Writes the Properties window's edits; false when a file couldn't be.
+  ## The file playing opens again where it is, for mpv to read it as it
+  ## is now (its new tags, and its data where TagLib moved it).
+  let d = a.tagDlg
+  let p = a.player
+  var saved = 0
+  var notes: seq[string]
+  var failed = false
+  var reopen = false
+  for i in 0 ..< d.files.len:
+    if not d.files[i].changed: continue
+    let path = d.files[i].path
+    let oldKey = mediaKey(path)
+    let (ok, msg) = d.saveFile(i)
+    if not ok:
+      failed = true
+      notes.add path.extractFilename & ": " & msg
+      continue
+    inc saved
+    if msg.len > 0: notes.add path.extractFilename & ": " & msg
+    a.rekeyMedia(path, oldKey)
+    # The playlist's columns show the new fields right away.
+    if path in a.mediaInfo:
+      var fields: seq[(string, string)]
+      for k, vs in d.files[i].tags:
+        if vs.len > 0: fields.add (k, vs[0])
+      a.mediaInfo[path].retag(fields)
+    if p.loaded and p.path == path: reopen = true
+  if a.prober != nil: a.prober.finish()
+  if reopen and not a.reopening:
+    a.reopening = true
+    a.reopenTracks = p.tracks.filterIt(it.external and it.kind in ["sub", "audio"])
+    a.reopenSel = @[("aid", p.selectedTrack("audio")), ("sid", p.selectedTrack("sub")),
+                    ("vid", p.selectedTrack("video"))]
+    p.reopen(p.threadless)
+  d.statusError = notes.len > 0
+  d.status =
+    if notes.len > 0: notes.join("; ")
+    elif saved == 1: "Saved 1 file"
+    else: &"Saved {saved} files"
+  if saved > 0: a.osd(if saved == 1: "Tags saved" else: &"Tags saved to {saved} files")
+  a.dirtyUntil = max(a.dirtyUntil, now() + 0.2)
+  not failed
+
+proc rememberPattern(a: App, pattern: string) =
+  ## Autofill's pattern first among those used, eight kept.
+  if pattern.strip.len == 0: return
+  a.cfg.tagPatterns.keepItIf(it != pattern)
+  a.cfg.tagPatterns.insert(pattern, 0)
+  if a.cfg.tagPatterns.len > 8: a.cfg.tagPatterns.setLen 8
+  a.tagDlg.patterns = a.cfg.tagPatterns
+  a.cfg.save()
 
 proc toggleEqualizer(a: App) =
   ## Shows the Equalizer window, or hides it. Not a dialog the player waits
@@ -4614,6 +6069,53 @@ proc setPlaylistShown(a: App, shown: bool) =
   a.cfg.showPlaylist = shown
   let w = int32(a.playlistWidth)
   a.resizeKeepingVideo(ivec2(if shown: w else: -w, 0))
+
+# --- playlist search (Ctrl+F) ------------------------------------------------
+
+proc plFindMatches(a: App): seq[int] =
+  ## Entries whose name, filename, artist or album hold every word searched
+  ## for, ignoring case.
+  let words = strutils.splitWhitespace(unicode.toLower(a.plFind))
+  if words.len == 0: return
+  for i, p in a.playlist:
+    let m = a.mediaInfo.getOrDefault(p)
+    let hay = unicode.toLower(a.rowName(p) & "\n" & p.extractFilename & "\n" & m.artist & "\n" & m.album)
+    if words.allIt(it in hay): result.add i
+
+proc plFindGo(a: App, step: int) =
+  ## Selects the next (step 1) or previous (-1) match from the selection,
+  ## wrapping around; step 0 selects the first one from where searching began.
+  a.plFindHits = a.plFindMatches
+  let hits = a.plFindHits
+  if hits.len == 0: return
+  var j =
+    if step == 0: hits.lowerBound(a.plFindFrom)
+    elif step > 0: hits.lowerBound(a.plSelected + 1)
+    else: hits.lowerBound(a.plSelected) - 1
+  if j >= hits.len: j = 0
+  if j < 0: j = hits.high
+  a.selectOnly(hits[j])
+  a.plReveal = true
+  a.dirtyUntil = max(a.dirtyUntil, now() + 0.1)
+
+proc openPlaylistFind(a: App) =
+  ## Shows the playlist with its search bar, the field taking the keyboard
+  ## with its text selected.
+  a.setPlaylistShown(true)
+  if a.playlistLocked: return
+  a.plFindOpen = true
+  a.plFindFrom = max(0, a.plSelected)
+  a.plFocused = true
+  a.ui.focusId = "pl-find"
+  a.ui.focusFresh = true
+  a.dirtyUntil = max(a.dirtyUntil, now() + 0.1)
+
+proc closePlaylistFind(a: App) =
+  ## Hides the search bar; the selection stays on the match it reached.
+  a.plFindOpen = false
+  a.plFindHits.setLen 0
+  if a.ui.focusId == "pl-find": a.ui.focusId = ""
+  a.dirtyUntil = max(a.dirtyUntil, now() + 0.1)
 
 proc setRunLogShown(a: App, shown: bool) =
   ## Shows or hides the run log, growing or shrinking the window by its height.
@@ -4792,8 +6294,7 @@ proc ytStatus(a: App): string =
     if j.bytes > 0 and j.speed > 0: result.add " · " & fmtBytes(j.speed) & "/s"
   of ytCaptions, ytSubs, ytPlaylist, ytInfo, ytDownload: discard  # their own slots, quietly
 
-proc ytCurrentLink(a: App): string =
-  if a.plIndex in 0 ..< a.playlist.len: a.playlist[a.plIndex] else: ""
+proc ytCurrentLink(a: App): string = a.playingEntry
 
 proc ytOpen(a: App, url: string, delay = 0.0) =
   ## Streams url again (from where it was tried), unless another entry has
@@ -4802,7 +6303,7 @@ proc ytOpen(a: App, url: string, delay = 0.0) =
     (a.ytRetry, a.ytRetryAt, a.ytRetryNet) = (url, now() + delay, false)
   elif url.len > 0 and a.ytCurrentLink == url:
     if a.streamArgs.url == url: a.streamLink(url, a.streamArgs.start, a.streamArgs.opts)
-    else: a.playIndex(a.plIndex)
+    else: a.inPlaying: a.playIndex(a.plIndex)
 
 proc ytGiveUp(a: App) =
   ## The link's stream failed, yt-dlp as new as it gets. yt-dlp's reason, when
@@ -4828,11 +6329,13 @@ proc closeDialogs(a: App) =
   of ovRename: a.closeRename()
   of ovCommands: a.closeCommands()
   of ovSync: a.closeSyncProps()
+  of ovTags: a.closeTagProps()
   of ovYtdlp:
     a.ytUi.focusId = ""
     a.ytWin.visible = false
   of ovEmbed: a.closeEmbed()
   of ovUpdate: a.closeUpdate()
+  of ovPalette: a.closePalette()
   else: discard
   a.overlay = ovNone
 
@@ -5016,13 +6519,10 @@ proc pollStyled(a: App) =
   a.styleSaved(j.link)
   if a.player.path == j.link and a.player.loaded: a.addStyled(j.link)
 
-proc pollYtList(a: App) =
-  ## A YouTube playlist's videos, as yt-dlp finds them: those before the
-  ## link's own video go before it, the rest after (a playlist alone: the
-  ## first in its place, playing).
-  let j = a.ytList
-  if j == nil or not j.poll(): return
-  a.dirtyUntil = max(a.dirtyUntil, now() + 0.1)
+proc takeYtItems(a: App, j: YtJob): bool =
+  ## pollYtList's new videos into the shown playlist; false once the link
+  ## is gone from it (or it's locked), for the listing to stop.
+  result = true
   let link = j.url
   let id = link.youtubeId
   while a.ytListUsed < j.items.len:
@@ -5032,10 +6532,7 @@ proc pollYtList(a: App) =
     if dur > 0: a.mediaInfo.mgetOrPut(url, MediaInfo()).duration = dur
     a.noteLink(url, title, MediaInfo(duration: dur))
     let at = a.playlist.find(if a.ytListLast.len > 0: a.ytListLast else: link)
-    if at < 0 or a.playlistLocked:  # gone from the playlist meanwhile
-      j.stop()
-      a.ytList = nil
-      return
+    if at < 0 or a.playlistLocked: return false  # gone from the playlist meanwhile
     if vid == id and a.ytListLast.len == 0:
       a.ytListLast = link
       if link notin a.linkTitles: a.linkTitles[link] = title
@@ -5056,6 +6553,25 @@ proc pollYtList(a: App) =
     for m in a.plMarks.mitems:
       if m >= pos: inc m
     if a.ytListLast.len > 0: a.ytListLast = url
+
+proc pollYtList(a: App) =
+  ## A YouTube playlist's videos, as yt-dlp finds them, into the playlist
+  ## that listed it, shown or not: those before the link's own video go
+  ## before it, the rest after (a playlist alone: the first in its place,
+  ## playing).
+  let j = a.ytList
+  if j == nil or not j.poll(): return
+  a.dirtyUntil = max(a.dirtyUntil, now() + 0.1)
+  let ti = a.tabAt(a.ytListTab)
+  var going = ti >= 0
+  if going:
+    a.inTab(ti): going = a.takeYtItems(j)
+  if not going:  # its playlist closed, or the link gone from it
+    j.stop()
+    a.ytList = nil
+    return
+  let link = j.url
+  let id = link.youtubeId
   if j.running: return
   a.ytList = nil
   if j.code != 0 and a.ytListUsed == 0:
@@ -5321,7 +6837,7 @@ proc restartRenderer(a: App, cpu: bool) =
   ## Restarts onto the CPU or the GPU, unless something going on would be
   ## lost or cut short: then it's looked at again shortly.
   if a.overlay != ovNone or a.pickOpen or a.menus.isOpen or pointerButtonsDown() or
-     a.saveJob.running or a.upJob.running or a.embProc != nil or a.upRestart:
+     a.saveJob.running or a.rgJob.running or a.upJob.running or a.embProc != nil or a.upRestart:
     return
   a.rdRestart = if cpu: "cpu" else: "gpu"
   a.window.closeRequested = true
@@ -5676,6 +7192,73 @@ proc relabeled(n: MenuNode, label: string): MenuNode =
   result[] = n[]
   result.label = label
 
+proc fmtDb(v: float, decimals = 1): string =
+  if abs(v) < 0.005: "0 dB"
+  else: (if v > 0: "+" else: "") & formatFloat(v, ffDecimal, decimals) & " dB"
+
+proc currentRg(a: App): ReplayGain =
+  ## The ReplayGain values of the audio track playing; none known without one.
+  for t in a.player.tracks:
+    if t.kind == "audio" and t.selected: return t.rg
+
+proc rgButton(a: App): bool =
+  ## A local file with sound is open: the controls show the ReplayGain button.
+  let p = a.player
+  p.loaded and not p.path.contains("://") and p.tracks.anyIt(it.kind == "audio")
+
+proc replayGainItems(a: App, m: MenuNode, rg: ReplayGain, read: bool) =
+  ## ReplayGain's menu items. With `read` (the file's tags were read), first
+  ## what the file has and the gain it gets, on purple; then the mode, the
+  ## gains, clipping and the Options page.
+  let c = a.cfg
+  if read:
+    if rg.known:
+      m.item("Track Gain", &"{fmtDb(rg.trackGain, 2)}  (peak {rg.trackPeak:.3f})")
+      if rg.albumGain != rg.trackGain or rg.albumPeak != rg.trackPeak:
+        m.item("Album Gain", &"{fmtDb(rg.albumGain, 2)}  (peak {rg.albumPeak:.3f})")
+      else:
+        m.item("Album Gain", "same as track")
+      m.item("Applied", if c.replayGain == rgOff: "none (off)"
+        else: fmtDb(rg.applied(c.replayGain == rgAlbum, c.replayGainPreamp, c.replayGainNoClip), 2))
+    else:
+      m.item("No ReplayGain Values", if c.replayGain == rgOff: ""
+        else: fmtDb(c.replayGainFallback) & " applied")
+    m.markContextual()
+    m.sep()
+  let setMode = proc (x: ReplayGainMode) =
+    a.cfg.replayGain = x
+    a.cfg.save()
+    a.osd("ReplayGain: " & ["off", "track gain", "album gain"][x.ord])
+  for (label, x) in [("Off", rgOff), ("Use Track Gain", rgTrack), ("Use Album Gain", rgAlbum)]:
+    m.radio(label, checked = c.replayGain == x, action = bindAct(setMode, x))
+  m.sep()
+  # A value set in Options between the steps shows on top, picked.
+  proc steps(m: MenuNode, label: string, value: float, values: openArray[float],
+             pick: proc (v: float)) =
+    let s = m.sub(label & ": " & fmtDb(value))
+    if value notin values:
+      s.radio(fmtDb(value), checked = true)
+      s.sep()
+    for v in values:
+      s.radio(fmtDb(v), checked = value == v, action = bindAct(pick, v))
+    s.markListed()
+  m.steps("Pre-amp", c.replayGainPreamp, [12.0, 9, 6, 3, 0, -3, -6, -9, -12], proc (v: float) =
+    a.cfg.replayGainPreamp = v
+    a.cfg.save()
+    a.osd("ReplayGain pre-amp: " & fmtDb(v)))
+  m.steps("Without ReplayGain", c.replayGainFallback, [6.0, 3, 0, -3, -6, -9, -12], proc (v: float) =
+    a.cfg.replayGainFallback = v
+    a.cfg.save()
+    a.osd("Without ReplayGain: " & fmtDb(v)))
+  m.check("Prevent Clipping", checked = c.replayGainNoClip, action = proc () =
+    a.cfg.replayGainNoClip = not a.cfg.replayGainNoClip
+    a.cfg.save()
+    a.osd("Prevent clipping: " & (if a.cfg.replayGainNoClip: "on" else: "off")))
+  m.sep()
+  m.item("ReplayGain Options...", action = proc () =
+    a.showOverlay(ovOptions)
+    a.optionsDlg.selectPage(a.optUi, opReplayGain))
+
 proc rlSelection(a: App): string =
   ## The run log text selected by dragging, its rows joined by newlines.
   var (s, e) = (a.rlSelFrom, a.rlSelTo)
@@ -5690,6 +7273,9 @@ proc rlSelection(a: App): string =
 
 proc recentName(a: App, path: string): string =
   ## An Open Recent entry's name: "title [id]" for a link.
+  if path.isCueEntry:
+    let album = path.cueTrack.sheet.title
+    return if album.len > 0: path.fileTitle & " (" & album & ")" else: path.fileTitle
   if not path.isWebLink: return path.extractFilename
   var title = a.linkTitles.getOrDefault(path, a.cfg.recentTitles.getOrDefault(path))
   if title.len == 0: title = a.saved.lookup(path).title
@@ -5720,6 +7306,7 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
   if a.cfg.recentFiles.len > 0:
     recent.sep()
     recent.item("Clear List", action = proc () = a.cfg.clearRecent())
+  recent.markListed()
   file.item("Open Directory...", enabled = not locked, action = proc () =
     a.ask(dkOpenDir, "opendir", "Open Directory"))
   file.item("Open From Clipboard", k(kaOpenClipboard), enabled = not locked,
@@ -5727,8 +7314,7 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
   file.item("Copy to Clipboard", k(kaCopyClipboard), enabled = loaded,
     action = proc () = a.copyToClipboard())
   file.item("Copy YouTube Link at Current Time", k(kaCopyTimeLink),
-    enabled = loaded and a.plIndex in 0 ..< a.playlist.len and
-      a.playlist[a.plIndex].youtubeId.len > 0, action = proc () = a.copyTimeLink())
+    enabled = loaded and a.playingEntry.youtubeId.len > 0, action = proc () = a.copyTimeLink())
   if a.saveJob.running:
     file.item("Cancel Saving", action = proc () = a.cancelSave())
   else:
@@ -5865,20 +7451,23 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
   let (playPause, stop) = (play.children[0], play.children[1])
   play.item("Frame Forward", k(kaFrameForward), enabled = loaded, action = proc () = a.frameStep(true))
   play.item("Frame Back", k(kaFrameBack), enabled = loaded, action = proc () = a.frameStep(false))
-  play.item(&"Faster Playback (+{a.cfg.rateStep:g}x)", k(kaFaster), enabled = loaded,
+  play.item(&"Fast-Forward (+{a.cfg.rateStep:g}x)", k(kaFaster), enabled = loaded,
     action = proc () = a.changeRate(1))
-  play.item(&"Slower Playback (-{a.cfg.rateStep:g}x)", k(kaSlower), enabled = loaded,
+  play.item(&"Slow Down (-{a.cfg.rateStep:g}x)", k(kaSlower), enabled = loaded,
     action = proc () = a.changeRate(-1))
   let rep = play.sub("Repeat")
-  rep.check("Forever", k(kaRepeatForever), cfg.repeatForever, action = proc () =
-    a.cfg.repeatForever = not a.cfg.repeatForever; a.applyLoop())
+  rep.check("Enabled", k(kaRepeatForever), cfg.repeatForever, action = proc () =
+    a.toggleRepeat())
   rep.check("Ping-Pong", k(kaRepeatPingPong), cfg.repeatPingPong, action = proc () =
-    a.cfg.repeatPingPong = not a.cfg.repeatPingPong; a.applyLoop(); a.applyAbLoop())
+    a.cfg.repeatPingPong = not a.cfg.repeatPingPong; a.applyLoop(); a.applyAbLoop()
+    if a.cfg.repeatForever: a.repeatOsd())
   rep.sep()
   rep.radio("File", "", cfg.repeatMode == rmFile, action = proc () =
-    a.cfg.repeatMode = rmFile; a.applyLoop())
+    a.cfg.repeatMode = rmFile; a.applyLoop()
+    if a.cfg.repeatForever: a.repeatOsd())
   rep.radio("Playlist", "", cfg.repeatMode == rmPlaylist, action = proc () =
-    a.cfg.repeatMode = rmPlaylist; a.applyLoop())
+    a.cfg.repeatMode = rmPlaylist; a.applyLoop()
+    if a.cfg.repeatForever: a.repeatOsd())
   rep.sep()
   rep.check("Loop A-B", "", a.abLoop and a.loopReady, enabled = loaded and a.loopReady,
     action = proc () =
@@ -5891,7 +7480,8 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
   for (title, kind, prop) in [("Audio Track", "audio", "aid"),
                               ("Subtitle Track", "sub", "sid"),
                               ("Video Track", "video", "vid")]:
-    let m = play.sub(title, enabled = loaded)
+    # Always Disable is there with nothing open too.
+    let m = play.sub(title, enabled = loaded or kind == "video")
     trackMenus.add m
     # A link's languages stand for its one audio track: it comes in one at a
     # time. Audio loaded from a file is listed still.
@@ -5899,8 +7489,8 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
                 else: @[]
     let dubbed = langs.len > 1
     let opening = dubbed and not p.tracks.anyIt(it.kind == "audio")  # in another one, perhaps
-    m.radio("None", "", p.selectedTrack(kind) == 0 and not opening,
-      action = bindAct(selectTrack, (prop, 0)))
+    m.radio("None", "", loaded and p.selectedTrack(kind) == 0 and not opening,
+      enabled = loaded, action = bindAct(selectTrack, (prop, 0)))
     if dubbed:
       let lang = a.audioRows(p.path)[0].lang
       let heard = opening or p.tracks.anyIt(it.kind == "audio" and it.selected and not it.loadedFile)
@@ -5910,6 +7500,13 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
     for t in p.tracks:
       if t.kind == kind and (not dubbed or t.loadedFile):
         m.radio(t.trackLabel, "", t.selected, action = bindAct(selectTrack, (prop, t.id)))
+    m.markListed()
+    if kind == "video":
+      m.sep()
+      m.check("Always Disable", "", a.cfg.noVideo, action = proc () =
+        a.cfg.noVideo = not a.cfg.noVideo
+        a.cfg.save()
+        a.applyNoVideo())
   play.sep()
   let vol = play.sub("Volume")
   vol.item("Up", k(kaVolumeUp), action = proc () = a.volumeStep(true))
@@ -5940,8 +7537,10 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
   let marks = a.fileBookmarks
   if marks.len > 0:
     bm.sep()
+    let first = bm.children.len
     for i, b in marks:
       bm.item(fmtTime(b.time, dur = p.duration) & "  " & b.label(i), action = bindAct(proc (t: float) = a.seekTo(t), b.time))
+    bm.markListed(first)
   nav.sep()
   nav.item(&"Jump Forward {a.cfg.seekStep:g}s", k(kaJumpForward), enabled = loaded,
     action = proc () = a.seekRelative(a.cfg.seekStep))
@@ -5956,6 +7555,7 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
   for i, c in p.chapters:
     let label = fmtTime(c.time, dur = p.duration) & "  " & (if c.title.len > 0: c.title else: &"Chapter {i + 1}")
     chm.item(label, action = bindAct(proc (t: float) = a.seekTo(t), c.time))
+  chm.markListed()
   nav.item("Next Chapter", k(kaNextChapter), enabled = canStep, action = proc () = a.chapterStep(1))
   nav.item("Previous Chapter", k(kaPrevChapter), enabled = canStep, action = proc () = a.chapterStep(-1))
   nav.sep()
@@ -5982,6 +7582,7 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
     if peer.pid == a.syncMaster: label.add "  · master"
     elif peer.master != 0 and peer.pid notin a.syncMembers: label.add "  · synchronized elsewhere"
     syn.check(label, checked = peer.pid in a.syncMembers, action = bindAct(toggle, peer.pid))
+  syn.markListed(4)  # the players, after Connect All, Disconnect All, Properties...
 
   # Run: the Commands window and the command lines it saved.
   let run = root.sub("Run")
@@ -5998,18 +7599,27 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
       if first: run.sep()
       first = false
       run.item(c.title, action = bindAct(runOne, c))
+  run.markListed(1)  # the command lines, after Commands...
 
   # Help
   let help = root.sub("Help")
   help.item("Keyboard Shortcuts", k(kaShortcuts), action = proc () = a.showOverlay(ovShortcuts))
+  help.item("Command Palette", k(kaCommandPalette), action = proc () = a.showPalette())
   help.item("Check for Updates...", action = proc () = a.checkForUpdates())
   help.sep()
   help.item("About " & AppName, action = proc () = a.showOverlay(ovAbout))
 
   # Right-click menu, built from the bar's nodes.
   let ctx = newMenuRoot()
-  # A tracker module has no cover: its chart instead (with libopenmpt).
-  let module = a.isModule
+  # A picture dropped or pasted on the file: first, over everything else.
+  if loaded and a.qcImage.len > 0 and a.qcFor == p.path:
+    let shown = a.quickCoverShown
+    ctx.check("Show Quick Cover", checked = shown, action = proc () = a.showQuickCover(not shown))
+    ctx.check("Save Quick Cover", checked = a.quickCoverSaved, action = proc () =
+      a.toggleSaveQuickCover())
+    ctx.sep()
+  # A tracker module or MIDI file has no cover: its chart instead.
+  let module = a.isModule or a.isMidi
   if module and a.chart != nil and (a.chart.song != nil or a.chart.tried != p.path or
                                     not a.cfg.showTrackerChart):
     ctx.check("Show Tracker Chart", checked = a.cfg.showTrackerChart, action = proc () =
@@ -6025,9 +7635,51 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
       a.cfg.showCover = not a.cfg.showCover
       a.cfg.save()
       a.syncSettings())
+    # A picture named after the file, over the one inside it and the folder's.
+    if a.player.hasOwnCover:
+      ctx.check("Show Front Cover (file)", checked = a.cfg.showFileCover,
+                enabled = a.cfg.showCover, action = proc () =
+        a.cfg.showFileCover = not a.cfg.showFileCover
+        a.cfg.save()
+        a.syncSettings())
+    ctx.sep()
+  # The visualizer, for sound without a picture.
+  if loaded and not p.hasVideo:
+    ctx.check("Show Visualizer", checked = a.cfg.showVisualizer, action = proc () =
+      a.cfg.showVisualizer = not a.cfg.showVisualizer
+      a.cfg.save()
+      a.dirtyUntil = max(a.dirtyUntil, now() + 0.1))
+    if a.avsShown and a.avs != nil:
+      let pre = ctx.sub("Visualizer Preset")
+      pre.item("Visualizers...", action = proc () = a.showAvsList())
+      pre.sep()
+      pre.item("Next", action = proc () = a.avsStep(1))
+      pre.item("Previous", action = proc () = a.avsStep(-1))
+      pre.item("Random", action = proc () = a.avsStep(0))
+      if a.avs.current >= 0:
+        pre.sep()
+        let rates = pre.sub("Frame Rate")
+        a.avsRateMenu(rates, @[a.avs.presets[a.avs.current]])
+        rates.markListed()
+      pre.sep()
+      # The list itself (the presets turned on), while it's short enough for a menu.
+      let shownPresets = toSeq(0 ..< a.avs.presets.len).filterIt(a.avs.enabled(it))
+      if shownPresets.len in 1 .. 150:
+        let first = pre.children.len
+        for i in shownPresets:
+          let id = a.avs.presets[i]
+          pre.radio(presetName(id), "", i == a.avs.current, action = bindAct(proc (k: int) =
+            if a.avs.select(k):
+              a.cfg.avsPreset = a.avs.presets[k]
+              a.cfg.save(), i))
+        pre.markListed(first)
+        pre.sep()
+      pre.item("Open Presets Folder", action = proc () =
+        a.openFolder(configDir() / "avs")
+        a.avs.rescan())
     ctx.sep()
   # Items about the opened link, in one group.
-  let isYoutube = a.plIndex in 0 ..< a.playlist.len and a.playlist[a.plIndex].youtubeId.len > 0
+  let isYoutube = a.playingEntry.youtubeId.len > 0
   if loaded and a.player.path.contains("://"):
     ctx.item("Copy URL", k(kaCopyClipboard), action = proc () = a.copyToClipboard())
     if isYoutube:
@@ -6047,6 +7699,8 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
         a.cfg.sphereDragMovesWindow = not a.cfg.sphereDragMovesWindow
         a.cfg.save())
     ctx.sep()
+  # All of the above is about what's open: set apart in purple.
+  ctx.markContextual()
   ctx.children.add file
   ctx.sep()
   ctx.children.add [playPause.relabeled("Play/Pause"), stop, rep]
@@ -6091,6 +7745,21 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
     let rc = newMenuRoot()
     rc.children = rep.children
     (root, rc)
+  of cmReplayGain:
+    let rg = newMenuRoot()
+    a.replayGainItems(rg, a.currentRg, a.rgButton)
+    rg.sep()
+    if a.rgJob.running:
+      rg.item("Cancel Analysis", action = proc () = a.cancelReplayGain())
+    else:
+      # The open file's own tags (a sheet's track has none of its own).
+      let path = a.player.path
+      let ok = a.rgButton and not path.isCueEntry and canWriteTags()
+      rg.item("Analyze and Apply as Track", enabled = ok, action = proc () =
+        a.saveReplayGain(rmTrack, @[path]))
+      rg.item("Remove ReplayGain Values", enabled = ok, action = proc () =
+        a.removeReplayGain(@[path]))
+    (root, rg)
   of cmTime:
     let timeCtx = newMenuRoot()
     timeCtx.check("Enable milliseconds", checked = a.cfg.showMillis, action = proc () =
@@ -6115,7 +7784,7 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
     let i = a.ctxBookmark
     let on = i >= 0 and i < a.fileBookmarks.len
     let (t, bt) = (a.ctxSeekT, if on: a.fileBookmarks[i].time else: 0.0)
-    if a.plIndex in 0 ..< a.playlist.len and a.playlist[a.plIndex].youtubeId.len > 0:
+    if a.playingEntry.youtubeId.len > 0:
       # Not at Options > Online's Lowest Quality, which downloads no thumbnails.
       sb.check("Preview YouTube Videos", checked = a.cfg.ytSeekPreview,
         enabled = a.cfg.seekPreview and a.cfg.streamQuality != sqLowest, action = proc () =
@@ -6204,6 +7873,8 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
       else:
         ac.radio(x.label, checked = w.audio == x.id, action = bindAct(pickAudio, x.id))
     if looking: ac.item("...", enabled = false)
+    vc.markListed()
+    ac.markListed()
     (root, q)
   of cmRunLog:
     let rl = newMenuRoot()
@@ -6226,40 +7897,133 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
       let path = a.playlist[a.plSelected]
       pl.item("Open Containing Directory", enabled = not path.contains("://"),
         action = proc () = a.showInFolder(path))
+      pl.item("Properties...", enabled = a.plSelection.anyIt(not a.playlist[it].contains("://")),
+        action = proc () = a.showTagProps())
       pl.sep()
     else:
       pl.item("Add Media File...", enabled = edit, action = proc () =
-        a.ask(dkOpenFiles, "pladd", "Add Media File", exts = @MediaExtensions,
+        a.ask(dkOpenFiles, "pladd", "Add Media File", exts = @MediaExtensions & "cue",
           filterName = "Media files",
-          extraFilters = @[("Tracker modules", @TrackerExtensions)]))
+          extraFilters = @[("Tracker modules", @TrackerExtensions),
+                           ("MIDI files", @MidiExtensions), ("Cue sheets", @["cue"])]))
     pl.item("Remove Media File", k(kaRemoveFromPlaylist), enabled = hasSel and edit, action = proc () =
       a.removeSelected())
     pl.item("Duplicate", "Ctrl+D", enabled = hasSel and edit, action = proc () =
       a.duplicateSelected())
+    pl.item("Find...", k(kaFindPlaylist), enabled = n > 0 and edit, action = proc () =
+      a.openPlaylistFind())
     pl.sep()
+    # The playback queue: what plays next, before the playlist goes on.
+    pl.item("Add to Playback Queue", k(kaQueue), enabled = hasSel and edit, action = proc () =
+      a.queueSelected())
+    if hasSel and a.plSelection.anyIt(a.queuePos(it) > 0):
+      pl.item("Remove from Playback Queue", k(kaUnqueue), action = proc () = a.unqueueSelected())
+    if a.queue.len > 0:
+      pl.item(&"Clear Playback Queue ({a.queue.len})", action = proc () = a.queue.setLen 0)
+    # Send to Playlist: copies; Shift held as it's picked moves them.
+    let send = pl.sub("Send to Playlist", enabled = hasSel and edit)
+    let sendTo = proc (target: int) = a.sendSelected(target, move = a.window.shiftDown)
+    send.item("New Playlist", action = bindAct(sendTo, -1))
+    if a.tabs.len > 1: send.sep()
+    for i, t in a.tabs:
+      if i != a.tabView: send.item(t.name, action = bindAct(sendTo, i))
+    send.markListed()
+    let clean = pl.sub("Clean Up", enabled = n > 0 and edit)
+    clean.item("Crop to Selection", enabled = hasSel and a.plSelection.len < n, action = proc () =
+      a.cropToSelection())
+    clean.item("Remove Duplicates", action = proc () = a.removeDuplicates())
+    clean.item("Remove Missing Files", action = proc () = a.removeDeadItems())
+    pl.sep()
+    let srt = pl.sub("Sort...")
     let sortBy = proc (by: PlaylistField) = a.sortPlaylist(by)
     for (label, by) in [("Sort by A-Z", pfName), ("Sort by Duration", pfDuration),
                         ("Sort by Dimensions", pfDimensions), ("Sort by Size", pfSize)]:
-      pl.item(label, enabled = n > 1 and edit, action = bindAct(sortBy, by))
-    pl.sep()
+      srt.item(label, enabled = n > 1 and edit, action = bindAct(sortBy, by))
+    srt.sep()
     let moveTo = proc (m: PlaylistMove) = a.moveSelected(m)
     let up = a.canMove(true) and edit
     let down = a.canMove(false) and edit
-    pl.item("Move to Top", "Ctrl+Shift+Home", enabled = up, action = bindAct(moveTo, pmTop))
-    pl.item("Move Up", "Ctrl+Shift+Up", enabled = up, action = bindAct(moveTo, pmUp))
-    pl.item("Move Down", "Ctrl+Shift+Down", enabled = down, action = bindAct(moveTo, pmDown))
-    pl.item("Move to Bottom", "Ctrl+Shift+End", enabled = down, action = bindAct(moveTo, pmBottom))
-    pl.sep()
-    pl.item("Randomize", enabled = n > 1 and edit, action = proc () = a.randomizePlaylist())
+    srt.item("Move to Top", "Ctrl+Shift+Home", enabled = up, action = bindAct(moveTo, pmTop))
+    srt.item("Move Up", "Ctrl+Shift+Up", enabled = up, action = bindAct(moveTo, pmUp))
+    srt.item("Move Down", "Ctrl+Shift+Down", enabled = down, action = bindAct(moveTo, pmDown))
+    srt.item("Move to Bottom", "Ctrl+Shift+End", enabled = down, action = bindAct(moveTo, pmBottom))
+    srt.sep()
+    srt.item("Randomize", enabled = n > 1 and edit, action = proc () = a.randomizePlaylist())
     pl.sep()
     pl.item("Save Playlist...", enabled = n > 0, action = proc () = a.savePlaylistDialog())
     pl.item("Load Playlist...", enabled = edit, action = proc () = a.loadPlaylistDialog())
     pl.sep()
     pl.item("Clear", enabled = n > 0 and edit, action = proc () = a.clearPlaylist())
+    let tab = a.tabs[a.tabView]
+    pl.item(if tab.undo.len > 0: "Undo " & tab.undo[^1].label else: "Undo", k(kaUndoPlaylist),
+      enabled = tab.undo.len > 0 and edit, action = proc () = a.undoRedo(false))
+    pl.item(if tab.redo.len > 0: "Redo " & tab.redo[^1].label else: "Redo", k(kaRedoPlaylist),
+      enabled = tab.redo.len > 0 and edit, action = proc () = a.undoRedo(true))
     pl.sep()
     pl.check("Cursor follows playback", checked = a.cfg.playlistCursorFollows, action = proc () =
       a.cfg.playlistCursorFollows = not a.cfg.playlistCursorFollows)
+    pl.sep()
+    # With a local file selected, its values once the columns' probe read them.
+    let sel = if hasSel: a.playlist[a.plSelected] else: ""
+    let opened = sel.len > 0 and sel == p.path and p.loaded
+    let read = opened or sel.len > 0 and not sel.contains("://") and sel in a.mediaInfo
+    let rgm = pl.sub("ReplayGain")
+    a.replayGainItems(rgm,
+      if opened: a.currentRg elif read: a.mediaInfo[sel].rg else: ReplayGain(), read)
+    rgm.sep()
+    if a.rgJob.running:
+      rgm.item("Cancel Analysis", action = proc () = a.cancelReplayGain())
+    else:
+      # Measured from the audio (ffmpeg decodes it), written with TagLib.
+      let files = a.rgFiles.len
+      let ok = files > 0 and canWriteTags()
+      let count = if files > 1: &" ({files} files)" else: ""
+      rgm.item("Analyze and Apply as Tracks" & count, enabled = ok, action = proc () =
+        a.saveReplayGain(rmTrack, a.rgFiles))
+      rgm.item("Analyze and Apply as Album" & count, enabled = ok, action = proc () =
+        a.saveReplayGain(rmAlbum, a.rgFiles))
+      rgm.item("Remove ReplayGain Values" & count, enabled = ok, action = proc () =
+        a.removeReplayGain(a.rgFiles))
     (root, pl)
+  of cmPlaylistTab:
+    # A tab's menu (it's shown), or the strip's around the tabs.
+    let tm = newMenuRoot()
+    let i = a.ctxTab
+    let on = i in 0 ..< a.tabs.len
+    tm.item("New Playlist", k(kaNewPlaylist), enabled = not locked, action = proc () =
+      discard a.newPlaylist())
+    if on:
+      tm.item("Rename...", k(kaRenamePlaylist), enabled = not locked, action = proc () =
+        a.startRename(i))
+      tm.item("Duplicate", enabled = not locked, action = proc () = a.duplicateTab(i))
+      tm.item("Close", k(kaClosePlaylist), enabled = not locked, action = proc () = a.closeTab(i))
+    tm.item(if a.closedTabs.len > 0: "Restore " & a.closedTabs[^1].name else: "Restore Closed Playlist",
+      k(kaRestorePlaylist), enabled = a.closedTabs.len > 0 and not locked, action = proc () =
+        a.restoreTab())
+    tm.sep()
+    tm.item("Load Playlist...", enabled = not locked, action = proc () = a.loadPlaylistDialog())
+    if on:
+      tm.item("Save Playlist...", enabled = a.tabLen(i) > 0, action = proc () =
+        a.showTab(i)
+        a.savePlaylistDialog())
+    tm.sep()
+    tm.item("Show Playing Playlist", k(kaShowPlaying),
+      enabled = a.tabPlaying in 0 ..< a.tabs.len and a.tabPlaying != a.tabView and not locked,
+      action = proc () = a.showPlaying())
+    tm.item("Sort Playlists by Name", enabled = a.tabs.len > 1 and not locked, action = proc () =
+      a.sortTabs())
+    tm.sep()
+    # Tabs above the entries, or a list of the playlists left of them.
+    tm.check("Playlists in a Side Column", checked = a.cfg.playlistTabsSide, action = proc () =
+      a.cfg.playlistTabsSide = not a.cfg.playlistTabsSide
+      # The panel widens by the column, so that the entries keep their room.
+      let side = max(PlaylistSideMinW, round(a.cfg.playlistSideWidth).float32) + 1
+      a.cfg.playlistWidth = clamp(a.cfg.playlistWidth +
+        (if a.cfg.playlistTabsSide: side else: -side), PlaylistMinWidth,
+        max(PlaylistMinWidth, a.ui.size.x - MinWindow.x.float32 / 2))
+      a.tabSeen = -1  # the shown one into view
+      a.cfg.save())
+    (root, tm)
   of cmPlaylistColumns:
     let cols = newMenuRoot()
     if a.ctxColumn == pfDuration:
@@ -6268,18 +8032,31 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
         a.cfg.save())
       cols.sep()
     let toggle = proc (f: PlaylistField) =
-      let at = a.cfg.playlistColumns.find(f)
-      if at >= 0: a.cfg.playlistColumns.delete(at)
-      else: a.cfg.playlistColumns.add f
-    let shown = a.cfg.playlistColumns
+      var shown = a.plColumns
+      let at = shown.find(f)
+      if at >= 0: shown.delete(at)
+      else: shown.add f
+      a.plColumns = shown
+      a.saveColumns()
+    let shown = a.plColumns
     for f in PlaylistField:
       # The last column left stays: the header is what brings the others back.
       cols.check(PlaylistFields[f].label, checked = f in shown,
         enabled = f notin shown or shown.len > 1, action = bindAct(toggle, f))
     cols.sep()
-    cols.item("Reset column widths", enabled = a.cfg.playlistColumnWidths.len > 0, action = proc () =
-      a.cfg.playlistColumnWidths.clear()
-      a.cfg.save())
+    cols.item("Reset column widths", enabled = a.plColumnWidths.len > 0, action = proc () =
+      a.plColumnWidths.clear()
+      a.saveColumns())
+    # This playlist's own columns and widths, starting as the shared ones are;
+    # unchecked, it shows the shared ones again and forgets its own.
+    cols.sep()
+    let own = a.ownColumns
+    cols.check("Override columns for this playlist", checked = own,
+      enabled = a.tabView in 0 ..< a.tabs.len, action = proc () =
+        let t = addr a.tabs[a.tabView]
+        if own: (t.columns, t.columnWidths) = (newSeq[PlaylistField](), initTable[string, float]())
+        else: (t.columns, t.columnWidths) = (a.cfg.playlistColumns, a.cfg.playlistColumnWidths)
+        a.savePlaylistStore())
     (root, cols)
 
 # --- keyboard ---------------------------------------------------------------
@@ -6297,6 +8074,429 @@ proc runMenuPath(a: App, path: seq[string]) =
       return
     node = found
   if node.action != nil and node.enabled: node.action()
+
+# --- command palette -------------------------------------------------------
+# F3: every command, searched by name: the menu bar's items, from the menus as
+# they are right now; the right-click menu's items about the file; the
+# controls bar's buttons and the menus their right-click opens; the status
+# bar's; and the commands that only have a key. Submenus are items too, which
+# open in the palette; lists (files, tracks, chapters...) only show inside
+# their own submenu. Running a check or radio item leaves it open, to toggle
+# more.
+
+const
+  PaletteSep = " › "
+  PaletteRecentMax = 12
+  PaletteContext = "Right-Click Menu"  ## the right-click menu's own items
+  ## Commands with a key but no menu item, filed under the menu of their key group.
+  PaletteKeyOnly = {kaNextAudio, kaPrevAudio, kaNextSub, kaPrevSub, kaSeek10 .. kaSeek90,
+    kaSubTopLeft .. kaSubSmaller, kaFindPlaylist, kaNewPlaylist .. kaUnqueue}
+  ## Submenus that come first among what a search finds.
+  PaletteFavored = ["Play › Audio Track", "Play › Subtitle Track", "Play › Video Track"]
+  PaletteSubBonus = 50
+  PaletteFavoredBonus = 150
+
+proc runAction(a: App, act: KeyAction)  # below
+proc trackerButton(a: App): bool  # below
+proc setShield(a: App, on: bool)  # below
+
+proc paletteKey(it: PaletteItem): string =
+  (it.path & it.label).join(PaletteSep)
+
+proc paletteRoot(a: App): MenuNode =
+  ## Everything the palette lists, as one menu tree.
+  let was = a.ctxMenu
+  defer: a.ctxMenu = was
+  proc menuOf(which: ContextMenu): seq[MenuNode] =
+    a.ctxMenu = which
+    a.buildMenu().context.children
+  let p = a.player
+  result = newMenuRoot()
+  # The menu bar's menus, and the right-click menu's items about what's open.
+  for c in menuOf(cmVideo):
+    if c.contextual and c.kind != mkSeparator:
+      if result.children.len == 0: discard result.sub(PaletteContext)
+      result.children[0].children.add c
+  let ownCtx = if result.children.len > 0: result.children[0] else: nil
+  result.children.setLen 0
+  a.ctxMenu = cmVideo
+  for c in a.buildMenu().bar.children: result.children.add c
+  if ownCtx != nil: result.children.add ownCtx
+  # The controls bar's buttons (all of them, as a wide bar has them), and
+  # the menus their right-click opens.
+  let ctl = result.sub("Controls")
+  ctl.item("Play", enabled = p.loaded or a.cfg.recentFiles.len > 0, action = proc () = a.play())
+  ctl.item("Pause", enabled = p.loaded, action = proc () = a.pause())
+  ctl.item("Stop", enabled = p.loaded, action = proc () = a.stop())
+  let navOk = p.loaded and not a.playlistLocked
+  ctl.item("Previous", enabled = navOk, action = proc () = a.navigate(-1))
+  ctl.item("Slow Down", enabled = p.loaded, action = proc () = a.changeRate(-1))
+  ctl.item("Fast-Forward", enabled = p.loaded, action = proc () = a.changeRate(1))
+  ctl.item("Next", enabled = navOk, action = proc () = a.navigate(1))
+  ctl.check("Repeat", checked = a.cfg.repeatForever, action = proc () =
+    a.toggleRepeat())
+  ctl.sub("Repeat Options").children = menuOf(cmRepeat)
+  ctl.item("Equalizer", action = proc () = a.toggleEqualizer())
+  if p.path.isWebLink:
+    ctl.sub("Quality", enabled = p.loaded).children = menuOf(cmQuality)
+  if a.trackerButton:
+    ctl.item("Tracker Playback", action = proc () = a.setTrackerPanel(true))
+  if a.rgButton:
+    ctl.sub("ReplayGain").children = menuOf(cmReplayGain)
+  ctl.check("Mute", checked = p.muted, action = proc () = a.setMute(not a.player.muted))
+  ctl.check("Shield", checked = a.shielded, action = proc () = a.setShield(not a.shielded))
+  # The status bar's right-click menus: its time's and its own.
+  let st = result.sub("Status Bar")
+  st.sub("Timestamp").children = menuOf(cmTime)
+  st.children.add menuOf(cmStatus)
+  # The playlist's right-click menu on the entry playing, built as if it
+  # were right-clicked: its playlist shown (moved into the live fields and
+  # back) and it alone selected. Picking an item does that for real first.
+  let elsewhere = a.tabPlaying in 0 ..< a.tabs.len and a.tabPlaying != a.tabView
+  if a.playingIndex >= 0 and not (elsewhere and a.playlistLocked):
+    let shown = a.tabView
+    var items: seq[MenuNode]
+    if elsewhere:
+      a.stashTab()
+      a.unstashTab(a.tabPlaying)
+    let (sel, marks) = (a.plSelected, a.plMarks)
+    try:
+      if a.plIndex in 0 ..< a.playlist.len:
+        a.selectOnly(a.plIndex)
+        items = menuOf(cmPlaylist)
+    finally:
+      a.plSelected = sel
+      a.plMarks = marks
+      if elsewhere:
+        a.stashTab()
+        a.unstashTab(shown)
+    if items.len > 0:
+      let entry = result.sub("Playlist").sub("Playing Item")
+      entry.children = items
+      proc atPlaying(f: proc ()): proc () =
+        result = proc () =
+          a.showPlaying()
+          f()
+      proc wrap(n: MenuNode) =
+        for c in n.children:
+          if c.action != nil: c.action = atPlaying(c.action)
+          wrap(c)
+      wrap(entry)
+  # The commands that only have a key, in the menu of their group.
+  for act in PaletteKeyOnly:
+    let name =
+      case Actions[act].group
+      of kgPlayback: "Play"
+      else: $Actions[act].group
+    var menu: MenuNode
+    for c in result.children:
+      if c.kind == mkSub and c.label == name: menu = c
+    if menu == nil: menu = result.sub(name)
+    menu.item(Actions[act].hint, a.cfg.keyText(act),
+      action = bindAct(proc (x: KeyAction) = a.runAction(x), act))
+
+proc paletteNode(root: MenuNode, trail: seq[(string, int)]): MenuNode =
+  ## The submenu at trail, or nil when it's gone. A submenu is found by its
+  ## label, else at its place (labels showing a value change: "Pre-amp: +3 dB").
+  result = root
+  for (label, i) in trail:
+    var next: MenuNode
+    for c in result.children:
+      if c.kind == mkSub and c.label == label:
+        next = c
+        break
+    if next == nil and i < result.children.len and result.children[i].kind == mkSub:
+      next = result.children[i]
+    if next == nil: return nil
+    result = next
+
+proc paletteItems(n: MenuNode, trail: seq[(string, int)], path: seq[string],
+                  enabled, deep: bool, res: var seq[PaletteItem], direct = true) =
+  ## n's items for the palette and, with deep, those of its submenus but for
+  ## lists, which show only in their own (direct: n is the palette's
+  ## submenu). A column's items count as its menu's.
+  for i, c in n.children:
+    let on = enabled and c.enabled
+    case c.kind
+    of mkSeparator: discard
+    of mkColumn:
+      paletteItems(c, trail, path & c.label, on, deep, res, direct)
+    of mkSub:
+      let t = trail & (c.label, i)
+      res.add PaletteItem(label: c.label, path: path, kind: mkSub, enabled: on, trail: t)
+      if deep and not c.listed:
+        paletteItems(c, t, path & c.label, on, deep, res, direct = false)
+    of mkAction, mkCheck, mkRadio:
+      if c.action == nil or c.label == "Command Palette" or (c.listed and not direct): continue
+      res.add PaletteItem(label: c.label, path: path, shortcut: c.shortcut, kind: c.kind,
+        checked: c.checked, enabled: on, action: c.action)
+
+proc paletteFind(a: App): seq[PaletteItem] =
+  ## What the palette shows, best first. With nothing typed, the open
+  ## submenu's items in menu order, at the top after the ones run lately.
+  let root = a.paletteRoot()
+  var node = paletteNode(root, a.palTrail)
+  if node == nil:  # it went (the file closed, say): back to the top
+    a.palTrail = @[]
+    a.palBack.setLen 0
+    node = root
+  let base = a.palTrail.mapIt(it[0])  # the open submenu's path
+  var all: seq[PaletteItem]
+  paletteItems(node, a.palTrail, base, true, true, all)
+  let recent = a.cfg.paletteRecent
+  if a.palText.strip.len == 0:
+    if a.palTrail.len == 0:
+      for key in recent:
+        for it in all:
+          if it.paletteKey == key:
+            result.add it
+            break
+    var own: seq[PaletteItem]
+    paletteItems(node, a.palTrail, base, true, false, own)
+    for it in own:
+      if a.palTrail.len > 0 or it.paletteKey notin recent: result.add it
+    return
+  var scored: seq[(int, int, PaletteItem)]
+  for i, it in all:
+    let where = it.path[base.len .. ^1].join(" ")  # the menus below the open one
+    var score = searchScore(it.label, where & " " & it.shortcut, a.palText)
+    if score < 0: continue
+    if it.kind == mkSub:
+      score += PaletteSubBonus
+      if it.paletteKey in PaletteFavored: score += PaletteFavoredBonus
+    let r = recent.find(it.paletteKey)
+    if r >= 0: score += PaletteRecentMax - r  # a nudge between equals
+    if not it.enabled: score -= 25
+    scored.add (score, i, it)
+  scored.sort(proc (x, y: (int, int, PaletteItem)): int =
+    result = cmp(y[0], x[0])
+    if result == 0: result = cmp(x[1], y[1]))
+  result = scored.mapIt(it[2])
+
+proc paletteReset(a: App) =
+  a.palSel = 0
+  a.palSelKey = ""
+  a.palScroll = 0
+  a.palFollow = true
+
+proc showPalette(a: App) =
+  ## Opens the command palette at its top, with the last search selected,
+  ## so typing replaces it and Enter runs its first command again.
+  a.menus.close()
+  if a.tkOpen: a.setTrackerPanel(false)
+  a.overlay = ovPalette
+  if a.palTrail.len > 0 or a.palBack.len > 0:  # closed in a submenu: the search it came from
+    a.palText = if a.palBack.len > 0: a.palBack[0].text else: ""
+    a.palTrail = @[]
+    a.palBack.setLen 0
+  a.paletteReset()
+  a.palPress = -1
+  a.ui.focusId = "palette"
+  a.ui.focusFresh = true
+
+proc closePalette(a: App) =
+  if a.ui.focusId == "palette": a.ui.focusId = ""
+  if a.overlay == ovPalette: a.overlay = ovNone
+
+proc paletteOpen(a: App, it: PaletteItem) =
+  ## Opens a submenu in the palette, its search empty.
+  a.palBack.add (a.palTrail, a.palText)
+  a.palTrail = it.trail
+  a.palText = ""
+  a.paletteReset()
+
+proc paletteUp(a: App) =
+  ## Back to where the open submenu was opened from, its search as it was.
+  if a.palBack.len == 0: return
+  let (trail, text) = a.palBack.pop()
+  a.palTrail = trail
+  # After the field has taken this frame's keys: the Backspace that brought
+  # it here would edit the search.
+  a.palTextNext = text
+  a.palTextSet = true
+  a.paletteReset()
+
+proc runPaletteItem(a: App, it: PaletteItem) =
+  ## Runs a command found, or opens a submenu. A check or radio item leaves
+  ## the palette open, any other command closes it first (it may open a
+  ## dialog of its own).
+  if not it.enabled or (it.kind != mkSub and it.action == nil): return
+  let key = it.paletteKey
+  a.cfg.paletteRecent.keepItIf(it != key)
+  a.cfg.paletteRecent.insert(key, 0)
+  if a.cfg.paletteRecent.len > PaletteRecentMax: a.cfg.paletteRecent.setLen PaletteRecentMax
+  case it.kind
+  of mkSub: a.paletteOpen(it)
+  of mkCheck, mkRadio:
+    it.action()
+    a.palFollow = true
+  else:
+    a.closePalette()
+    it.action()
+  a.dirtyUntil = max(a.dirtyUntil, now() + 0.1)
+
+proc paletteKeys(a: App) =
+  ## The keyboard while the palette is open: what isn't typed into its
+  ## field moves through the list, runs a command, goes back from a
+  ## submenu (Backspace in an empty search) or closes it.
+  let w = a.window
+  let pressed = w.buttonPressed
+  let (ok, act) = a.cfg.pressedAction(w)
+  if pressed[KeyEscape] or (ok and act == kaCommandPalette):
+    a.closePalette()
+    return
+  if pressed[KeyBackspace] and a.palText.len == 0 and a.palBack.len > 0:
+    a.paletteUp()
+    return
+  let n = a.palItems.len
+  if n == 0: return
+  let page = max(1, a.palRows - 1)
+  var sel = a.palSel
+  if pressed[KeyDown]: sel = (sel + 1) mod n
+  elif pressed[KeyUp]: sel = (sel - 1 + n) mod n
+  elif pressed[KeyPageDown]: sel = min(n - 1, sel + page)
+  elif pressed[KeyPageUp]: sel = max(0, sel - page)
+  if sel != a.palSel:
+    a.palSel = sel
+    a.palSelKey = a.palItems[sel].paletteKey
+    a.palFollow = true
+  if pressed[KeyEnter] or pressed[NumpadEnter]:
+    a.runPaletteItem(a.palItems[clamp(a.palSel, 0, n - 1)])
+
+proc paletteOverlay(a: App) =
+  ## The command palette: a search field over the commands found, at the
+  ## top of the window; the highlighted one runs with Enter or a click. In a
+  ## submenu, a button left of the field goes back.
+  let ui = a.ui
+  const
+    Pad = 8'f32
+    FieldH = 32'f32
+    RowH = 26'f32
+    IconW = 24'f32
+    ArrowW = 22'f32
+    MaxRows = 12
+  let W = ui.size.x
+  let H = ui.size.y
+  let pw = max(120'f32, min(640'f32, W - 16))
+  let px = floor((W - pw) / 2)
+  let py = min(a.menuBarHeight + 12, max(4'f32, H - (Pad * 2 + FieldH + 6 + RowH) - 4))
+  # The submenu open: its name on a button that goes back.
+  var fieldR = rect(px + Pad, py + Pad, pw - Pad * 2, FieldH)
+  if a.palTrail.len > 0:
+    let name = ui.ellipsize("‹  " & a.palTrail[^1][0], pw * 0.4)
+    let bw = ui.textSize(name).x + 20
+    let br = rect(fieldR.x, fieldR.y, bw, FieldH)
+    let hov = ui.hover(br)
+    ui.rect(br, if hov: colPressed else: colHover)
+    ui.textIn(name, br, colText, h = CenterAlign)
+    if hov and ui.pressed():
+      ui.consumeClick()
+      a.paletteUp()
+    fieldR = rect(br.x + bw + 6, fieldR.y, fieldR.w - bw - 6, FieldH)
+  let before = a.palText
+  let placeholder =
+    if a.palTrail.len > 0: "Search " & a.palTrail.mapIt(it[0]).join(PaletteSep)
+    else: "Search commands"
+  let ev = ui.textField("palette", fieldR, a.palText, placeholder)
+  ui.focusId = "palette"  # Enter and Tab end editing; this field keeps it
+  if eeChanged in ev and a.palText != before: a.paletteReset()
+  if a.palTextSet:
+    a.palTextSet = false
+    a.palText = a.palTextNext
+    ui.selAnchor = 0  # all of it, so typing replaces it
+    ui.caret = a.palText.len
+  # The list, refreshed every frame: checkmarks follow what's toggled.
+  a.palItems = a.paletteFind()
+  let n = a.palItems.len
+  # The highlighted command stays put while the list changes around it.
+  if a.palSelKey.len > 0:
+    for i, it in a.palItems:
+      if it.paletteKey == a.palSelKey:
+        a.palSel = i
+        break
+  a.palSel = clamp(a.palSel, 0, max(0, n - 1))
+  let fit = int((H - 4 - py - Pad * 2 - FieldH - 6) / RowH)
+  let rows = clamp(min(fit, n), 1, MaxRows)
+  a.palRows = rows
+  let r = rect(px, py, pw, Pad * 2 + FieldH + 6 + rows.float32 * RowH)
+  let listR = rect(px + Pad, fieldR.y + FieldH + 6, pw - Pad * 2, rows.float32 * RowH)
+  a.palScroll = clamp(a.palScroll, 0, max(0, n - rows))
+  if a.palFollow:
+    a.palFollow = false
+    if a.palSel < a.palScroll: a.palScroll = a.palSel
+    elif a.palSel >= a.palScroll + rows: a.palScroll = a.palSel - rows + 1
+  if ui.hover(listR) and ui.scroll() != 0:
+    a.palScroll = clamp(a.palScroll + (if ui.scroll() > 0: 3 else: -3), 0, max(0, n - rows))
+    ui.scrollConsumed = true
+  # Under the field, which went first to take the keys first: on the layer
+  # below, last there.
+  ui.sk.pushLayer(NormalLayer)
+  ui.rect(rect(r.xy + vec2(4, 6), r.wh), colShadow)
+  ui.rect(r, colPopup)
+  ui.border(r, colBorder)
+  ui.sk.popLayer()
+  if n == 0:
+    ui.textIn(if a.palText.strip.len > 0: "No commands found" else: "Empty",
+      rect(listR.x + IconW, listR.y, listR.w - IconW, RowH), colTextDim)
+  let shown = a.palTrail.len  # path entries the open submenu accounts for
+  ui.sk.pushClipRect(listR)
+  for row in 0 ..< rows:
+    let i = a.palScroll + row
+    if i >= n: break
+    let it = a.palItems[i]
+    let rr = rect(listR.x, listR.y + row.float32 * RowH, listR.w, RowH)
+    let hov = ui.hover(rr)
+    if hov and ui.pressed():
+      ui.consumeClick()
+      a.palPress = i
+    if i == a.palSel: ui.rect(rr, colPressed)
+    elif hov: ui.rect(rr, colHover)
+    let fg = if it.enabled: colText else: colTextDisabled
+    let dim = if it.enabled: colTextDim else: colTextDisabled
+    if it.checked:
+      ui.icon(if it.kind == mkRadio: "radio16" else: "check16",
+        vec2(rr.x + IconW / 2 + 2, rr.y + RowH / 2), if it.enabled: colAccent else: colTextDisabled)
+    # Path, dim, then the label; the path gives way first when it's narrow.
+    var right = rr.x + rr.w - 8
+    if it.kind == mkSub:
+      ui.icon("arrow16", vec2(rr.x + rr.w - ArrowW / 2, rr.y + RowH / 2), fg)
+      right = rr.x + rr.w - ArrowW - 4
+    elif it.shortcut.len > 0:
+      let sw = ui.textSize(it.shortcut, FontSmall).x
+      ui.textIn(it.shortcut, rect(right - sw - 2, rr.y, sw + 2, RowH), dim, FontSmall,
+        h = RightAlign)
+      right -= sw + 16
+    var x = rr.x + IconW + 4
+    let avail = max(0'f32, right - x)
+    let labelW = ui.textSize(it.label).x
+    let path = it.path[min(shown, it.path.len) .. ^1]
+    if path.len > 0 and avail - labelW > 40:
+      let ps = ui.ellipsize(path.join(PaletteSep) & PaletteSep, avail - labelW)
+      let psW = ui.textSize(ps).x
+      ui.textIn(ps, rect(x, rr.y, psW + 2, RowH), dim)
+      x += psW
+    ui.textIn(ui.ellipsize(it.label, max(0'f32, right - x)), rect(x, rr.y, right - x, RowH), fg)
+  ui.sk.popClipRect()
+  # A thin scroll bar when the list runs past the rows shown.
+  if n > rows:
+    let th = max(16'f32, listR.h * rows.float32 / n.float32)
+    let ty = listR.y + (listR.h - th) * a.palScroll.float32 / float32(n - rows)
+    ui.rect(rect(r.x + r.w - 5, ty, 3, th), colBorder)
+  if ui.released() and a.palPress >= 0:
+    let i = a.palPress
+    a.palPress = -1
+    let row = i - a.palScroll
+    if i < n and row in 0 ..< rows and
+       ui.mouse.inside(rect(listR.x, listR.y + row.float32 * RowH, listR.w, RowH)):
+      a.palSel = i
+      a.palSelKey = a.palItems[i].paletteKey
+      ui.consumeClick()
+      a.runPaletteItem(a.palItems[i])
+  elif not ui.down(): a.palPress = -1
+  # A press outside closes it, without reaching anything beneath.
+  if (ui.pressed() or ui.pressed(MouseRight)) and not ui.mouse.inside(r):
+    a.closePalette()
+    ui.consumeClick()
 
 # --- subtitle placement ------------------------------------------------------
 
@@ -6584,7 +8784,7 @@ proc runAction(a: App, act: KeyAction) =
   of kaFrameBack: a.frameStep(false)
   of kaFaster: a.changeRate(1)
   of kaSlower: a.changeRate(-1)
-  of kaRepeatForever: a.runMenuPath(@["Play", "Repeat", "Forever"])
+  of kaRepeatForever: a.runMenuPath(@["Play", "Repeat", "Enabled"])
   of kaRepeatPingPong: a.runMenuPath(@["Play", "Repeat", "Ping-Pong"])
   of kaVolumeUp: a.volumeStep(true)
   of kaVolumeDown: a.volumeStep(false)
@@ -6630,11 +8830,31 @@ proc runAction(a: App, act: KeyAction) =
   of kaControls: a.runMenuPath(@["View", "Controls"])
   of kaStatus: a.runMenuPath(@["View", "Status"])
   of kaPlaylist: a.runMenuPath(@["View", "Playlist"])
+  of kaFindPlaylist: a.openPlaylistFind()
+  of kaNewPlaylist:
+    if not a.editLocked:
+      a.setPlaylistShown(true)
+      discard a.newPlaylist()
+  of kaClosePlaylist: (if a.cfg.showPlaylist: a.closeTab(a.tabView))
+  of kaRestorePlaylist:
+    a.setPlaylistShown(true)
+    a.restoreTab()
+  of kaRenamePlaylist: (if a.cfg.showPlaylist: a.startRename(a.tabView))
+  of kaNextPlaylist, kaPrevPlaylist:
+    a.setPlaylistShown(true)
+    a.stepTab(if act == kaNextPlaylist: 1 else: -1)
+  of kaShowPlaying:
+    a.setPlaylistShown(true)
+    a.showPlaying()
+  of kaUndoPlaylist, kaRedoPlaylist: a.undoRedo(act == kaRedoPlaylist)
+  of kaQueue: (if a.cfg.showPlaylist: a.queueSelected())
+  of kaUnqueue: (if a.cfg.showPlaylist: a.unqueueSelected())
   of kaRunLog: a.runMenuPath(@["View", "Run Log"])
   of kaShowOsd: a.runMenuPath(@["View", "Show OSD"])
   of kaFullScreen: a.setFullscreen(not a.fullscreen)
   of kaOptions: a.showOverlay(ovOptions)
   of kaShortcuts: a.showOverlay(ovShortcuts)
+  of kaCommandPalette: a.showPalette()
   of kaCenter .. kaPanReset:
     a.runMenuPath(@["View", "Pan, Rotate & Zoom", PanMenuLabels[act]])
 
@@ -6644,19 +8864,39 @@ proc handleKeys(a: App) =
   let w = a.window
   let pressed = w.buttonPressed
   if a.rectKeys(): return
+  if a.overlay == ovPalette:
+    a.paletteKeys()
+    return
 
   # The tracker panel's field takes the keys while it's being typed in.
   if a.tkOpen and a.ui.focusId.startsWith("tk-"):
     if pressed[KeyEscape]: a.setTrackerPanel(false)
     return
+  # A tab's name being edited takes them all; Escape leaves it as it was.
+  if a.ui.focusId == "pl-tabname":
+    if a.tabRename == 0 or not a.cfg.showPlaylist or pressed[KeyEscape]:
+      a.tabRename = 0
+      a.ui.focusId = ""
+    return
+  # So does the playlist's search field; Enter and F3 (Shift: back) step
+  # through the matches, as do Up and Down.
+  if a.plFindOpen and a.ui.focusId == "pl-find":
+    if pressed[KeyEscape]: a.closePlaylistFind()
+    elif pressed[KeyEnter] or pressed[NumpadEnter] or pressed[KeyF3]:
+      a.plFindGo(if w.shiftDown: -1 else: 1)
+      a.plFindKeep = true
+    elif pressed[KeyDown] or pressed[KeyUp]:
+      a.plFindGo(if pressed[KeyUp]: -1 else: 1)
+    return
   if pressed[KeyEscape]:
     # A text field being edited takes Escape itself.
     if a.overlay == ovOptions: a.closeOptions(false)
     elif a.overlay == ovRename: a.closeRename()
-    elif a.overlay in {ovCommands, ovSync, ovYtdlp, ovEmbed, ovUpdate}: discard  # their windows handle Escape
+    elif a.overlay in {ovCommands, ovSync, ovYtdlp, ovEmbed, ovUpdate, ovTags}: discard  # their windows handle Escape
     elif a.overlay != ovNone: a.overlay = ovNone
     elif a.menus.isOpen: a.menus.close()
     elif a.tkOpen: a.setTrackerPanel(false)
+    elif a.plFindOpen: a.closePlaylistFind()
     elif a.fullscreen: a.setFullscreen(false)
     return
   if a.overlay == ovProperties:
@@ -6678,6 +8918,9 @@ proc handleKeys(a: App) =
       setClipboardString(sel)
       a.osd("Copied the selected text")
       return
+  if a.plFindOpen and pressed[KeyF3] and not (w.ctrl or w.alt):
+    a.plFindGo(if w.shiftDown: -1 else: 1)
+    return
   if a.playlistKeys(): return
 
   let (ok, act) = a.cfg.pressedAction(w)
@@ -6748,8 +8991,9 @@ proc updateOsdApart(a: App) =
   if l == nil: return
   while mpv_wait_event(l.h, 0).eventId != evNone: discard  # nothing to act on
   let p = a.player
+  # Loop and step frames hold no OSD, and an animated cover covers mpv's.
   let apart = p.hasVideo and not p.stopped and not p.isSpherical and
-    (a.xf != VideoTransform() or a.lfOn or a.sfShow >= 0)  # loop and step frames hold no OSD
+    (a.xf != VideoTransform() or a.lfOn or a.sfShow >= 0 or a.animOn)
   if apart != a.osdApart:
     a.osdApart = apart
     a.osdStatus = ""
@@ -7118,12 +9362,434 @@ proc wantedThumb(a: App): string =
   let p = a.player
   if not a.cfg.ytThumbnail or a.cfg.streamQuality == sqLowest: return
   if not p.loaded or p.stopped or p.hasVideo or a.holding: return
-  if a.plIndex notin 0 ..< a.playlist.len: return
-  a.playlist[a.plIndex].youtubeId
+  a.playingEntry.youtubeId
+
+const AnimCodecs = ["gif", "apng", "webp"]  ## covers that may move
+
+proc wantedAnim(a: App): string =
+  ## What the cover shown is read from when it may move (GIF, APNG, WebP):
+  ## its file (a quick cover's own picture, not the still mpv shows of it),
+  ## or the audio file, the picture's place among those inside it and their
+  ## count (on lines of their own); "" for none.
+  let p = a.player
+  if a.qcBridge: return a.qcImage  # drawn before mpv's picture is back
+  if not p.hasVideo or p.stopped or a.holding: return
+  if a.quickCoverShown: return a.qcImage
+  if p.path.contains("://"): return
+  var inside: seq[int]
+  for t in p.tracks:
+    if t.kind == "video" and t.albumArt and not t.external: inside.add t.id
+  for t in p.tracks:
+    if t.kind != "video" or not t.selected: continue
+    if not t.albumArt or t.codec notin AnimCodecs: return
+    return if t.external: t.file else: p.path & "\n" & $inside.find(t.id) & "\n" & $inside.len
+
+proc readAnimCover(key: string): AnimPic =
+  ## The frames of the picture wantedAnim's key names, nil when it isn't an
+  ## animated one (or is too big to read).
+  let k = key.split('\n')
+  try:
+    if k.len == 1:
+      if getFileSize(key) <= 256 shl 20: result = readAnimPic(readFile(key))
+    else:
+      # Only when the pictures read are the ones mpv found, in its order.
+      let pics = pictures(k[0], data = true)
+      let i = parseInt(k[1])
+      if pics.len == parseInt(k[2]) and i in 0 ..< pics.len: result = readAnimPic(pics[i].data)
+  except CatchableError: discard
+
+proc pollAnimCover(a: App) =
+  ## Reads a moving cover's frames, and paces the redraws that step through
+  ## them: at the picture's own pace, around and around, playing or paused.
+  let key = a.wantedAnim
+  if key != a.animKey:
+    # A quick cover hidden keeps its frames, to move on at once when shown.
+    if a.anim != nil and a.animKey == a.qcImage: a.animStash = (a.animKey, a.anim)
+    a.animKey = key
+    a.anim = if key.len == 0: nil
+             elif key == a.animStash.key: a.animStash.pic
+             else: readAnimCover(key)
+    a.animFrame = 0
+    a.animTexFrame = -1
+    if a.anim != nil: a.animNext = now() + a.anim.delay(0)
+    elif a.animTex != 0:
+      glDeleteTextures(1, a.animTex.addr)
+      a.animTex = 0
+  a.animOn = a.anim != nil
+  if not a.animOn: return
+  let t = now()
+  if t < a.animNext: return
+  if t - a.animNext > 1: a.animNext = t  # held up (a dialog, a stall): goes on from here
+  while t >= a.animNext:
+    a.animFrame = (a.animFrame + 1) mod a.anim.len
+    a.animNext += a.anim.delay(a.animFrame)
+  a.dirtyUntil = max(a.dirtyUntil, t + 0.001)
+
+proc drawAnim(a: App, center, size: Vec2, fb: IVec2) =
+  ## The moving cover's frame due, on the picture's own rect: over
+  ## mpv's still first frame, panned, rotated and sized as it is.
+  let g = a.anim
+  if a.animTexFrame != a.animFrame:
+    if a.animTex == 0:
+      glGenTextures(1, a.animTex.addr)
+      glBindTexture(GL_TEXTURE_2D, a.animTex)
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR.GLint)
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR.GLint)
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE.GLint)
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE.GLint)
+    glBindTexture(GL_TEXTURE_2D, a.animTex)
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8.GLint, g.w.GLsizei, g.h.GLsizei, 0,
+      GL_RGBA, GL_UNSIGNED_BYTE, g.frame(a.animFrame))
+    glGenerateMipmap(GL_TEXTURE_2D)  # smaller than it is, it mustn't shimmer
+    glBindTexture(GL_TEXTURE_2D, 0)
+    a.animTexFrame = a.animFrame
+  a.quad.draw(a.animTex, transformedCorners(center, size, a.xf.rotation), fb.vec2)
 
 proc thumbShown(a: App): bool =
   let id = a.wantedThumb
   id.len > 0 and a.thumb != nil and a.thumb.id == id and a.thumb.image != nil
+
+proc soundOnly(a: App): bool =
+  ## Sound without a picture plays (or is paused) in the frame. While another
+  ## file opens, only if the one before was that too, and never once the new
+  ## one has a video track on: the frame stays black between two videos.
+  let p = a.player
+  p.loaded and not p.stopped and not p.hasVideo and not p.videoTrackOn and
+    (not p.switching or a.soundBefore)
+
+proc avsShown(a: App): bool =
+  ## The visualizer plays in the frame: sound without a picture (no video
+  ## track, cover, chart or thumbnail), playing or paused.
+  a.cfg.showVisualizer and a.soundOnly and not a.chartShown and not a.thumbShown and
+    not a.holding
+
+proc avsGain(a: App): float32 =
+  ## The tap hears mpv's output, after its volume (cubic): this undoes it, so
+  ## the visualizer sees the same at any volume. Muted, there's nothing to see.
+  let v = a.player.volume / 100
+  if a.player.muted or v <= 0.01: 1'f32 else: float32(1 / (v * v * v))
+
+proc applyAvsLists(a: App) =
+  ## Visualizers...' choices on the presets: those turned off, added, removed.
+  let v = a.avs
+  v.disabled = a.cfg.avsDisabled.toHashSet
+  v.rates = a.cfg.avsFrameRates
+  (v.extra, v.hidden) = (a.cfg.avsAdded, a.cfg.avsHidden)
+  v.rescan()
+  # Files first seen now were added now (built-in ones have no date): those
+  # listed before dates were kept share the first date, in their old order.
+  var stamped = false
+  let t = epochTime()
+  for id in v.presets:
+    if not id.isBuiltin and id notin a.cfg.avsAddedDates:
+      a.cfg.avsAddedDates[id] = t
+      stamped = true
+  if stamped: a.cfg.save()
+  if a.avsDlg != nil: a.avsDlg.added = a.cfg.avsAddedDates
+
+proc folderCopyRoot(a: App, dir: string): string =
+  ## Where a folder's presets are copied: a folder of its name in the presets
+  ## folder.
+  let name = dir.normalizedPath.lastPathPart
+  a.avs.dir / (if name.len > 0: name else: "Added")
+
+proc renameAvs(a: App, old, new: string) =
+  ## What's kept by preset (turned off, rating, frame rate, date, the one in
+  ## use) moved from preset file old to new.
+  a.cfg.avsAdded.keepItIf(it != old)
+  a.cfg.avsHidden.keepItIf(it != new)
+  if old in a.cfg.avsDisabled:
+    a.cfg.avsDisabled.keepItIf(it != old)
+    if new notin a.cfg.avsDisabled: a.cfg.avsDisabled.add new
+  if a.cfg.avsPreset == old: a.cfg.avsPreset = new
+  template moveKey(t: untyped) =
+    if old in t:
+      if new notin t: t[new] = t[old]
+      t.del old
+  moveKey a.cfg.avsStarRatings
+  moveKey a.cfg.avsFrameRates
+  moveKey a.cfg.avsAddedDates
+
+proc copyAddedAvs(a: App) =
+  ## Presets added when Add... listed them where they were (`avsAdded`),
+  ## copied into the presets folder like ones added now: laid out as in the
+  ## folder they all came from (in a folder of its name), unless that's the
+  ## home folder or above it, then each in a folder named after its own.
+  ## Ones that can't be copied (missing for now) stay listed where they are.
+  let v = a.avs
+  let old = a.cfg.avsAdded.filterIt(fileExists(it) and not v.inPresetsFolder(it))
+  if old.len == 0: return
+  var common = old[0].parentDir
+  for f in old:
+    while common.len > 0 and not f.isRelativeTo(common):
+      let up = common.parentDir
+      common = if up == common: "" else: up
+  let home = getHomeDir().normalizedPath
+  let shared = common.len > 0 and common.parentDir != common and not home.isRelativeTo(common)
+  let commonDest = if shared: a.folderCopyRoot(common) else: ""
+  var copied = 0
+  for f in old:
+    let p = if shared: v.importPreset(f, common, commonDest)
+            else: v.importPreset(f, f.parentDir, a.folderCopyRoot(f.parentDir))
+    if p.len == 0: continue
+    a.renameAvs(f, p)
+    inc copied
+  if copied > 0: a.cfg.save()
+
+proc ensureAvs(a: App) =
+  ## The presets, listed without starting the visualizer (that's on its
+  ## first preset).
+  if a.avs != nil: return
+  a.avs = newAvsView(configDir() / "avs")
+  a.copyAddedAvs()
+  a.applyAvsLists()
+
+proc pollAvs(a: App) =
+  ## Starts the visualizer the first time it shows, keeps its worker rendering
+  ## only while it shows, and redraws for its frames.
+  let shown = a.avsShown
+  if not a.player.switching or not a.player.loaded: a.soundBefore = a.soundOnly
+  if a.avs == nil and not shown: return
+  a.ensureAvs()
+  if shown and a.avs.current < 0:
+    if not a.avs.selectId(a.cfg.avsPreset): discard a.avs.randomPreset()
+    if a.avs.current >= 0: a.cfg.avsPreset = a.avs.presets[a.avs.current]
+  let p = a.player
+  if a.avs.update(shown, a.avsArea, a.avsGain, p.timePos * 1000, p.duration, a.cfg.avsBeatThreshold,
+      a.cfg.avsBeatSensitivity):
+    a.dirtyUntil = max(a.dirtyUntil, now() + 0.001)
+
+proc avsStep(a: App, how: int) =
+  ## Next (1), previous (-1) or a random (0) preset, named on the OSD.
+  if a.avs == nil: return
+  let ok = if how == 0: a.avs.randomPreset() else: a.avs.step(how)
+  if ok:
+    a.cfg.avsPreset = a.avs.presets[a.avs.current]
+    a.cfg.save()
+    a.osd(presetName(a.cfg.avsPreset))
+  elif not toSeq(0 ..< a.avs.presets.len).anyIt(a.avs.enabled(it)):
+    a.osd("Every preset is turned off (Visualizer Preset > Visualizers...)")
+
+# --- Visualizer Preset > Visualizers... ----------------------------------------
+
+proc showAvsList(a: App) =
+  ## Shows the presets' window, or brings it up, scrolled to the preset
+  ## playing; it opens over the player, where it was left after that.
+  a.menus.close()
+  a.ensureAvs()
+  if a.avsDlg == nil:
+    a.avsDlg = newAvsDialog(a.cfg.avsColumnWidths, a.cfg.avsStarRatings, a.cfg.avsAddedDates,
+      a.cfg.avsSort, a.cfg.avsSortDescending, a.cfg.avsAddSubfolders)
+  let cur = a.avs.current
+  a.avsDlg.jumpTo(if cur >= 0: a.avs.presets[cur] else: "")
+  a.avsDlg.forget()
+  if a.avsWin == nil:
+    (a.avsWin, a.avsSk, a.avsUi) = a.newDialogWindow("Visualizers", AvsSize, modal = false,
+      resizable = true)
+    a.showDialog(a.avsWin, a.avsWinSize, AvsMinSize)
+  elif not a.avsWin.visible:
+    a.showDialog(a.avsWin, a.avsWinSize, AvsMinSize)
+  else: a.avsWin.activate()
+
+proc closeAvsList(a: App) =
+  if a.avsWin == nil or not a.avsWin.visible: return
+  if a.rememberAvsWinSize(): a.cfg.save()
+  a.avsUi.focusId = ""
+  a.avsMenus.close()
+  a.avsWin.visible = false
+  a.window.activate()
+
+proc pickAvs(a: App, id: string) =
+  ## Plays preset id, as highlighting it in Visualizers... does.
+  if a.avs.selectId(id):
+    a.cfg.avsPreset = id
+    a.cfg.save()
+    a.dirtyUntil = max(a.dirtyUntil, now() + 0.1)
+
+proc toggleAvs(a: App, ids: seq[string]) =
+  ## Turns the presets on, or off: all of them off when any is on.
+  let anyOn = ids.anyIt(it notin a.cfg.avsDisabled)
+  for id in ids:
+    a.cfg.avsDisabled.keepItIf(it != id)
+    if anyOn: a.cfg.avsDisabled.add id
+  a.avs.disabled = a.cfg.avsDisabled.toHashSet
+  a.cfg.save()
+
+proc avsFilesIn(dir: string, subfolders: bool): seq[string] =
+  ## A folder's preset files (and its subfolders', with subfolders), by path.
+  let isAvs = proc (f: string): bool = f.toLowerAscii.endsWith(".avs") and fileExists(f)
+  try:
+    if subfolders:
+      for f in walkDirRec(dir, yieldFilter = {pcFile, pcLinkToFile}):
+        if isAvs(f): result.add f
+    else:
+      for kind, f in walkDir(dir):
+        if kind in {pcFile, pcLinkToFile} and isAvs(f): result.add f
+  except OSError: discard
+  result.sort(proc (x, y: string): int = cmpIgnoreCase(x, y))
+
+proc addAvs(a: App, paths: seq[string]) =
+  ## Lists preset files, and those in folders (their subfolders too when
+  ## Visualizers' Include subfolders is on): copied into the presets folder
+  ## with their images (files at its top, a folder's into a folder of its
+  ## name, as they're laid out in it), back in the list if removed. One that
+  ## can't be copied is listed where it is.
+  var files: seq[(string, string, string)]  # the file, the folder taken from, the one copied to
+  var folders = 0
+  for p in paths:
+    let p = p.absolutePath
+    if dirExists(p):
+      inc folders
+      let dest = if a.avs.inPresetsFolder(p) or p == a.avs.dir: p else: a.folderCopyRoot(p)
+      for f in avsFilesIn(p, a.cfg.avsAddSubfolders): files.add (f, p, dest)
+    else: files.add (p, p.parentDir, a.avs.dir)
+  var added: seq[string]
+  var notCopied = 0
+  for (f, srcRoot, destRoot) in files:
+    if not f.toLowerAscii.endsWith(".avs") or not fileExists(f): continue
+    var p = a.avs.importPreset(f, srcRoot, destRoot)
+    if p.len == 0:
+      p = f
+      inc notCopied
+      if p notin a.avs.presets and p notin a.cfg.avsAdded: a.cfg.avsAdded.add p
+    if p in added: continue
+    a.cfg.avsHidden.keepItIf(it != p)
+    a.cfg.avsAddedDates[p] = epochTime()  # added again: added now
+    added.add p
+  a.applyAvsLists()
+  a.cfg.save()
+  if a.avsDlg != nil and added.len > 0: a.avsDlg.sel = added.filterIt(it in a.avs.presets)
+  a.osd(if added.len == 1: "Added " & presetName(added[0])
+        elif added.len == 0 and folders > 0: "No .avs presets in " &
+          (if folders == 1: "that folder" else: "those folders")
+        else: &"Added {added.len} presets")
+  if notCopied > 0:
+    a.osd(if notCopied == 1: "Could not copy a preset to the presets folder: listed where it is"
+          else: &"Could not copy {notCopied} presets to the presets folder: listed where they are",
+          secs = 3)
+
+proc removeAvs(a: App, ids: seq[string]) =
+  ## Takes presets out of the list (built-in ones stay): an added file is
+  ## forgotten, one in the presets folder hidden. No file is deleted.
+  var n = 0
+  for id in ids:
+    if id.isBuiltin: continue
+    inc n
+    if id in a.cfg.avsAdded: a.cfg.avsAdded.keepItIf(it != id)
+    elif id notin a.cfg.avsHidden: a.cfg.avsHidden.add id
+    a.cfg.avsDisabled.keepItIf(it != id)
+    a.cfg.avsAddedDates.del id
+  a.applyAvsLists()
+  a.cfg.save()
+  if a.avsDlg != nil: a.avsDlg.sel.setLen 0
+  if n > 0: a.osd(if n == 1: "Removed a preset from the list" else: &"Removed {n} presets from the list")
+
+proc askAddAvs(a: App) =
+  ## Visualizers' Add...: its own folder, not the media one, as presets live
+  ## apart from media.
+  let dir = a.cfg.avsLastDir
+  a.ask(dkOpenFiles, "avsadd", "Add Visualizer Presets",
+    if dir.len > 0 and dirExists(dir): dir else: configDir() / "avs",
+    exts = @["avs"], filterName = "AVS presets")
+
+proc askAddAvsDir(a: App) =
+  ## Visualizers' Add Folder...: every preset in a folder (and its
+  ## subfolders, with Include subfolders).
+  let dir = a.cfg.avsLastDir
+  a.ask(dkOpenDir, "avsadddir", "Add Visualizer Preset Folder",
+    if dir.len > 0 and dirExists(dir): dir else: configDir() / "avs")
+
+proc sortAvs(a: App, key: string, desc: bool) =
+  ## Visualizers' sorting, as a header click sets it.
+  let d = a.avsDlg
+  (d.sortKey, d.sortDesc) = (key, desc)
+  (a.cfg.avsSort, a.cfg.avsSortDescending) = (key, desc)
+  a.cfg.save()
+
+proc rateAvs(a: App, ids: seq[string], quarters: int) =
+  let d = a.avsDlg
+  for id in ids:
+    if quarters > 0: d.ratings[id] = quarters else: d.ratings.del id
+  a.cfg.avsStarRatings = d.ratings
+  a.cfg.save()
+
+const AvsRates = [60, 50, 40, 30, 25, 20, 15, 10]
+
+proc rateAvsFps(a: App, ids: seq[string], fps: int) =
+  ## How many times a second the presets step: MaxFps (every display frame)
+  ## is the default, and forgotten.
+  for id in ids:
+    if fps >= MaxFps: a.cfg.avsFrameRates.del id else: a.cfg.avsFrameRates[id] = fps
+  a.avs.rates = a.cfg.avsFrameRates
+  a.cfg.save()
+
+proc avsRateMenu(a: App, m: MenuNode, ids: seq[string]) =
+  ## Frame Rate: AVS presets move a set amount each frame, so ones made on
+  ## slower computers play too fast at 60; slower ones blend between steps.
+  if ids.len == 0: return
+  let r0 = a.avs.rateOf(ids[0])
+  let same = ids.allIt(a.avs.rateOf(it) == r0)
+  let setTo = proc (fps: int) = a.rateAvsFps(ids, fps)
+  for fps in AvsRates:
+    m.radio(if fps == MaxFps: &"{fps} fps (Default)" else: &"{fps} fps", checked = same and r0 == fps,
+      action = bindAct(setTo, fps))
+
+proc avsSortMenu(a: App, m: MenuNode) =
+  ## Sort by each column, then which way.
+  let d = a.avsDlg
+  # bindAct: a closure made in a loop would see the loop's last value.
+  let sortBy = proc (key: string) =
+    a.sortAvs(key, if key == a.avsDlg.sortKey: a.avsDlg.sortDesc else: false)
+  for (key, title) in columnTitles():
+    m.radio(title, checked = d.sortKey == key, action = bindAct(sortBy, key))
+  m.sep()
+  m.radio("Ascending", checked = not d.sortDesc, action = proc () = a.sortAvs(a.avsDlg.sortKey, false))
+  m.radio("Descending", checked = d.sortDesc, action = proc () = a.sortAvs(a.avsDlg.sortKey, true))
+  m.sep()
+  m.item("Order Added", enabled = d.sortKey != "added" or d.sortDesc, action = proc () =
+    a.sortAvs("added", false))
+
+proc buildAvsMenu(a: App): MenuNode =
+  ## Visualizers' context menu: for the highlighted rows, the header or the
+  ## space under the rows.
+  let d = a.avsDlg
+  result = newMenuRoot()
+  if d == nil or a.avs == nil: return
+  let m = result
+  case d.ctx
+  of acHeader: a.avsSortMenu(m)
+  of acEmpty:
+    m.item("Add...", action = proc () = a.askAddAvs())
+    m.item("Add Folder...", action = proc () = a.askAddAvsDir())
+    m.sep()
+    a.avsSortMenu(m.sub("Sort By"))
+  of acRows:
+    let sel = d.sel.filterIt(it in a.avs.presets)
+    if sel.len == 0: return
+    let files = sel.filterIt(not it.isBuiltin)
+    let anyOn = sel.anyIt(it notin a.cfg.avsDisabled)
+    m.item("Play", enabled = sel.len == 1, action = proc () = a.pickAvs(sel[0]))
+    m.item(if anyOn: "Turn Off" else: "Turn On", "Space", action = proc () = a.toggleAvs(sel))
+    let rm = m.sub("Rating")
+    let r0 = d.ratings.getOrDefault(sel[0])
+    let same = sel.allIt(d.ratings.getOrDefault(it) == r0)
+    rm.radio("None", checked = same and r0 == 0, action = proc () = a.rateAvs(sel, 0))
+    let rate = proc (q: int) = a.rateAvs(sel, q)
+    for n in 1 .. 5:
+      rm.radio(if n == 1: "1 Star" else: &"{n} Stars", checked = same and r0 == n * 4,
+        action = bindAct(rate, n * 4))
+    a.avsRateMenu(m.sub("Frame Rate"), sel)
+    m.sep()
+    m.item("Open Containing Directory", enabled = files.len == 1 and sel.len == 1,
+      action = proc () = a.showInFolder(files[0]))
+    m.item("Copy Path", enabled = files.len > 0, action = proc () =
+      setClipboardString(files.join("\n")))
+    m.sep()
+    m.item("Add...", action = proc () = a.askAddAvs())
+    m.item("Add Folder...", action = proc () = a.askAddAvsDir())
+    m.item("Remove", "Delete", enabled = files.len > 0, action = proc () = a.removeAvs(files))
+    m.sep()
+    a.avsSortMenu(m.sub("Sort By"))
 
 proc pollThumbnail(a: App) =
   let id = a.wantedThumb
@@ -7202,12 +9868,30 @@ proc drawVideo(a: App, area: Rect, fb: IVec2) =
   glClear(GL_COLOR_BUFFER_BIT)
   glDisable(GL_SCISSOR_TEST)
   if a.holding and a.drawHeld(area, fb, flags): return
+  if a.qcBridge and a.qcTex != 0:
+    # Show Quick Cover: its snapshot while mpv sets the picture up again,
+    # still taking mpv's frames so it isn't held up.
+    if (flags and MpvRenderUpdateFrame) != 0:
+      a.player.target.ensureSize(max(16, a.player.target.w), max(16, a.player.target.h))
+      a.player.render.render(a.player.target)
+    let ts = a.qcTexSize.vec2
+    let size = ts * min(area.w / ts.x, area.h / ts.y)
+    let center = area.xy + area.wh / 2
+    glEnable(GL_SCISSOR_TEST)
+    glScissor(GLint(area.x), GLint(fb.y.float32 - area.y - area.h), GLsizei(area.w), GLsizei(area.h))
+    a.quad.draw(a.qcTex, transformedCorners(center, size, a.xf.rotation), fb.vec2)
+    if a.animOn: a.drawAnim(center, size, fb)
+    glDisable(GL_SCISSOR_TEST)
+    return
   if not a.player.hasVideo or a.player.stopped:
     # Still consume frames so mpv keeps its pipeline moving.
     if (flags and MpvRenderUpdateFrame) != 0:
       a.player.target.ensureSize(16, 16)
       a.player.render.render(a.player.target)
     a.drawThumbnail(area, fb)
+    if a.avsShown:
+      a.avsArea = area.wh
+      if a.avs != nil: a.avs.draw(a.quad, area, fb)
     return
   if a.player.isSpherical:
     a.drawSphere(area, fb, flags)
@@ -7248,6 +9932,7 @@ proc drawVideo(a: App, area: Rect, fb: IVec2) =
             else: a.player.target.tex
   a.videoCorners = transformedCorners(center + shift, quadSize, a.xf.rotation)
   a.quad.draw(tex, a.videoCorners, fb.vec2)
+  if a.animOn: a.drawAnim(center, size, fb)
   a.drawOsdLayer(area, fb)
   glDisable(GL_SCISSOR_TEST)
 
@@ -7539,9 +10224,24 @@ const
 
 proc controlsVolumeW(a: App): float32 =
   ## Width of the volume group at the right of the controls bar: the
-  ## percentage, the mute button and the slider.
+  ## shield, the percentage, the mute button and the slider.
   let pct = &"{int(round(a.player.volume))}%"
-  a.ui.textSize(pct, FontSmall).x + 6 + CtlButtonW + 6 + CtlVolumeW + 16
+  CtlButtonW + 6 + a.ui.textSize(pct, FontSmall).x + 6 + CtlButtonW + 6 + CtlVolumeW + 16
+
+proc setShield(a: App, on: bool) =
+  ## On, files opened from the file manager start a player of their own
+  ## (whatever "Same player for each media file" says): this one stops
+  ## listening, so a later launch finds nobody to hand them to. Off, it
+  ## listens again, unless another player took over meanwhile.
+  a.shielded = on
+  if on:
+    a.instance.close()
+    a.instance = nil
+  elif a.instance == nil and not a.scripted:
+    a.instance = startServer()
+    a.instanceRetry = now()
+  a.osd(if on: "Shield on: files opened elsewhere start a new player"
+        else: "Shield off")
 
 proc trackerButton(a: App): bool =
   ## A tracker module plays, and libopenmpt is here to play it with settings.
@@ -7550,12 +10250,13 @@ proc trackerButton(a: App): bool =
 proc controlsTier(a: App, w: float32): int =
   ## How much a controls bar w wide drops as the window narrows: 0 keeps
   ## everything, 1 hides the status bar's key hints, 2 the Repeat,
-  ## Equalizer and Tracker buttons (and a link's quality one), 3 the rate
-  ## buttons, 4 previous/next.
+  ## Equalizer, Tracker and ReplayGain buttons (and a link's quality one),
+  ## 3 the rate buttons, 4 previous/next.
   let quality = if a.player.path.isWebLink: CtlStep else: 0
   let tracker = if a.trackerButton: CtlSepW + CtlStep else: 0
+  let rg = if a.rgButton: CtlSepW + CtlStep else: 0
   let need = [6 + 3 * CtlStep, CtlSepW + 2 * CtlStep, 2 * CtlStep,
-              CtlSepW + 2 * CtlStep + quality + tracker]
+              CtlSepW + 2 * CtlStep + quality + tracker + rg]
   var full = a.controlsVolumeW + 10
   for n in need: full += n
   if w >= full + CtlHintsMargin: return 0
@@ -7596,17 +10297,22 @@ proc controls(a: App, r: Rect) =
     let navOk = p.loaded and not a.playlistLocked
     btn("prev", "prev", "Previous", navOk, false): a.navigate(-1)
     if tier < 3:
-      btn("slower", "slower", "Slower playback", p.loaded, false): a.changeRate(-1)
-      btn("faster", "faster", "Faster playback", p.loaded, false): a.changeRate(1)
+      btn("slower", "slower", "Slow down", p.loaded, false): a.changeRate(-1)
+      btn("faster", "faster", "Fast-forward", p.loaded, false): a.changeRate(1)
     btn("next", "next", "Next", navOk, false): a.navigate(1)
   if tier < 2:
     divider()
-    # Click toggles Repeat > Forever; right-click opens the Repeat menu.
+    # Click cycles off, Repeat and Loop A-B (with both marks set); right-click
+    # opens the Repeat menu. Cyan like the marks while the A-B loop runs.
     let loopR = rect(x, y, bw, bh)
-    btn("loop", "loop", "Repeat (right-click for options)", true,
-        a.cfg.repeatForever or (a.abLoop and a.loopReady)):
-      a.cfg.repeatForever = not a.cfg.repeatForever
-      a.applyLoop()
+    let abOn = a.abLoop and a.loopReady
+    let tipText =
+      if abOn: "Loop A-B"
+      elif a.cfg.repeatForever: "Repeat: on"
+      else: "Repeat: off"
+    btn("loop", "loop", tipText & " (click to cycle, right-click for options)",
+        true, a.cfg.repeatForever or abOn, if abOn: colLoop else: colAccent):
+      a.cycleLoop()
     if ui.hover(loopR) and ui.released(MouseRight):
       a.ctxMenu = cmRepeat
       a.menus.openContext(ui.mouse)
@@ -7631,6 +10337,24 @@ proc controls(a: App, r: Rect) =
       btn("tracker", "tracker", "Tracker playback", true, a.tkOpen or custom,
           if custom: colEqualizer else: colAccent):
         a.setTrackerPanel(not a.tkOpen)
+    # ReplayGain: purple while on for a file without values, blue while the
+    # file's values apply; lit while its menu is open.
+    if a.rgButton:
+      divider()
+      let rgR = rect(x, y, bw, bh)
+      a.rgRect = rgR
+      let on = a.cfg.replayGain != rgOff
+      let applied = on and a.currentRg.known
+      let shown = a.menus.contextOpen and a.ctxMenu == cmReplayGain
+      let tipText =
+        if not on: "ReplayGain: off"
+        elif applied: "ReplayGain: " & fmtDb(a.currentRg.applied(a.cfg.replayGain == rgAlbum,
+          a.cfg.replayGainPreamp, a.cfg.replayGainNoClip), 2) & " applied"
+        else: "ReplayGain: no values in this file"
+      btn("replaygain", "replaygain", tipText, true, on or shown,
+          if applied: colEqualizer else: colAccent):
+        a.ctxMenu = cmReplayGain
+        a.menus.openContext(rgR.xy, sticky = true, keep = rgR, above = true)
 
   # Volume on the right, never over the buttons.
   let vx = max(r.x + r.w - a.controlsVolumeW, x + 4)
@@ -7643,7 +10367,25 @@ proc controls(a: App, r: Rect) =
   let pct = &"{int(round(p.volume))}%"
   let pw = ui.textSize(pct, FontSmall).x
   ui.textIn(pct, rect(vb.x - pw - 6, r.y, pw + 2, r.h), colTextDim, FontSmall)
+  let shieldTip =
+    if a.shielded: "Shield on: files opened from the file manager start a new player"
+    else: "Shield: make files opened from the file manager start a new player"
+  let shieldX = vb.x - pw - 6 - 6 - bw
+  if ui.iconButton("shield", rect(shieldX, y, bw, bh), "shield20",
+                   shieldTip, true, a.shielded, colAccent):
+    a.setShield(not a.shielded)
   ui.sk.popClipRect()
+  # The empty stretch between the buttons and the volume moves the window
+  # when dragged, like the video frame (not in full screen).
+  let gap = rect(x + 2, r.y, shieldX - 2 - (x + 2), r.h)
+  if not a.fullscreen and gap.w > 0 and ui.hover(gap) and ui.pressed():
+    a.ctlPress = true
+    a.ctlPressPos = ui.mouse
+  if a.ctlPress:
+    if not ui.down() or a.fullscreen: a.ctlPress = false
+    elif (ui.mouse - a.ctlPressPos).length > 4:
+      a.ctlPress = false
+      a.window.startWindowDrag()
 
 type KeyHint = tuple[key, label: string]
 
@@ -7689,6 +10431,8 @@ proc modifierHints(a: App): seq[seq[KeyHint]] =
         of kaCopyClipboard:
           if logSel and mods == {kmCtrl} and ks.anyIt(it.key == KeyC): "Copy Selected Text"
           else: Actions[act].hint
+        of kaOpenClipboard:  # a picture becomes the quick cover
+          if a.quickCoverAllowed: "Open / Paste Cover" else: Actions[act].hint
         else: Actions[act].hint
       hints.add (ks.mapIt(shortKeyName(it.key)).join("/"), label)
     if hints.len > 0: result.add hints
@@ -7699,6 +10443,9 @@ proc modifierHints(a: App): seq[seq[KeyHint]] =
     if mods == {kmCtrl}: result.add @[("A", "Select All Entries"), ("D", "Duplicate Entries")]
     elif mods == {kmCtrl, kmShift}:
       result.add @[("Up/Down", "Move Entries"), ("Home/End", "Move Entries To Top/Bottom")]
+  # The playlist search's way back (handleKeys); Enter only while typing in it.
+  if a.plFindOpen and mods == {kmShift}:
+    result.add @[((if a.ui.focusId == "pl-find": "Enter/F3" else: "F3"), "Previous Match")]
   let plShown = a.cfg.showPlaylist and not a.playlistLocked and a.playlist.len > 0
   var mouse: seq[KeyHint]
   if mods == {kmCtrl}:
@@ -7708,7 +10455,7 @@ proc modifierHints(a: App): seq[seq[KeyHint]] =
         ("Drag", if a.cfg.sphereDragMovesWindow: "Look Around" else: "Move Window")]
     elif a.chartShown: mouse = @[("Wheel", "Zoom Chart"), ("Drag", "Pan Chart")]
     else: mouse = @[("Wheel", "Zoom At Cursor"), ("Drag", "Pan Zoomed Video")]
-    if plShown: mouse.add ("LMB", "Toggle Playlist Entry")
+    if plShown: mouse.add @[("LMB", "Toggle Playlist Entry"), ("Drag", "Copy Playlist Entries")]
   elif mods == {kmAlt}: mouse = @[("MDrag", "Rotate Frame"), ("MMB", "Reset Rotation")]
   elif mods == {kmAlt, kmShift}: mouse = @[("MDrag", "Rotate In " & rot & " Steps")]
   elif mods == {kmCtrl, kmAlt}: mouse = @[("MDrag", "Rotate Around Cursor")]
@@ -7719,6 +10466,7 @@ proc modifierHints(a: App): seq[seq[KeyHint]] =
               ("RMB", "Menu Bar's Menus")]
     if a.cfg.showRunLog and a.runLog.len > 0: mouse.add ("LMB", "Extend Log Selection")
     if plShown: mouse.add ("LMB", "Select Playlist Range")
+    if plShown and a.tabs.len > 1: mouse.add ("Drag", "Move Entries To A Tab")
   # Mouse shortcuts lead the bar, before any key group.
   if mouse.len > 0: result.insert(mouse, 0)
 
@@ -7857,8 +10605,19 @@ proc status(a: App, r: Rect) =
     ui.textIn(saving, sr, colTextDim, FontSmall)
     ui.tip(sr, "Saving to " & a.saveJob.dest)
     sw += sr.w + 4
+  if a.rgJob.running:
+    let (i, pc) = a.rgJob.progress
+    let n = a.rgJob.paths.len
+    let w = a.rgJob.writing
+    let text = (if w: "Applying ReplayGain " elif n > 1: &"ReplayGain ({min(i + 1, n)}/{n}) " else: "ReplayGain ") &
+               $int(pc) & "%"
+    let gr = rect(r.x + 30 + sw + 8, r.y, ui.textSize(text, FontSmall).x + 4, r.h)
+    ui.textIn(text, gr, colTextDim, FontSmall)
+    ui.tip(gr, (if w: "Writing the tags of " else: "Analyzing ") & a.rgJob.paths[min(i, n - 1)].extractFilename)
+    sw += gr.w + 4
   let err = if a.ytError.len > 0: a.ytError
             elif yt.len > 0 or a.overlay == ovYtdlp or p.opening: ""
+            elif p.loadError.len > 0 and a.midiErrorFor == p.path and a.midiError.len > 0: a.midiError
             else: p.loadError
   if err.len > 0:
     ui.textIn("Error: " & err, rect(r.x + 30 + max(sw + 16, 70), r.y, r.w / 2, r.h),
@@ -7930,7 +10689,7 @@ proc columnTitle(field: PlaylistField): string =
 
 proc columnFills(a: App, field: PlaylistField): bool =
   ## A text column nobody resized: it shares the width the others leave.
-  PlaylistFields[field].sample.len == 0 and $field notin a.cfg.playlistColumnWidths
+  PlaylistFields[field].sample.len == 0 and $field notin a.plColumnWidths
 
 proc columnMin(a: App, cells: seq[(Rect, PlaylistField)], i: int): float32 =
   if a.columnFills(cells[i][1]): PlaylistMinTextW
@@ -7943,7 +10702,7 @@ proc playlistCells(a: App, hdr: Rect): seq[(Rect, PlaylistField)] =
   ## except the text columns, which share what the rest leave (with none
   ## shown, the last column takes it).
   let ui = a.ui
-  let cols = a.cfg.playlistColumns
+  let cols = a.plColumns
   a.plDurSeconds = pfDuration in cols and
     not a.playlist.anyIt(it in a.mediaInfo and a.mediaInfo[it].duration > 60)
   var widths = newSeq[float32](cols.len)
@@ -7951,8 +10710,8 @@ proc playlistCells(a: App, hdr: Rect): seq[(Rect, PlaylistField)] =
   var shared = 0
   for i, f in cols:
     let sample = PlaylistFields[f].sample
-    if $f in a.cfg.playlistColumnWidths:
-      widths[i] = a.cfg.playlistColumnWidths[$f].float32
+    if $f in a.plColumnWidths:
+      widths[i] = a.plColumnWidths[$f].float32
       used += widths[i]
     elif sample.len == 0: inc shared
     else:
@@ -8030,18 +10789,19 @@ proc fitColumn(a: App, cells: seq[(Rect, PlaylistField)], i: int, visible: Slice
   let room = cells[other][0].w - a.columnMin(cells, other)
   let otherFills = a.columnFills(cells[other][1])
   let w = clamp(want, a.columnMin(cells, i), max(a.columnMin(cells, i), was + room))
-  a.cfg.playlistColumnWidths[$field] = w.float
+  a.plColumnWidths[$field] = w.float
   if not otherFills:
-    a.cfg.playlistColumnWidths[$cells[other][1]] = float(cells[other][0].w + was - w)
-  a.cfg.save()
+    a.plColumnWidths[$cells[other][1]] = float(cells[other][0].w + was - w)
+  a.saveColumns()
 
 proc playlistCell(a: App, s: string, cell: Rect, field: PlaylistField, first: bool,
-                  color: ColorRGBX, font: string) =
+                  color: ColorRGBX, font: string, shift = 0'f32) =
   ## A column's text, in the header or a row: text columns start at its left
   ## edge, past the playing icon in the first column; the others end at its right.
+  ## shift moves a text column's start further right (past a long queue label).
   let ui = a.ui
   if PlaylistFields[field].sample.len == 0:
-    let pad = if first: PlaylistIconW else: 9'f32
+    let pad = (if first: PlaylistIconW else: 9'f32) + min(shift, max(0'f32, cell.w - 40))
     let w = cell.w - pad - 4
     ui.textIn(ui.ellipsize(s, w, font), rect(cell.x + pad, cell.y, w, cell.h), color, font)
   else:
@@ -8099,6 +10859,298 @@ proc playlistBar(a: App, gutter: Rect): float32 =
     ui.rect(rect(x - 1, rowY(a.plIndex) - 1, w + 2, 2), blend(colAccent, colWhite, a.plBarLift))
   thumb.y + thumbH / 2
 
+proc tabSummary(a: App, i: int): string =
+  ## A tab's tooltip: its name, entries and how long they last (those known).
+  let entries = a.tabEntries(i)
+  var total = 0.0
+  var unknown = false
+  for e in entries:
+    let d = a.mediaInfo.getOrDefault(e).duration
+    if d > 0: total += d else: unknown = true
+  result = a.tabs[i].name & ": " & countLabel(entries.len)
+  if total > 0: result.add ", " & fmtTime(total, dur = total) & (if unknown: "+" else: "")
+  if i == a.tabPlaying: result.add ", playing"
+  result.add ". Double-click to rename, middle-click to close, drag to move"
+
+proc dropRows(a: App, at: int) =
+  ## Rows dragged from another playlist dropped on the shown one, before
+  ## entry `at`: copies, or with Shift held moved out of theirs.
+  let src = a.tabAt(a.rowDragTab)
+  let paths = a.rowDragPaths
+  if paths.len == 0 or a.editLocked: return
+  let move = a.window.shiftDown and src >= 0
+  let first = a.insertEntries(paths, at, if move: "Move" else: "Add")
+  a.plSelected = first
+  a.plMarks = if paths.len > 1: toSeq(first ..< first + paths.len) else: @[]
+  if move:
+    a.inTab(src): a.removeEntries(a.plSelection, "Move")
+  a.osd((if move: "Moved " else: "Copied ") & countLabel(paths.len) & " to " & a.tabs[a.tabView].name)
+
+proc playlistTabs(a: App, x, y, w: float32): float32 =
+  ## The playlists' tabs, wrapping onto more rows as they need; returns
+  ## their height. A click shows one, a drag moves it, a double-click
+  ## renames it, a middle-click closes it; the wheel steps through them, a
+  ## double-click beside them or + makes a new one. Rows dragged onto a tab
+  ## go there (copied; moved with Shift), and show it when held there.
+  let ui = a.ui
+  let pad = 4'f32
+  let th = PlaylistTabH - 3
+  var rects: seq[Rect]
+  var cx = x + pad
+  var cy = y + 3
+  for i, t in a.tabs:
+    var tw = ui.textSize(t.name, FontSmall).x + 20
+    if i == a.tabPlaying: tw += 14
+    tw = clamp(tw, PlaylistTabMinW, PlaylistTabMaxW)
+    if t.id == a.tabRename: tw = max(tw, PlaylistTabRenameW)
+    tw = min(tw, w - pad * 2)
+    if cx + tw > x + w - pad and cx > x + pad:
+      cx = x + pad
+      cy += PlaylistTabH
+    rects.add rect(cx, cy, tw, th)
+    cx += tw + 2
+  if cx + 24 > x + w - pad and cx > x + pad:
+    cx = x + pad
+    cy += PlaylistTabH
+  let plus = rect(cx, cy, 24, th)
+  result = cy + PlaylistTabH - y
+  let strip = rect(x, y, w, result)
+  (a.tabRects, a.tabPlus, a.tabStrip) = (rects, plus, strip)
+  ui.rect(strip, colPanelRaised)
+  ui.rect(rect(x, y + result - 1, w, 1), colBorder)
+
+  let rowDrag = ui.activeId == "plrow" and a.plRowFrom.moved
+  let tabDrag = ui.activeId == "pltab" and a.tabFrom.moved
+  var over = -1
+  for i, tr in rects:
+    if ui.hover(tr): over = i
+  for i, tr in rects:
+    let t = addr a.tabs[i]
+    let shown = i == a.tabView
+    if t.id == a.tabRename:
+      let ev = ui.textField("pl-tabname", tr, a.tabRenameText)
+      if eeCommitted in ev:
+        a.renameTab(i, a.tabRenameText)
+        a.tabRename = 0
+      continue
+    let target = rowDrag and over == i and t.id != a.rowDragTab
+    if shown or target: ui.rect(tr, colPanel)
+    elif over == i and not tabDrag: ui.rect(tr, colHover)
+    if target: ui.border(tr, colAccent)
+    elif shown: ui.rect(rect(tr.x, tr.y, tr.w, 2), colAccent)
+    var tx = tr.x + 10
+    if i == a.tabPlaying:
+      ui.icon("play16", vec2(tr.x + 13, tr.y + tr.h / 2), colAccent)
+      tx += 12
+    let tw = tr.x + tr.w - 8 - tx
+    ui.textIn(ui.ellipsize(t.name, tw, FontSmall), rect(tx, tr.y, tw, tr.h),
+      if shown: colText else: colTextDim, FontSmall)
+  if a.tabRename != 0 and a.tabAt(a.tabRename) < 0: a.tabRename = 0
+  if not rowDrag and not tabDrag and over >= 0: ui.tip(rects[over], a.tabSummary(over))
+  let newKey = a.cfg.keyText(kaNewPlaylist)
+  if not a.playlistLocked and ui.iconButton("pl-tabnew", plus, "plus16",
+      "New playlist" & (if newKey.len > 0: " (" & newKey & ")" else: "")):
+    discard a.newPlaylist()
+  let w0 = a.window
+  let renaming = over >= 0 and a.tabs[over].id == a.tabRename
+  if over >= 0 and not renaming:
+    if w0.buttonPressed[DoubleClick]:  # on the press or, on X11, its release
+      ui.consumeClick()
+      a.startRename(over)
+    elif ui.pressed():
+      ui.consumeClick()
+      a.showTab(over)
+      ui.activeId = "pltab"
+      a.tabFrom = (over, ui.mouse.x, false)
+    elif ui.released(MouseMiddle): a.closeTab(over)
+  elif over < 0 and ui.hover(strip) and not ui.hover(plus):
+    if w0.buttonPressed[DoubleClick]:
+      ui.consumeClick()
+      if not a.editLocked: discard a.newPlaylist()
+    elif ui.pressed(): ui.consumeClick()
+  if ui.hover(strip) and ui.released(MouseRight):
+    if over >= 0: a.showTab(over)
+    a.ctxTab = over
+    a.ctxMenu = cmPlaylistTab
+    a.menus.openContext(ui.mouse)
+  if ui.hover(strip) and ui.scroll() != 0 and not rowDrag:
+    a.stepTab(if ui.wheelNotches > 0: 1 else: -1)
+    ui.scrollConsumed = true
+
+  # Dragging a tab: the gap it drops into, before the tab under the pointer
+  # or after it, past its middle.
+  if ui.activeId == "pltab":
+    if abs(ui.mouse.x - a.tabFrom.x) >= PlaylistTabDrag: a.tabFrom.moved = true
+    var gap = -1
+    var gx, gy: float32
+    if a.tabFrom.moved:
+      for i, tr in rects:
+        if ui.mouse.y >= tr.y and ui.mouse.y < tr.y + PlaylistTabH:
+          if ui.mouse.x < tr.x + tr.w / 2:
+            if gap < 0: (gap, gx, gy) = (i, tr.x - 1, tr.y)
+          else: (gap, gx, gy) = (i + 1, tr.x + tr.w + 1, tr.y)
+      if gap < 0 and ui.mouse.y >= y + result and rects.len > 0:
+        (gap, gx, gy) = (rects.len, rects[^1].x + rects[^1].w + 1, rects[^1].y)
+      if gap >= 0: ui.rect(rect(gx - 1, gy, 2, th), colAccent)
+    if ui.released() and gap >= 0: a.moveTab(a.tabFrom.index, gap)
+
+  # Rows dragged here: held over a tab, it's shown; let go on one, they go
+  # to its end.
+  if rowDrag:
+    let id = if over >= 0: a.tabs[over].id else: 0
+    if id == 0 or id == a.shownId: a.rowDragOver = (0, 0.0)
+    elif a.rowDragOver.tab != id: a.rowDragOver = (id, now())
+    elif now() - a.rowDragOver.since >= PlaylistTabHover:
+      a.showTab(over)
+      a.rowDragOver = (0, 0.0)
+    if id != 0: a.dirtyUntil = max(a.dirtyUntil, now() + 0.1)
+    if ui.released() and ui.hover(strip):
+      if over >= 0 and id != a.rowDragTab:
+        if over != a.tabView:
+          a.inTab(over): a.dropRows(-1)
+        else: a.dropRows(-1)
+      elif over < 0 and ui.hover(plus) and not a.editLocked:
+        let ti = a.newPlaylist(show = false)
+        a.inTab(ti): a.dropRows(-1)
+      ui.activeId = ""  # not dropped on the rows too
+
+proc playlistSide(a: App, x, y, w, h: float32, blocked: bool) =
+  ## The playlists as a column left of the shown one's entries (Playlists in
+  ## a Side Column), top to bottom with + after the last: a click shows one,
+  ## a drag moves it, a double-click renames it, a middle-click closes it, a
+  ## double-click below them makes a new one. Rows dragged onto one go there
+  ## (copied; moved with Shift), and show it when held there. The wheel
+  ## scrolls the column when it overflows, else steps through the playlists.
+  ## blocked: the pointer is on an edge that resizes, not on a playlist.
+  let ui = a.ui
+  let rowH = PlaylistTabH
+  let n = a.tabs.len
+  let strip = rect(x, y, w, h)
+  let top = y + 2
+  let maxScroll = max(0'f32, (n + 1).float32 * rowH + 4 - h)
+  let rowDrag = ui.activeId == "plrow" and a.plRowFrom.moved
+  let tabDrag = ui.activeId == "pltab" and a.tabFrom.moved
+  if a.tabSeen != a.tabView:  # shown some other way (Ctrl+Tab, Show Playing): into view
+    a.tabSeen = a.tabView
+    let ty = 2 + a.tabView.float32 * rowH
+    a.tabScroll = clamp(a.tabScroll, ty + rowH + 2 - h, ty - 2)
+  if ui.hover(strip) and ui.scroll() != 0:
+    if maxScroll > 0: a.tabScroll += ui.wheelNotches * rowH * PlaylistWheelRows
+    elif not rowDrag: a.stepTab(if ui.wheelNotches > 0: 1 else: -1)
+    ui.scrollConsumed = true
+  a.tabScroll = clamp(a.tabScroll, 0, maxScroll)
+  var rects: seq[Rect]
+  for i in 0 ..< n: rects.add rect(x, top + i.float32 * rowH - a.tabScroll, w, rowH)
+  let plus = rect(x, top + n.float32 * rowH - a.tabScroll, w, rowH)
+  (a.tabRects, a.tabPlus, a.tabStrip) = (rects, plus, strip)
+  ui.rect(strip, colPanelRaised)
+
+  var over = -1
+  if ui.hover(strip) and not blocked:
+    for i, tr in rects:
+      if ui.hover(tr): over = i
+  ui.sk.pushClipRect(strip)
+  for i, tr in rects:
+    if tr.y + tr.h < y or tr.y > y + h: continue
+    let t = addr a.tabs[i]
+    let shown = i == a.tabView
+    if t.id == a.tabRename:
+      let ev = ui.textField("pl-tabname", rect(tr.x + 3, tr.y + 1, tr.w - 6, tr.h - 2), a.tabRenameText)
+      if eeCommitted in ev:
+        a.renameTab(i, a.tabRenameText)
+        a.tabRename = 0
+      continue
+    let target = rowDrag and over == i and t.id != a.rowDragTab
+    if shown or target: ui.rect(tr, colPanel)
+    elif over == i and not tabDrag: ui.rect(tr, colHover)
+    if target: ui.border(tr, colAccent)
+    elif shown: ui.rect(rect(tr.x, tr.y, 2, tr.h), colAccent)
+    var tx = tr.x + 10
+    if i == a.tabPlaying:
+      ui.icon("play16", vec2(tr.x + 15, tr.y + tr.h / 2), colAccent)
+      tx += 14
+    # The entry count at the right, when there's room left for the name.
+    let count = $a.tabLen(i)
+    let cw = ui.textSize(count, FontSmall).x
+    let room = tr.x + tr.w - 8 - tx
+    let showCount = room - cw - 8 >= 40
+    let nw = if showCount: room - cw - 8 else: room
+    ui.textIn(ui.ellipsize(t.name, nw, FontSmall), rect(tx, tr.y, nw, tr.h),
+      if shown: colText else: colTextDim, FontSmall)
+    if showCount:
+      ui.textIn(count, rect(tr.x + tr.w - 8 - cw, tr.y, cw, tr.h), colTextDisabled, FontSmall)
+  # +: a new playlist, and where rows or files dropped make one.
+  if not a.playlistLocked:
+    let newKey = a.cfg.keyText(kaNewPlaylist)
+    let onPlus = ui.hover(strip) and ui.hover(plus) and not blocked
+    let plusTarget = rowDrag and onPlus
+    if plusTarget: ui.border(plus, colAccent)
+    elif onPlus and not tabDrag: ui.rect(plus, colHover)
+    ui.icon("plus16", vec2(plus.x + 15, plus.y + plus.h / 2), if onPlus: colText else: colTextDim)
+    ui.textIn(ui.ellipsize("New playlist", plus.w - 34, FontSmall),
+      rect(plus.x + 26, plus.y, max(0'f32, plus.w - 34), plus.h),
+      if onPlus: colText else: colTextDim, FontSmall)
+    if onPlus and not rowDrag and not tabDrag:
+      ui.tip(plus, "New playlist" & (if newKey.len > 0: " (" & newKey & ")" else: ""))
+      if ui.pressed():
+        ui.consumeClick()
+        discard a.newPlaylist()
+  if a.tabRename != 0 and a.tabAt(a.tabRename) < 0: a.tabRename = 0
+  if not rowDrag and not tabDrag and over >= 0: ui.tip(rects[over], a.tabSummary(over))
+  let w0 = a.window
+  let renaming = over >= 0 and a.tabs[over].id == a.tabRename
+  if over >= 0 and not renaming:
+    if w0.buttonPressed[DoubleClick]:  # on the press or, on X11, its release
+      ui.consumeClick()
+      a.startRename(over)
+    elif ui.pressed():
+      ui.consumeClick()
+      a.showTab(over)
+      ui.activeId = "pltab"
+      a.tabFrom = (over, ui.mouse.y, false)
+    elif ui.released(MouseMiddle): a.closeTab(over)
+  elif over < 0 and not blocked and ui.hover(strip) and not ui.hover(plus):
+    if w0.buttonPressed[DoubleClick]:
+      ui.consumeClick()
+      if not a.editLocked: discard a.newPlaylist()
+    elif ui.pressed(): ui.consumeClick()
+  if ui.hover(strip) and ui.released(MouseRight):
+    if over >= 0: a.showTab(over)
+    a.ctxTab = over
+    a.ctxMenu = cmPlaylistTab
+    a.menus.openContext(ui.mouse)
+
+  # Dragging a playlist: the gap it drops into, nearest the pointer.
+  if ui.activeId == "pltab":
+    if abs(ui.mouse.y - a.tabFrom.x) >= PlaylistTabDrag: a.tabFrom.moved = true
+    if a.tabFrom.moved and n > 0:
+      let gap = clamp(int((ui.mouse.y - top + a.tabScroll) / rowH + 0.5), 0, n)
+      let gy = clamp(top + gap.float32 * rowH - a.tabScroll - 1, y, y + h - 2)
+      ui.rect(rect(x + 2, gy, w - 4, 2), colAccent)
+      if ui.released(): a.moveTab(a.tabFrom.index, gap)
+  ui.sk.popClipRect()
+
+  # Rows dragged here: held over a playlist, it's shown; let go on one, they
+  # go to its end.
+  if rowDrag:
+    let id = if over >= 0: a.tabs[over].id else: 0
+    if id == 0 or id == a.shownId: a.rowDragOver = (0, 0.0)
+    elif a.rowDragOver.tab != id: a.rowDragOver = (id, now())
+    elif now() - a.rowDragOver.since >= PlaylistTabHover:
+      a.showTab(over)
+      a.tabSeen = a.tabView  # stays where it is under the pointer
+      a.rowDragOver = (0, 0.0)
+    if id != 0: a.dirtyUntil = max(a.dirtyUntil, now() + 0.1)
+    if ui.released() and ui.hover(strip):
+      if over >= 0 and id != a.rowDragTab:
+        if over != a.tabView:
+          a.inTab(over): a.dropRows(-1)
+        else: a.dropRows(-1)
+      elif over < 0 and ui.hover(plus) and not a.editLocked:
+        let ti = a.newPlaylist(show = false)
+        a.inTab(ti): a.dropRows(-1)
+      ui.activeId = ""  # not dropped on the rows too
+
 proc playlistPanel(a: App, r: Rect) =
   let ui = a.ui
   a.plOverEdge = false
@@ -8116,20 +11168,105 @@ proc playlistPanel(a: App, r: Rect) =
       max(PlaylistMinWidth, ui.size.x - MinWindow.x.float32 / 2))
   let header = rect(r.x, r.y, r.w, 30)
   ui.icon("playlist16", vec2(r.x + 18, header.y + 15), colAccent)
-  ui.textIn(&"Playlist ({a.playlist.len})", rect(r.x + 32, header.y, r.w - 70, 30), colText)
+  # Autosave: on, every change goes to the playlist's file. A new playlist
+  # asks for one first; one still the site's (YouTube) or in a read-only
+  # file can't be autosaved until saved to a file of its own.
+  let asW = 24 + ui.textSize("Autosave").x
+  let asPos = vec2(r.x + r.w - 32 - asW, header.y + 4)
+  let online = a.plFile.len == 0 and a.plOnline
+  let asEnabled = not a.playlistLocked and not online and
+    (a.plFile.len == 0 or a.plFileWritable)
+  var asOn = a.playlistAutosaves
+  if ui.checkbox("pl-autosave", asPos, "Autosave", asOn, asEnabled):
+    a.setPlaylistAutosave(asOn)
+  let name = a.plFile.extractFilename
+  ui.tip(rect(asPos.x, asPos.y, asW, 22),
+    if a.playlistLocked: "Locked while synchronized"
+    elif online: "An online playlist: save it to a file to autosave it"
+    elif a.plFile.len == 0: "Save the playlist to a file, then save every change to it"
+    elif not a.plFileWritable: name & " is read-only"
+    else: "Save every change to " & name)
+  let titleW = asPos.x - 4 - (r.x + 32)
+  var title = &"Playlist ({a.playlist.len})"
+  if ui.textSize(title).x > titleW: title = &"({a.playlist.len})"  # narrow: the count alone
+  ui.textIn(ui.ellipsize(title, titleW), rect(r.x + 32, header.y, titleW, 30), colText)
   if ui.iconButton("pl-close", rect(r.x + r.w - 30, header.y + 3, 24, 24), "close16", a.closeTip(kaPlaylist)):
     a.setPlaylistShown(false)
   ui.rect(rect(r.x + 1, header.y + 29, r.w - 1, 1), colBorder)
   if a.playlistLocked:
     a.plListRect = Rect()
+    (a.tabStrip, a.tabRects, a.tabPlus) = (Rect(), newSeq[Rect](), Rect())
+    if a.plFindOpen: a.closePlaylistFind()
     ui.textIn("Locked while synchronized", rect(r.x, header.y + 30, r.w, r.h - 30),
       colTextDim, FontSmall, h = CenterAlign)
     return
 
+  var top = 30'f32
+  # The entries' column: the whole panel under the tabs, or right of the
+  # playlists' side column, whose right edge drags to resize it.
+  var (cx, cw) = (r.x + 1, r.w - 1)
+  var sideEdge = false
+  if a.cfg.playlistTabsSide:
+    let most = max(PlaylistSideMinW, cw - PlaylistSideRest)
+    var sw = clamp(round(a.cfg.playlistSideWidth).float32, PlaylistSideMinW, most)
+    let sideGrip = rect(cx + sw - 2, r.y + top, 5, r.h - top)
+    sideEdge = ui.hover(sideGrip) and not ui.hover(grip)
+    if sideEdge and ui.pressed():
+      ui.activeId = "plside"
+      a.sideResizeFrom = (ui.mouse.x, sw)
+      ui.consumeClick()
+    if ui.activeId == "plside":
+      let (x0, w0) = a.sideResizeFrom
+      a.cfg.playlistSideWidth = clamp(w0 + ui.mouse.x - x0, PlaylistSideMinW, most)
+      sw = round(a.cfg.playlistSideWidth).float32
+      if ui.released(): a.cfg.save()
+    a.playlistSide(cx, r.y + top, sw, r.h - top, sideEdge or ui.hover(grip))
+    ui.rect(rect(cx + sw, r.y + top, 1, r.h - top), colBorder)
+    cx += sw + 1
+    cw -= sw + 1
+  else:
+    top += a.playlistTabs(cx, r.y + top, cw)
+  # The search bar (Ctrl+F): typing selects the first match from where the
+  # search began, Enter and the arrows step through them; matches are tinted.
+  if a.plFindOpen:
+    let bar = rect(cx, r.y + top, cw, PlaylistFindH)
+    let bx = bar.x + bar.w - 30
+    if ui.iconButton("pl-find-close", rect(bx, bar.y + 3, 24, 24), "close16", "Close search (Esc)"):
+      a.closePlaylistFind()
+    let some = a.plFindHits.len > 0
+    if ui.iconButton("pl-find-next", rect(bx - 26, bar.y + 3, 24, 24), "chevdown16",
+        "Next match (Enter, F3)", enabled = some):
+      a.plFindGo(1)
+    if ui.iconButton("pl-find-prev", rect(bx - 52, bar.y + 3, 24, 24), "chevup16",
+        "Previous match (Shift+Enter, Shift+F3)", enabled = some):
+      a.plFindGo(-1)
+    # The count goes beside the field, which takes the rest of the bar.
+    let hitAt = a.plFindHits.find(a.plSelected)
+    let count =
+      if a.plFind.strip.len == 0: ""
+      elif not some: "No matches"
+      elif hitAt >= 0: &"{hitAt + 1} of {a.plFindHits.len}"
+      else: &"{a.plFindHits.len} found"
+    let countW = if count.len > 0: ui.textSize(count, FontSmall).x + 10 else: 0'f32
+    let fx = bar.x + 26
+    let field = rect(fx, bar.y + 3, max(40'f32, bx - 56 - countW - fx), 24)
+    ui.icon("search16", vec2(bar.x + 14, bar.y + bar.h / 2), colTextDim)
+    if a.plFindOpen:  # not closed by its button just now
+      let ev = ui.textField("pl-find", field, a.plFind, "Find in playlist")
+      if a.plFindKeep:  # Enter stepped: keep typing
+        a.plFindKeep = false
+        ui.focusId = "pl-find"
+      if eeChanged in ev: a.plFindGo(0)
+      ui.textIn(count, rect(field.x + field.w, bar.y, countW, bar.h),
+        if some: colTextDim else: colError, FontSmall, h = CenterAlign)
+    a.plFindHits = if a.plFindOpen: a.plFindMatches else: @[]
+    ui.rect(rect(bar.x, bar.y + bar.h - 1, bar.w, 1), colBorder)
+    top += PlaylistFindH
+
   # Column headers: a click sorts by the column, a drag moves it. A drag of its
   # right edge resizes it, a double-click there fits it to the rows in view.
-  let colHdr = rect(r.x + 1, r.y + 30, r.w - 1, PlaylistHeaderH)
-  let list = rect(r.x + 1, colHdr.y + colHdr.h, r.w - 1, r.h - 30 - colHdr.h)
+  let colHdr = rect(cx, r.y + top, cw, PlaylistHeaderH)
+  let list = rect(cx, colHdr.y + colHdr.h, cw, r.h - top - colHdr.h)
   let rowH = PlaylistRowH
   let maxScroll = max(0'f32, a.playlist.len.float32 * rowH - list.h)
   # Only a list that overflows gives up its right edge to the scroll bar.
@@ -8141,7 +11278,7 @@ proc playlistPanel(a: App, r: Rect) =
   if not ui.hover(grip):
     for i, (cr, f) in cells:
       if ui.hover(rect(cr.x + cr.w - PlaylistColumnGrip, cr.y, PlaylistColumnGrip * 2, cr.h)): edge = i
-  a.plOverEdge = edge >= 0
+  a.plOverEdge = edge >= 0 or sideEdge
   if edge >= 0 and a.window.buttonPressed[DoubleClick]:  # on the press or, on X11, its release
     ui.consumeClick()
     let top = int(a.plScroll / rowH)
@@ -8149,24 +11286,30 @@ proc playlistPanel(a: App, r: Rect) =
   elif edge >= 0 and ui.pressed():
     ui.consumeClick()
     if edge < cells.high:  # the last column's edge doesn't move: it only fits
-      # One text column stays filling the panel, so the edge follows the pointer.
+      # Only the dragged column changes width: the ones right of it move along.
+      # A text column right of the edge keeps filling the panel and gives way;
+      # without one, the last column takes up the slack and the rightmost
+      # columns narrow once pushed against the panel's edge.
       var filler = -1
-      for j in @[edge, edge + 1] & toSeq(0 .. cells.high):
+      for j in edge + 1 .. cells.high:
         if filler < 0 and a.columnFills(cells[j][1]): filler = j
+      var room = 0'f32
+      if filler >= 0: room = cells[filler][0].w - a.columnMin(cells, filler)
+      else:
+        for j in edge + 1 .. cells.high: room += max(0'f32, cells[j][0].w - a.columnMin(cells, j))
       ui.activeId = "plwidth"
-      a.plWidthFrom = (edge, ui.mouse.x, cells[edge][0].w, cells[edge + 1][0].w, filler, false)
+      a.plWidthFrom = (edge, ui.mouse.x, cells[edge][0].w, room, filler, false)
   if ui.activeId == "plwidth" and not a.plWidthFrom.moved and ui.mouse.x != a.plWidthFrom.x:
     # A click leaves the widths alone: they're set from the first movement on.
     a.plWidthFrom.moved = true
     for j, (cr, f) in cells:
-      if j != a.plWidthFrom.filler and a.columnFills(f): a.cfg.playlistColumnWidths[$f] = cr.w.float
+      if j != a.plWidthFrom.filler and a.columnFills(f): a.plColumnWidths[$f] = cr.w.float
   if ui.activeId == "plwidth" and a.plWidthFrom.moved:
     let d = a.plWidthFrom
     let least = -(d.left - a.columnMin(cells, d.index))
-    let dx = clamp(ui.mouse.x - d.x, least, max(least, d.right - a.columnMin(cells, d.index + 1)))
-    if d.index != d.filler: a.cfg.playlistColumnWidths[$cells[d.index][1]] = float(d.left + dx)
-    if d.index + 1 != d.filler: a.cfg.playlistColumnWidths[$cells[d.index + 1][1]] = float(d.right - dx)
-    if ui.released(): a.cfg.save()
+    let dx = clamp(ui.mouse.x - d.x, least, max(least, d.room))
+    a.plColumnWidths[$cells[d.index][1]] = float(d.left + dx)
+    if ui.released(): a.saveColumns()
   ui.rect(colHdr, colPanelRaised)
   ui.sk.pushClipRect(colHdr)
   for i, (cr, f) in cells:
@@ -8195,8 +11338,11 @@ proc playlistPanel(a: App, r: Rect) =
       let from0 = a.plColumnFrom.index
       if not a.plColumnFrom.moved: a.sortPlaylist(cells[from0][1])
       else:
-        a.cfg.playlistColumns.delete(from0)
-        a.cfg.playlistColumns.insert(cells[from0][1], if to > from0: to - 1 else: to)
+        var shown = a.plColumns
+        shown.delete(from0)
+        shown.insert(cells[from0][1], if to > from0: to - 1 else: to)
+        a.plColumns = shown
+        a.saveColumns()
   ui.sk.popClipRect()
   ui.rect(rect(colHdr.x, colHdr.y + colHdr.h - 1, colHdr.w, 1), colBorder)
 
@@ -8206,7 +11352,7 @@ proc playlistPanel(a: App, r: Rect) =
       if ui.hover(cr): a.ctxColumn = f
     a.ctxMenu = cmPlaylistColumns
     a.menus.openContext(ui.mouse)
-  elif ui.hover(r) and ui.released(MouseRight):
+  elif ui.hover(r) and not ui.hover(a.tabStrip) and ui.released(MouseRight):
     # Right-click selects the row under the pointer (none below the last one).
     # A row already in the selection keeps the selection for the menu.
     let i = int((ui.mouse.y - list.y + a.plScroll) / rowH)
@@ -8215,7 +11361,12 @@ proc playlistPanel(a: App, r: Rect) =
     a.ctxMenu = cmPlaylist
     a.menus.openContext(ui.mouse)
   if a.playlist.len == 0:
-    ui.textIn("Empty. Use File > Open File...", list, colTextDim, FontSmall, h = CenterAlign)
+    ui.textIn(ui.ellipsize(if a.tabs[a.tabView].scratch: "Empty. Use File > Open File..."
+              else: "Empty. Drop files or rows from another playlist here", list.w - 16, FontSmall),
+      list, colTextDim, FontSmall, h = CenterAlign)
+    if ui.activeId == "plrow" and a.plRowFrom.moved and a.shownId != a.rowDragTab:
+      ui.border(list, colAccent)
+      if ui.released() and ui.hover(list): a.dropRows(0)
     return
   if ui.activeId == "plscroll":  # the drag wins over playback moving on
     a.plReveal = false
@@ -8239,15 +11390,36 @@ proc playlistPanel(a: App, r: Rect) =
   let last = min(a.playlist.len, first + int(list.h / rowH) + 2) - 1
   for i in first .. last:
     let row = rect(rows.x, rows.y + i.float32 * rowH - a.plScroll, rows.w, rowH)
-    let hov = ui.hover(row) and ui.hover(list) and not ui.hover(grip)
+    let hov = ui.hover(row) and ui.hover(list) and not ui.hover(grip) and
+      not (ui.activeId == "plrow" and a.plRowFrom.moved)
     if a.plIsSelected(i): ui.rect(row, colPressed)
     elif hov: ui.rect(row, colHover)
+    elif a.plFindOpen and a.plFindHits.binarySearch(i) >= 0: ui.rect(row, colFindHit)
     let current = i == a.plIndex
+    var shift = 0'f32  # the first column's text moves past a long queue label
     if current: ui.icon("play16", vec2(row.x + 14, row.y + rowH / 2), colAccent)
+    else:
+      # Its places in the playback queue, one for each time it was queued.
+      let qs = a.queuePositions(i)
+      if qs.len == 1:
+        ui.textIn(if qs[0] < 100: $qs[0] else: "+", rect(row.x + 2, row.y, PlaylistIconW - 6, rowH),
+          colAccent, FontSmall, h = CenterAlign)
+      elif qs.len > 1:
+        let firstW = if cells.len > 0: cells[0][0].w else: row.w
+        let label = ui.ellipsize(qs.mapIt(if it < 100: $it else: "+").join(","),
+          max(PlaylistIconW - 6, firstW / 2), FontSmall)
+        let w = ui.textSize(label, FontSmall).x
+        if w <= PlaylistIconW - 6:
+          ui.textIn(label, rect(row.x + 2, row.y, PlaylistIconW - 6, rowH),
+            colAccent, FontSmall, h = CenterAlign)
+        else:
+          ui.textIn(label, rect(row.x + 4, row.y, w + 1, rowH), colAccent, FontSmall)
+          shift = w + 10 - PlaylistIconW
     let path = a.playlist[i]
     for j, (cr, f) in cells:
       a.playlistCell(a.cellText(path, f), rect(cr.x, row.y, cr.w, rowH), f, j == 0,
-        if current: colAccent elif f.cellFont == FontMain: colText else: colTextDim, f.cellFont)
+        if current: colAccent elif f.cellFont == FontMain: colText else: colTextDim, f.cellFont,
+        if j == 0: shift else: 0)
     if hov and ui.pressed():
       # Ctrl+click adds or drops a row, Shift+click selects up to it.
       let w = a.window
@@ -8261,10 +11433,57 @@ proc playlistPanel(a: App, r: Rect) =
         a.plMarks = sel
       elif w.shiftDown and anchor in 0 ..< a.playlist.len:
         a.plMarks = toSeq(min(anchor, i) .. max(anchor, i))
+      elif a.plMarks.len > 0 and a.plIsSelected(i):
+        a.plSelected = i  # kept for a drag; a click alone selects only it
       else: a.selectOnly(i)
       ui.consumeClick()
+      # Dragging a selected row moves the whole selection.
+      if a.plIsSelected(i):
+        ui.activeId = "plrow"
+        a.plRowFrom = (i, ui.mouse.y, false, a.plMarks.len > 0 and not (w.ctrl or w.shiftDown), now())
+        a.rowDragTab = a.shownId
+        a.rowDragPaths = a.plSelection.mapIt(a.playlist[it])
+        a.rowDragOver = (0, 0.0)
     if hov and a.window.buttonPressed[DoubleClick]:
       a.playIndex(i)
+  if ui.activeId == "plrow":
+    let n = a.playlist.len
+    if abs(ui.mouse.y - a.plRowFrom.y) >= PlaylistRowDrag: a.plRowFrom.moved = true
+    # The boundary the rows would drop on, as for files dropped on the list.
+    let gap = clamp(int((ui.mouse.y - list.y + a.plScroll) / rowH + 0.5), 0, n)
+    if a.plRowFrom.moved:
+      a.plArrows = false
+      # Near or past the list's top or bottom edge it scrolls, faster further out.
+      let t = now()
+      let dt = min(0.1, t - a.plRowFrom.at)
+      a.plRowFrom.at = t
+      let edge = rowH / 2
+      let over = if ui.hover(a.tabStrip): 0'f32  # over the tabs, for one of them
+                 elif ui.mouse.y < list.y + edge: ui.mouse.y - (list.y + edge)
+                 elif ui.mouse.y > list.y + list.h - edge: ui.mouse.y - (list.y + list.h - edge)
+                 else: 0'f32
+      if over != 0:
+        a.plScroll = clamp(a.plScroll + clamp(over, -rowH * 4, rowH * 4) * 12 * dt.float32, 0, maxScroll)
+        a.dirtyUntil = max(a.dirtyUntil, t + 0.1)
+      let y = clamp(rows.y + gap.float32 * rowH - a.plScroll - 1, rows.y, rows.y + rows.h - 2)
+      ui.rect(rect(rows.x, y, rows.w, 2), colAccent)
+    if ui.released():
+      if a.plRowFrom.moved and a.shownId != a.rowDragTab:
+        a.dropRows(gap)  # from another playlist, shown while they were dragged
+      elif a.plRowFrom.moved and a.window.ctrl:
+        # Ctrl: copies go there, the selection.
+        let sel = a.plSelection
+        let first = a.insertEntries(sel.mapIt(a.playlist[it]), gap, "Copy")
+        a.plSelected = first
+        a.plMarks = if sel.len > 1: toSeq(first ..< first + sel.len) else: @[]
+      elif a.plRowFrom.moved:
+        let sel = a.plSelection
+        var picked = newSeq[bool](n)
+        for i in sel: picked[i] = true
+        let order = toSeq(0 ..< gap).filterIt(not picked[it]) & sel &
+          toSeq(gap ..< n).filterIt(not picked[it])
+        if order != toSeq(0 ..< n): a.reorderPlaylist(order)
+      elif a.plRowFrom.reselect: a.selectOnly(a.plRowFrom.index)
   ui.sk.popClipRect()
   if ui.activeId == "plscroll":
     # Which rows the thumb has reached, beside it.
@@ -8457,14 +11676,29 @@ proc dropFiles(a: App, dropped: seq[string]) =
   ## (from a browser) and text holding them (a dragged selection) alike.
   let paths = dropped.mapIt(pathOrLink(it)).filterIt(it.len > 0)
   let list = a.plListRect
+  # On a tab: the end of that playlist, shown; on +, a new one.
+  if list.w > 0 and a.dropAt.inside(a.tabStrip):
+    for i, tr in a.tabRects:
+      if a.dropAt.inside(tr):
+        a.showTab(i)
+        a.addToPlaylist(paths)
+        return
+    if a.dropAt.inside(a.tabPlus) and not a.editLocked:
+      discard a.newPlaylist()
+      a.addToPlaylist(paths)
+    return
   if list.w > 0 and a.dropAt.inside(list):
     let at = int((a.dropAt.y - list.y + a.plScroll) / PlaylistRowH + 0.5)
     a.addToPlaylist(paths, at)
+  elif paths.len == 1 and paths[0].isImageFile and not paths[0].contains("://") and
+       fileExists(paths[0]) and a.dropAt.inside(a.videoRect) and a.quickCoverAllowed:
+    a.setQuickCover(paths[0].absolutePath)  # on a file showing no picture: its cover
   else:
     a.openPaths(paths)
 
 proc idleScreen(a: App, area: Rect) =
   if a.holding or a.thumbShown: return  # a frame is up (another quality opening)
+  if a.qcBridge and a.qcTex != 0: return  # the quick cover's snapshot is
   let ui = a.ui
   let c = area.xy + area.wh / 2
   if a.chartShown:
@@ -8472,9 +11706,11 @@ proc idleScreen(a: App, area: Rect) =
     a.chart.draw(ui, area, a.chart.clock(a.player.timePos, a.player.speed, a.player.playing,
                                            a.player.jumps, t))
     a.chartDrawn = t
-  elif a.player.loaded and not a.player.hasVideo and not a.player.stopped:
+  elif a.avsShown and a.avs != nil and a.avs.hasFrame:
+    discard  # the visualizer fills the frame (drawVideo)
+  elif a.soundOnly:
     ui.icon("music96", c - vec2(0, 30), colAccentDim)
-    let name = ui.ellipsize(a.player.path.extractFilename, area.w - 40)
+    let name = ui.ellipsize(a.player.path.fileTitle, area.w - 40)
     ui.textIn(name, rect(area.x, c.y + 30, area.w, 30), colTextDim, h = CenterAlign)
   elif (not a.player.loaded or a.player.stopped) and area.h > 140:
     ui.icon("crown96", c - vec2(0, 24), colAccentDim)
@@ -8600,6 +11836,11 @@ proc renderOptions(a: App, shot: string) =
     let f = findYtdlp(a.cfg.ytdlp)
     a.ask(dkOpenFile, "optytdlp", "yt-dlp", if f.len > 0: f.parentDir else: "",
       exts = (when defined(windows): @["exe"] else: @[]), filterName = "Programs")
+  of prBrowseSoundFont:
+    let f = a.cfg.soundFont.expandPath
+    a.ask(dkOpenFile, "optsoundfont", "SoundFont",
+      if f.len > 0 and fileExists(f): f.parentDir else: a.startDir,
+      exts = @["sf2", "sf3"], filterName = "SoundFonts")
   of prBrowseWeb:
     let d = a.cfg.webDir.expandPath
     a.ask(dkOpenDir, "optwebdir", "Media Cache Folder",
@@ -8930,6 +12171,96 @@ proc renderSyncProps(a: App, shot: string) =
   of saSeconds:
     a.cfg.syncOffsetSeconds = d.useSeconds
     a.cfg.save()
+
+proc renderTagProps(a: App, shot: string) =
+  ## Draws the playlist's Properties; OK and Apply write its edits.
+  if a.overlay != ovTags: return
+  let w = a.tagWin
+  let ui = a.tagUi
+  if w.closeRequested:
+    w.closeRequested = false
+    a.closeTagProps()
+    return
+  let size = w.size
+  if size.x <= 0 or size.y <= 0: return
+  if not a.beginDialogDraw(w, a.tagSk, size): return  # retried next frame
+  ui.beginFrame()
+  a.tagSk.beginUi(w, size)
+  glViewport(0, 0, size.x, size.y)
+  glClearColor(colPanel.r.float32 / 255, colPanel.g.float32 / 255,
+    colPanel.b.float32 / 255, 1)
+  glClear(GL_COLOR_BUFFER_BIT)
+  let d = a.tagDlg
+  let action = d.draw(ui, rect(vec2(0, 0), ui.size))
+  ui.drawTooltip()
+  a.tagSk.endUi()
+  ui.endFrame()
+  if shot.len > 0: dialogImage(size).writeFile(shot.changeFileExt("") & "-tags.png")
+  a.endDialogDraw(w, a.tagSk, size)
+  case action
+  of taNone: discard
+  of taCancel: a.closeTagProps()
+  of taApply: discard a.applyTags()
+  of taOk:
+    if a.applyTags(): a.closeTagProps()
+  of taPattern: a.rememberPattern(d.pattern)
+  of taPrefs:
+    (a.cfg.tagPatterns, a.cfg.tagColumnWidths) = (d.patterns, d.colWidths)
+    a.cfg.save()
+
+proc renderAvsList(a: App, shot: string) =
+  ## Draws Visualizers...; its changes apply as they're made.
+  let w = a.avsWin
+  if w == nil or not w.visible or a.avs == nil: return
+  let ui = a.avsUi
+  if w.closeRequested:
+    w.closeRequested = false
+    a.closeAvsList()
+    return
+  let size = w.size
+  if size.x <= 0 or size.y <= 0: return
+  if not a.beginDialogDraw(w, a.avsSk, size): return  # retried next frame
+  ui.beginFrame()
+  a.avsSk.beginUi(w, size)
+  glViewport(0, 0, size.x, size.y)
+  glClearColor(colPanel.r.float32 / 255, colPanel.g.float32 / 255,
+    colPanel.b.float32 / 255, 1)
+  glClear(GL_COLOR_BUFFER_BIT)
+  let d = a.avsDlg
+  a.avsMenus.captureInput(ui)
+  (d.beatThreshold, d.beatSensitivity) = (a.cfg.avsBeatThreshold, a.cfg.avsBeatSensitivity)  # Options may have changed them
+  let action = d.draw(ui, rect(vec2(0, 0), ui.size), a.avs)
+  ui.captured = false
+  a.avsMenus.updatePopups(ui, newMenuRoot(), a.buildAvsMenu())
+  if not a.avsMenus.isOpen: ui.drawTooltip()
+  a.avsSk.endUi()
+  ui.endFrame()
+  if shot.len > 0: dialogImage(size).writeFile(shot.changeFileExt("") & "-avs.png")
+  a.endDialogDraw(w, a.avsSk, size)
+  a.avsMenus.renderPopups(ui, if shot.len == 0: nil else:
+    proc (level: int, image: Image) =
+      image.writeFile(shot.changeFileExt("") & &"-avsmenu{level}.png"),
+    main = a.window)
+  case action
+  of aaNone: discard
+  of aaSelect: a.pickAvs(d.pick)
+  of aaToggle: a.toggleAvs(d.toggled)
+  of aaAdd: a.askAddAvs()
+  of aaAddDir: a.askAddAvsDir()
+  of aaRemove: a.removeAvs(d.sel)
+  of aaContext: a.avsMenus.openContext(d.ctxPos)
+  of aaPrefs:
+    a.cfg.avsColumnWidths = d.colWidths
+    (a.cfg.avsSort, a.cfg.avsSortDescending) = (d.sortKey, d.sortDesc)
+    a.cfg.avsAddSubfolders = d.subfolders
+    a.cfg.save()
+  of aaRate:
+    a.cfg.avsStarRatings = d.ratings
+    a.cfg.save()
+  of aaBeat:
+    (a.cfg.avsBeatThreshold, a.cfg.avsBeatSensitivity) = (d.beatThreshold, d.beatSensitivity)
+    a.cfg.save()
+  of aaClose: a.closeAvsList()
 
 proc renderYtdlp(a: App, shot: string) =
   ## Draws the yt-dlp window: an install or update to agree to, or one going on.
@@ -9289,6 +12620,7 @@ proc shortcutColumns(a: App): array[2, seq[ShortcutGroup]] =
       ("Open file", @[kaOpenFile], ""), ("Load subtitle file", @[kaLoadSubtitle], ""),
       ("Load audio file", @[kaLoadAudio], ""),
       ("Open from clipboard", @[kaOpenClipboard], ""),
+      ("Paste a picture as the quick cover (music, video track off)", @[kaOpenClipboard], ""),
       ("Copy to clipboard", @[kaCopyClipboard], ""),
       ("Copy YouTube link at current time", @[kaCopyTimeLink], ""), ("Close", @[kaClose], ""),
       ("Save", @[kaSave], ""), ("Save screenshot", @[kaScreenshot], ""), ("Properties", @[kaProperties], ""),
@@ -9296,7 +12628,7 @@ proc shortcutColumns(a: App): array[2, seq[ShortcutGroup]] =
     a.keyRows("Playback", [
       ("Play / Pause", @[kaPlayPause], ""), ("Stop", @[kaStop], ""),
       ("Frame forward / back", @[kaFrameForward, kaFrameBack], ""),
-      ("Faster / slower playback", @[kaFaster, kaSlower], "Shift+. / Shift+,"),
+      ("Fast-forward / slow down", @[kaFaster, kaSlower], "Shift+. / Shift+,"),
       ("Repeat forever", @[kaRepeatForever], ""),
       ("Repeat ping-pong", @[kaRepeatPingPong], ""),
       ("Volume up / down", @[kaVolumeUp, kaVolumeDown], ""), ("Mute", @[kaMute], ""),
@@ -9330,18 +12662,50 @@ proc shortcutColumns(a: App): array[2, seq[ShortcutGroup]] =
       ("Select all entries", "Ctrl+A"),
       ("Duplicate selected entries", "Ctrl+D"),
       ("Move selected entries up / down", "Ctrl+Shift+Up / Down"),
-      ("Move selected entries to top / bottom", "Ctrl+Shift+Home / End")])]
+      ("Move selected entries to top / bottom", "Ctrl+Shift+Home / End")]),
+    a.keyRows("Playlists", [
+      ("New playlist", @[kaNewPlaylist], ""), ("Close playlist", @[kaClosePlaylist], ""),
+      ("Restore closed playlist", @[kaRestorePlaylist], ""),
+      ("Rename playlist", @[kaRenamePlaylist], ""),
+      ("Next / previous playlist", @[kaNextPlaylist, kaPrevPlaylist], ""),
+      ("Show playing playlist", @[kaShowPlaying], ""),
+      ("Undo / redo playlist change", @[kaUndoPlaylist, kaRedoPlaylist], "Ctrl+Z / Ctrl+Y"),
+      ("Add / remove selection in playback queue", @[kaQueue, kaUnqueue], "")]),
+    ("Playlist search", @[
+      ("Next / previous match", "Enter / Shift+Enter"),
+      ("Next / previous match (also after clicking a row)", "F3 / Shift+F3"),
+      ("Previous / next match (typing in the search)", "Up / Down"),
+      ("Close the search", "Esc")]),
+    ("Visualizers window", @[
+      ("Highlight and play the next / previous preset", "Down / Up"),
+      ("Turn the highlighted presets on / off", "Space"),
+      ("Remove the highlighted presets from the list", "Delete"),
+      ("Highlight every preset", "Ctrl+A"),
+      ("Highlight several / a range", "Ctrl+Click / Shift+Click"),
+      ("Search by name, author, file name or rating", "Ctrl+F"),
+      ("Search: go to the presets found", "Enter / Down"),
+      ("Clear the search, then close the window", "Esc")])]
   var view = a.keyRows("View", [
     ("Compact mode", @[kaCompact], ""),
     ("Seek bar", @[kaSeekBar], ""), ("Controls", @[kaControls], ""),
     ("Status", @[kaStatus], ""), ("Playlist", @[kaPlaylist], ""),
+    ("Find in playlist", @[kaFindPlaylist], ""),
     ("Run log", @[kaRunLog], ""), ("Show OSD", @[kaShowOsd], ""),
     ("Full screen", @[kaFullScreen], "")])
   view.rows.add ("Leave full screen / close dialog", "Esc")
   view.rows.add a.keyRows("", [("Options", @[kaOptions], ""),
-    ("Keyboard shortcuts", @[kaShortcuts], "")]).rows
+    ("Keyboard shortcuts", @[kaShortcuts], ""),
+    ("Command palette", @[kaCommandPalette], "")]).rows
+  let palKey = a.cfg.keyText(kaCommandPalette)
+  let paletteKey = if palKey.len > 0: " / " & palKey else: ""
   result[1] = @[
     view,
+    ("Command palette", @[
+      ("Highlight the next / previous command", "Down / Up"),
+      ("Highlight a page further / back", "Page Down / Page Up"),
+      ("Run it (a check or radio item keeps the palette open)", "Enter / Click"),
+      ("Open a submenu / go back from it", "Enter / Backspace"),
+      ("Close the palette", "Esc" & paletteKey)]),
     a.keyRows("Pan, Rotate & Zoom", [
       ("Center", @[kaCenter], ""), ("Move up / down", @[kaMoveUp, kaMoveDown], "Numpad 8 / 2"),
       ("Move left / right", @[kaMoveLeft, kaMoveRight], "Numpad 4 / 6"),
@@ -9352,14 +12716,24 @@ proc shortcutColumns(a: App): array[2, seq[ShortcutGroup]] =
       ("Increase / decrease width", @[kaWidthUp, kaWidthDown], "Ctrl+Numpad 6 / 4"),
       ("Increase / decrease height", @[kaHeightUp, kaHeightDown], "Ctrl+Numpad 8 / 2"),
       ("Reset", @[kaPanReset], "")]),
+    ("Playlist Properties (tag grid)", @[
+      ("Replace the selected value", "Type"),
+      ("Edit the selected value", "Enter / F2 / Click it"),
+      ("Keep the value and go down / up", "Enter or Tab / Shift+Tab"),
+      ("Cancel editing / close the window", "Esc"),
+      ("Select the next / previous field", "Down / Up"),
+      ("First / last field", "Ctrl+Home / Ctrl+End"),
+      ("Clear the selected value", "Delete"),
+      ("Copy / paste the selected value", "Ctrl+C / Ctrl+V")]),
     ("Mouse", @[
       ("Play / Pause", "Click video"), ("Full screen", "Double-click video"),
-      ("Move window", "Drag video"), ("Context menu", "Right-click"),
+      ("Move window", "Drag video or empty controls bar"), ("Context menu", "Right-click"),
       ("Context menu with the menu bar's menus", "Shift+Right-click video"),
       ("Move playlist column", "Drag column header"),
       ("Resize playlist column", "Drag column edge"),
       ("Fit playlist column to the rows shown", "Double-click column edge"),
       ("Resize window (compact mode)", "Drag window edge"),
+      ("Quick cover (music, video track off)", "Drop picture on video"),
       ("Volume", "Wheel"), ("Zoom at cursor", "Ctrl+Wheel"),
       ("Restore zoom / panning", "Middle-click video"),
       ("Pan zoomed video", "Ctrl+Drag video"),
@@ -9379,6 +12753,15 @@ proc shortcutColumns(a: App): array[2, seq[ShortcutGroup]] =
       ("Select run log text / extend selection", "Drag / Shift+Click run log"),
       ("Add or remove a playlist entry from the selection", "Ctrl+Click playlist"),
       ("Select playlist entries up to the clicked one", "Shift+Click playlist"),
+      ("Move the selected playlist entries", "Drag playlist entry"),
+      ("Copy the selected playlist entries there", "Ctrl+Drag playlist entry"),
+      ("Copy entries to a playlist (Shift: move)", "Drag entry onto tab"),
+      ("Show a playlist while dragging entries", "Hold entry over tab"),
+      ("Copy entries to a new playlist", "Drag entry onto +"),
+      ("Rename / close playlist", "Double-click / Middle-click tab"),
+      ("Move playlist tab", "Drag tab"),
+      ("New playlist", "Double-click beside tabs"),
+      ("Next / previous playlist", "Wheel over tabs"),
       ("Select word / whole run log", "Double / Triple-click run log"),
       ("Draw on video / keep value (Run window)", "Click / Right-click rectangle icon"),
       ("Draw, resize or move the rectangle", "Drag video / its side / inside it")])]
@@ -9511,7 +12894,7 @@ proc frame(a: App) =
   let mouseIn = ui.fakeMouse.x >= 0 or w.mouseInside
   let bottomVisible = not fs or ui.mouse.y >= revealZone and mouseIn or
     a.seekDragging or ui.activeId == "volume" or a.tkOpen or
-    a.menus.contextOpen and a.ctxMenu == cmQuality  # over its gear button
+    a.menus.contextOpen and a.ctxMenu in {cmQuality, cmReplayGain}  # over their buttons
   let bottomRect = rect(0, H - bottomH, W, bottomH)
   let plRect =
     if fs: rect(W - plW, rlH, plW, (if bottomVisible: H - bottomH else: H) - rlH)
@@ -9646,12 +13029,16 @@ proc frame(a: App) =
     else: a.lookDrag(ui.mouse)
 
   # Chrome
+  # Chrome
   if w.buttonPressed[MouseLeft] or w.buttonPressed[MouseRight]:
     a.plFocused = a.cfg.showPlaylist and ui.mouse.inside(plRect)
     a.plArrows = a.plFocused
   if not (a.cfg.showPlaylist and ui.mouse.inside(plRect)): a.plArrows = false
   if a.cfg.showPlaylist: a.playlistPanel(plRect)
-  else: a.plListRect = Rect()
+  else:
+    a.plListRect = Rect()
+    (a.tabStrip, a.tabRects, a.tabPlus) = (Rect(), newSeq[Rect](), Rect())
+    if a.plFindOpen: a.closePlaylistFind()
   if a.cfg.showRunLog: a.runLogPanel(rlRect)
   a.tkButton = Rect()
   if bottomVisible and bottomH > 0:
@@ -9685,6 +13072,8 @@ proc frame(a: App) =
       if ui.pressed(): a.cmdWin.activate()
     of ovSync:
       if ui.pressed(): a.syncWin.activate()
+    of ovTags:
+      if ui.pressed(): a.tagWin.activate()
     of ovYtdlp:
       if ui.pressed(): a.ytWin.activate()
     of ovEmbed:
@@ -9694,6 +13083,7 @@ proc frame(a: App) =
     of ovProperties: a.propertiesOverlay()
     of ovShortcuts: a.shortcutsOverlay()
     of ovAbout: a.aboutOverlay()
+    of ovPalette: a.paletteOverlay()
     of ovNone: discard
     ui.sk.popLayer()
     if ui.pressed() and a.overlay != ovNone: ui.consumeClick()
@@ -9714,7 +13104,7 @@ proc frame(a: App) =
     ui.mouse.inside(videoArea) and not a.menus.isOpen and a.overlay == ovNone and
     not (a.cfg.showRunLog and ui.mouse.inside(rlRect)) and
     not (fs and bottomVisible) and now() - a.lastMouseMove > 1.0
-  let resize = ui.activeId in ["plresize", "plwidth"] or a.cfg.showPlaylist and
+  let resize = ui.activeId in ["plresize", "plwidth", "plside"] or a.cfg.showPlaylist and
     (ui.hover(rect(plRect.x, plRect.y, PlaylistGripW, plRect.h)) or a.plOverEdge) and
     a.overlay == ovNone and not a.menus.isOpen
   let resizeV = ui.activeId == "rlresize" or a.cfg.showRunLog and
@@ -9776,6 +13166,8 @@ proc frame(a: App) =
   a.renderCommands(shot)
   a.renderPick(shot)
   a.renderSyncProps(shot)
+  a.renderTagProps(shot)
+  a.renderAvsList(shot)
   a.renderYtdlp(shot)
   a.renderEmbed(shot)
   a.renderUpdate(shot)
@@ -9790,6 +13182,7 @@ proc keyUi(a: App): Ui =
   of ovRename: a.renUi
   of ovCommands: a.cmdUi
   of ovSync: a.syncUi
+  of ovTags: a.tagUi
   of ovYtdlp: a.ytUi
   of ovEmbed: a.embUi
   of ovUpdate: a.upUi
@@ -9803,8 +13196,24 @@ proc runScriptStep(a: App, st: ScriptStep) =
     var path: seq[int]
     for x in st.args[1 .. ^1]: path.add parseInt(x)
     a.menus.openBar(parseInt(st.args[0]), path)
-  of "ctxdump":  # the open context menu's top level
-    stderr.writeLine "ctxmenu ", $a.buildMenu().context.children.mapIt(if it.kind == mkSeparator: "-" else: it.label)
+  of "drop":  # x y paths: dropped there, as a drag and drop would
+    a.dropAt = vec2(parseFloat(st.args[0]), parseFloat(st.args[1]))
+    a.dropped.add st.args[2 .. ^1]
+  of "qcdump":  # the quick cover, and the picture shown
+    let p = a.player
+    stderr.writeLine "quickcover image=", a.qcImage, " track=", a.qcTrack.extractFilename,
+      " for=", a.qcFor.extractFilename, " shown=", a.quickCoverShown, " saved=", a.quickCoverSaved,
+      " prev=", a.qcPrevVid, " vid=", p.h.getStr("vid"), " allowed=", a.quickCoverAllowed,
+      " video=", p.videoW, "x", p.videoH, " anim=",
+      (if a.animOn: $a.anim.len & " frames " & $a.anim.w & "x" & $a.anim.h else: "-")
+  of "ctxdump":  # the open context menu's top level, or Sub>Sub's
+    var n = a.buildMenu().context
+    if arg.len > 0:
+      for label in arg.split('>'):
+        let i = n.children.mapIt(it.label).find(label)
+        if i >= 0: n = n.children[i]
+    stderr.writeLine "ctxmenu ", $n.children.mapIt(if it.kind == mkSeparator: "-" else:
+      (if it.checked and arg.len > 0: "*" else: "") & it.label)
   of "ctx":  # x y [seek]: the seek bar's menu, else the video's
     let pos = vec2(parseFloat(st.args[0]), parseFloat(st.args[1]))
     if st.args.len > 2: a.seekBarContext(pos)
@@ -9816,16 +13225,85 @@ proc runScriptStep(a: App, st: ScriptStep) =
     a.menus.openContext(vec2(parseFloat(st.args[0]), parseFloat(st.args[1])))
   of "sbctx": a.seekBarContext(vec2(parseFloat(st.args[0]), parseFloat(st.args[1])))
   of "plselect": a.selectOnly(parseInt(arg))
+  of "plselectall": a.selectAll()  # Ctrl+A in the playlist
   of "plaction":  # playlist context menu item by label
     a.ctxMenu = cmPlaylist
     for n in a.buildMenu().context.children:
       if n.label == arg and n.enabled and n.action != nil: n.action()
     a.ctxMenu = cmVideo
-  of "ctxaction":  # video frame context menu item by label (top level)
-    a.ctxMenu = cmVideo
+  of "colaction":  # playlist header menu item by label, as clicking it
+    a.ctxMenu = cmPlaylistColumns
     for n in a.buildMenu().context.children:
       if n.label == arg and n.enabled and n.action != nil: n.action()
+    a.ctxMenu = cmVideo
+  of "tabaction":  # the strip's tab menu item by label, as clicking it
+    a.ctxTab = -1
+    a.ctxMenu = cmPlaylistTab
+    for n in a.buildMenu().context.children:
+      if n.label == arg and n.enabled and n.action != nil: n.action()
+    a.ctxMenu = cmVideo
+  of "coldump":  # the shown playlist's columns and widths, its own or shared, and the shared ones
+    stderr.writeLine "columns ", (if a.ownColumns: "own " else: "shared "), $a.plColumns, " ",
+      $a.plColumnWidths, " shared=", $a.cfg.playlistColumns, " ", $a.cfg.playlistColumnWidths
+  of "ctxaction":  # video frame context menu item by label, Sub>Item for a submenu's
+    a.ctxMenu = cmVideo
+    var n = a.buildMenu().context
+    for label in arg.split('>'):
+      let i = n.children.mapIt(it.label).find(label)
+      if i < 0 or not n.children[i].enabled: n = nil; break
+      n = n.children[i]
+    if n != nil and n.action != nil: n.action()
+    else: stderr.writeLine "ctxaction: no enabled item ", arg
+  of "baraction":  # Top>Sub>Item: a menu bar item by its labels, as clicking it
+    var n = a.buildMenu().bar
+    for label in arg.split('>'):
+      let i = n.children.mapIt(it.label).find(label)
+      if i < 0 or not n.children[i].enabled: n = nil; break
+      n = n.children[i]
+    if n != nil and n.action != nil: n.action()
+    else: stderr.writeLine "baraction: no enabled item ", arg
+  of "viddump":  # the video track picked, and what mpv will pick for the next file
+    stderr.writeLine "vid ", a.player.selectedTrack("video"), " option=", a.player.h.getStr("options/vid"),
+      " standby=", (if a.standby != nil: a.standby.h.getStr("options/vid") else: "-"),
+      " always=", a.cfg.noVideo, " path=", a.player.path.extractFilename,
+      " anim=", (if a.animOn: $a.anim.len & " frames, at " & $a.animFrame else: "-")
+    for n in a.buildMenu().bar.children:
+      for m in n.children:
+        if m.label == "Video Track": stderr.writeLine "  menu ", $m.children.mapIt((it.label, it.checked))
   of "pldump": stderr.writeLine "playlist ", a.plIndex, " ", $a.playlist.mapIt(it.extractFilename)
+  of "tabdump":  # every playlist: shown *, playing >, its entries and the queue
+    for i, t in a.tabs:
+      let e = a.tabEntries(i)
+      let ix = if i == a.tabPlaying: a.playingIndex else: -1
+      stderr.writeLine "tab ", i, (if i == a.tabView: "*" else: " "), (if i == a.tabPlaying: ">" else: " "),
+        " ", t.name, (if t.scratch: " [scratch]" else: ""), " index=", ix, " sel=",
+        (if i == a.tabView: a.plSelected else: t.selected), " undo=", t.undo.len, " redo=", t.redo.len,
+        " file=", (if i == a.tabView: a.plFile else: t.file).extractFilename, " ", $e.mapIt(it.extractFilename)
+    stderr.writeLine "queue ", $a.queue.mapIt(it.path.extractFilename), " closed=", a.closedTabs.len
+  of "tabrects":  # the tabs, + and the rows as last drawn, window coordinates
+    stderr.writeLine "tabrects ", $a.tabRects.mapIt((it.x.int, it.y.int, it.w.int, it.h.int)),
+      " plus=", (a.tabPlus.x.int, a.tabPlus.y.int), " rows=", (a.plListRect.x.int, a.plListRect.y.int)
+  of "tabnew": discard a.newPlaylist(arg)  # name, "" for New Playlist
+  of "tabshow": a.showTab(parseInt(arg))
+  of "tabclose": a.closeTab(parseInt(arg))
+  of "tabrestore": a.restoreTab()
+  of "tabrename": a.renameTab(parseInt(st.args[0]), st.args[1 .. ^1].join(" "))
+  of "tabmove": a.moveTab(parseInt(st.args[0]), parseInt(st.args[1]))  # from, gap before
+  of "tabsend": a.sendSelected(parseInt(st.args[0]), st.args.len > 1 and st.args[1] == "move")  # -1: a new one
+  of "tabctx":  # x y index: a tab's menu, -1 for the strip's
+    a.ctxTab = parseInt(st.args[2])
+    a.ctxMenu = cmPlaylistTab
+    a.menus.openContext(vec2(parseFloat(st.args[0]), parseFloat(st.args[1])))
+  of "plmark": a.plMarks = st.args.mapIt(parseInt(it)); a.plSelected = a.plMarks[0]  # rows to select
+  of "pladd": a.addToPlaylist(st.args)  # files into the shown playlist
+  of "act": a.runAction(parseEnum[KeyAction](arg))  # a command by its id, as the config names it
+  of "next": a.navigate(1)
+  of "prev": a.navigate(-1)
+  of "eof": a.afterEof()  # as when the file ends
+  of "dlgresult": a.handleDialogResult(st.args[0], st.args[1 .. ^1])  # purpose path...: as a file dialog returns
+  of "plautosave": a.setPlaylistAutosave(arg == "on")  # the playlist's Autosave checkbox
+  of "plfiledump": stderr.writeLine "plfile ", a.plFile, " autosave=", a.playlistAutosaves,
+    " writable=", a.plFileWritable, " online=", a.plOnline
   of "close": a.menus.close()
   of "mouse":
     a.ui.fakeMouse = if arg == "off": vec2(-1, -1)
@@ -9934,6 +13412,67 @@ proc runScriptStep(a: App, st: ScriptStep) =
       if a.peers != nil and a.peers.peers.len > 0: a.syncRequest("add", a.peers.peers[0].pid)
     else: a.syncRequest(st.args[0], if st.args.len > 1: parseInt(st.args[1]) else: 0)
   of "syncprops": a.showSyncProps()  # Synchronize > Properties
+  of "tags": a.showTagProps()  # the playlist's Properties, for the selection
+  of "avslist": a.showAvsList()  # Visualizer Preset > Visualizers...
+  of "avsclose": a.closeAvsList()  # as its Close button does
+  of "avshi": (let id = a.avs.presets[parseInt(arg)]; a.avsDlg.sel = @[id]; a.pickAvs(id))  # highlight row i
+  of "avstoggle": a.toggleAvs(@[a.avs.presets[parseInt(arg)]])  # row i's checkbox
+  of "avsadd": a.addAvs(st.args)  # paths: as Add... gives them
+  of "avsremove": a.removeAvs(@[a.avs.presets[parseInt(arg)]])
+  of "avssort":  # COLUMN [desc]: as a header click sorts
+    a.sortAvs(st.args[0], st.args.len > 1 and st.args[1] == "desc")
+  of "avsctx":  # rows|header|empty X Y: the context menu, for the highlighted rows
+    a.avsDlg.ctx = case st.args[0]
+      of "header": acHeader
+      of "empty": acEmpty
+      else: acRows
+    a.avsMenus.openContext(vec2(parseFloat(st.args[1]), parseFloat(st.args[2])))
+    stderr.writeLine "avsctx ", $a.buildAvsMenu().children.mapIt(if it.kind == mkSeparator: "-" else: it.label)
+  of "avsrate":  # row i, quarters of a star (0 none): as its Rating cell sets it
+    let id = a.avs.presets[parseInt(st.args[0])]
+    let n = clamp(parseInt(st.args[1]), 0, 20)
+    if n > 0: a.cfg.avsStarRatings[id] = n else: a.cfg.avsStarRatings.del id
+    if a.avsDlg != nil: a.avsDlg.ratings = a.cfg.avsStarRatings
+    a.cfg.save()
+  of "avsfps":  # row i, steps a second (60: the default): as Frame Rate sets it
+    a.rateAvsFps(@[a.avs.presets[parseInt(st.args[0])]], parseInt(st.args[1]))
+  of "avsstep": a.avsStep(parseInt(arg))  # 1 next, -1 previous, 0 random
+  of "avsfind": (if a.avsDlg != nil: a.avsDlg.search = st.args.join(" "))  # TEXT: as typed in the search
+  of "avsdump":
+    let v = a.avs
+    stderr.writeLine "avs current=", (if v.current >= 0: presetName(v.presets[v.current]) else: "-"),
+      " count=", v.presets.len, " on=", toSeq(0 ..< v.presets.len).countIt(v.enabled(it)),
+      " disabled=", $a.cfg.avsDisabled.mapIt(presetName(it)), " added=", $a.cfg.avsAdded.len,
+      " hidden=", $a.cfg.avsHidden.len, " widths=", $a.cfg.avsColumnWidths,
+      " ratings=", $toSeq(a.cfg.avsStarRatings.pairs).mapIt((presetName(it[0]), it[1])),
+      " fps=", $toSeq(a.cfg.avsFrameRates.pairs).mapIt((presetName(it[0]), it[1])),
+      " aslisted=", $(a.avsDlg != nil and a.avsDlg.rows == v.presets),
+      " sort=", a.cfg.avsSort, (if a.cfg.avsSortDescending: " desc" else: ""),
+      " beat=", a.cfg.avsBeatThreshold, " sensitivity=", a.cfg.avsBeatSensitivity,
+      " open=", $(a.avsWin != nil and a.avsWin.visible),
+      " search=", (if a.avsDlg != nil: "\"" & a.avsDlg.search & "\"" else: "-"),
+      " rows=", (if a.avsDlg != nil: $a.avsDlg.rows.mapIt(presetName(it)) else: "-")
+  of "tagtab": a.tagDlg.tab = parseEnum[TagTab](arg)  # Metadata | Autofill | Details
+  of "tagset": a.tagDlg.setField(st.args[0], st.args[1 .. ^1].join(" "))  # FIELD value: as typed in its cell
+  of "tagpattern": a.tagDlg.pattern = st.args.join(" ")  # Autofill's pattern, as typed
+  of "tagfill": discard a.tagDlg.fill(); a.rememberPattern(a.tagDlg.pattern)  # its Fill button
+  of "tagnumber": discard a.tagDlg.number()  # Autofill track numbers' Number button
+  of "tagapply": discard a.applyTags()
+  of "tagok": (if a.applyTags(): a.closeTagProps())
+  of "tagdetail": a.tagDlg.detailFile = parseInt(arg)  # the Details tab's file, 0-based
+  of "tagdump":
+    let d = a.tagDlg
+    for e in d.files:
+      stderr.writeLine "tag ", e.path.extractFilename, " editable=", e.editable,
+        " changed=", e.changed, " ", $e.tags
+    stderr.writeLine "tagstatus ", d.status, " patterns=", $a.cfg.tagPatterns
+    let p = a.player
+    for f in d.files:
+      stderr.writeLine "tagrow ", a.rowName(f.path), " | ", a.mediaInfo.getOrDefault(f.path).artist,
+        " | ", a.mediaInfo.getOrDefault(f.path).track
+    stderr.writeLine "tagtitle ", a.title, " widths=", $d.colWidths
+    stderr.writeLine "tagplayer ", p.path.extractFilename, " loaded=", p.loaded, " paused=", p.paused,
+      " time=", p.timePos.formatFloat(ffDecimal, 2), " title=", p.h.getStr("media-title")
   of "syncmaster":  # pid master: the Properties window's Master (pid 0: this player; p: the first peer)
     let v = st.args.mapIt(if it == "p": a.peers.peers[0].pid else: parseInt(it))
     a.setMasterOf(if v[0] == 0: a.peers.pid else: v[0], v[1])
@@ -9976,6 +13515,51 @@ proc runScriptStep(a: App, st: ScriptStep) =
     stderr.writeLine "embed mode=", a.embMode, " overlay=", a.overlay, " msg=", a.embMsg,
       " status=", a.mkvStatus, " exe=", findMkvpropedit(a.cfg.mkvpropedit), " marks=", a.fileBookmarks.len,
       " chapters=", a.player.chapters.len, " running=", a.embProc != nil
+  of "rg":  # the ReplayGain button's menu, as clicking it opens it
+    a.ctxMenu = cmReplayGain
+    a.menus.openContext(a.rgRect.xy, sticky = true, keep = a.rgRect, above = true)
+  of "rgaction":  # Label/Sub label...: runs a ReplayGain menu item (the button's, or with
+                  # "playlist/" first, the playlist's submenu)
+    var path = arg.split('/')
+    var node: MenuNode
+    if path[0] == "playlist":
+      a.ctxMenu = cmPlaylist
+      node = a.buildMenu().context
+      path[0] = "ReplayGain"
+    else:
+      a.ctxMenu = cmReplayGain
+      node = a.buildMenu().context
+    for name in path:
+      var found: MenuNode
+      for ch in node.children:
+        if ch.label == name: found = ch
+      if found == nil:
+        stderr.writeLine "rgaction: not found: ", name, " in ", $node.children.mapIt(it.label & "|" & it.shortcut)
+        node = nil
+        break
+      node = found
+    if node != nil and node.action != nil and node.enabled: node.action()
+    a.ctxMenu = cmVideo
+  of "rgmenu":  # the ReplayGain menu's items (playlist: the playlist's submenu)
+    a.ctxMenu = if arg == "playlist": cmPlaylist else: cmReplayGain
+    var m = a.buildMenu().context
+    if arg == "playlist":
+      for ch in m.children.filterIt(it.label == "ReplayGain"): m = ch
+    for ch in m.children:
+      if ch.kind == mkSeparator: stderr.writeLine "rgmenu -"
+      else: stderr.writeLine "rgmenu ", ch.kind, " ", ch.label, " | ", ch.shortcut,
+        " checked=", ch.checked, " enabled=", ch.enabled, " contextual=", ch.contextual,
+        (if ch.kind == mkSub: " [" & ch.children.mapIt((if it.checked: "*" else: "") & it.label).join(", ") & "]" else: "")
+    a.ctxMenu = cmVideo
+  of "rgdump":
+    let c = a.cfg
+    stderr.writeLine "rg cfg=", c.replayGain, " preamp=", c.replayGainPreamp, " fallback=",
+      c.replayGainFallback, " noclip=", c.replayGainNoClip, " file=", a.currentRg,
+      " button=", a.rgButton, " rect=", a.rgRect
+    for (name, p) in [("player", a.player), ("standby", a.standby), ("lsound", a.lsound)]:
+      if p != nil:
+        stderr.writeLine "rg ", name, " ", ["replaygain", "replaygain-preamp", "replaygain-clip",
+          "replaygain-fallback"].mapIt(it & "=" & p.h.getStr(it)).join(" ")
   of "quality":  # the quality button's menu, as clicking it opens it
     a.ctxMenu = cmQuality
     a.menus.openContext(a.qualityRect.xy, sticky = true, keep = a.qualityRect, above = true)
@@ -10037,7 +13621,8 @@ proc runScriptStep(a: App, st: ScriptStep) =
 proc main() =
   discard setlocale(LC_NUMERIC, "C")
   when defined(windows): attachStdio()
-  let a = App(plIndex: -1, plSelected: -1, optionsDlg: newOptionsDialog(),
+  let a = App(plIndex: -1, plSelected: -1, tabs: @[newTab(DefaultName, scratch = true)],
+    optionsDlg: newOptionsDialog(),
     cmdDlg: newCmdDialog(), pickDlg: newPickDialog(), tkCorrection: true)
   a.cfg = loadConfig()
   discard a.cfg.reloadRecent()
@@ -10057,6 +13642,7 @@ proc main() =
   if files.len > 0 and a.cfg.openMode == omSamePlayer and not scripted and
      forwardToRunning(files):
     return
+  a.scripted = scripted
   if not scripted: a.instance = startServer()
   # Debug scripts only see other players in a folder of their own.
   if not scripted or existsEnv("MMP_SYNC_DIR"): a.peers = startPeerNet()
@@ -10131,6 +13717,7 @@ proc main() =
   a.ui = newUi(a.sk, a.window)
   a.window.setAspectHints(0, ivec2(0, 0), a.minWindow)
   a.menus = newMenuSystem()
+  a.avsMenus = newMenuSystem()
   a.quad = newQuadRenderer()
 
   a.player = newPlayer(a.cfg.volume, a.cfg.muted, a.cfg.showOsd)
@@ -10140,19 +13727,26 @@ proc main() =
   a.linkInfos = loadLinkInfos()
   a.pruneSaved()
   a.applyLoop()
-  a.syncSettings()
   try:
     a.standby = newPlayer(a.cfg.volume, true, a.cfg.showOsd)
     a.standby.hidden = true
   except MpvError as e:
     stderr.writeLine "seamless loops disabled: ", e.msg
     a.standby = nil
+  # Saved quick covers, added as files open (the standby's, once it plays).
+  a.sweepQuickCovers()
+  let quickFor = proc (path: string): string = a.quickCoverHook(path)
+  a.player.quickCoverFor = quickFor
+  if a.standby != nil: a.standby.quickCoverFor = quickFor
+  a.applyNoVideo()
   a.hookYtdlp()
   try:
     a.lsound = newLoopSound(a.cfg.volume)
   except MpvError as e:
     stderr.writeLine "seamless loop sound disabled: ", e.msg
     a.lsound = nil
+  # After the standby and the loop sound exist: their ReplayGain must match.
+  a.syncSettings()
   try:
     a.preview = newPreview()
   except MpvError as e:
@@ -10200,19 +13794,10 @@ proc main() =
   a.rdForNow = startedLow
   a.rdStart = now()
   a.rdNote = rendererNote()
+  # The playlists, without playing: Play starts the entry that was current.
+  a.loadTabs()
   if resumed: a.resumeState(rs)
   elif files.len > 0: a.openPaths(files)
-  elif c.rememberPlaylist:
-    # Restored without playing; Play starts the entry that was current.
-    a.playlist = c.playlist.filterIt(fileExists(it) or it.contains("://"))
-    a.linkTitles = c.playlistTitles
-    a.ytListed = c.playlistListed.toHashSet
-    if a.playlist.len > 0:
-      let cur = c.playlistIndex
-      a.plSelected =
-        if cur >= 0 and cur < c.playlist.len and c.playlist[cur] in a.playlist:
-          a.playlist.find(c.playlist[cur])
-        else: 0
 
   var lastFrame = 0.0
   proc enableRunes() =
@@ -10225,6 +13810,8 @@ proc main() =
     if a.cmdWin != nil: a.cmdWin.runeInputEnabled = true
     if a.pickWin != nil: a.pickWin.runeInputEnabled = true
     if a.syncWin != nil: a.syncWin.runeInputEnabled = true
+    if a.tagWin != nil: a.tagWin.runeInputEnabled = true
+    if a.avsWin != nil: a.avsWin.runeInputEnabled = true
     if a.ytWin != nil: a.ytWin.runeInputEnabled = true
     if a.embWin != nil: a.embWin.runeInputEnabled = true
     if a.upWin != nil: a.upWin.runeInputEnabled = true
@@ -10236,6 +13823,12 @@ proc main() =
     if a.dropped.len > 0:
       a.dropFiles(a.dropped)
       a.dropped.setLen 0
+    # Unshielded but deaf (another player listened when we tried): take
+    # over once it's gone.
+    if a.instance == nil and not a.shielded and not a.scripted and
+       now() - a.instanceRetry > 2:
+      a.instanceRetry = now()
+      a.instance = startServer()
     let incoming = a.instance.poll()
     if incoming.len > 0 and a.playlistLocked:
       # The master's playlist rules; the files go there.
@@ -10249,11 +13842,13 @@ proc main() =
       a.window.activate()
       a.dirtyUntil = now() + 0.5
     if a.menus.pollInput(): a.dirtyUntil = now() + 1.2
+    if a.avsMenus.pollInput(): a.dirtyUntil = now() + 1.2
     if takeFrameReady(): a.frameFlag = true
     if takePreviewReady(): a.previewFlag = true
     if takeOsdReady(): a.osdFlag = true
     let peerNews = a.pollPeers()
     let changed = a.player.pollEvents() or peerNews
+    a.adoptGapless()
     a.seamlessLoop()
     a.loopSound()
     a.placeLoopEnd()
@@ -10271,6 +13866,8 @@ proc main() =
     a.pollYtdlp()
     a.pollWebSave()
     a.pollSave()
+    a.pollReplayGain()
+    a.autosavePlaylist()
     a.pollEmbed()
     a.pollUpdate()
     a.pollThumbnail()
@@ -10280,14 +13877,16 @@ proc main() =
     if a.script.next < a.script.steps.len: a.dirtyUntil = now() + 0.5
 
     if a.player.justLoaded and a.reopening:
-      # The same file again (pingPong): its added tracks and choices back.
+      # The same file again (pingPong, or its tags saved): its added tracks
+      # and choices back, and its title as it may be now.
       a.player.justLoaded = false
       a.reopening = false
+      a.updateTitle()
       let have = a.player.externalFiles
       for t in a.reopenTracks:
         if t.file notin have: a.player.h.command(t.kind & "-add", t.file, "auto")
       for (prop, id) in a.reopenSel:
-        a.player.h.setProp(prop, if id == 0: "no" else: $id)
+        a.player.h.setProp(trackProp(prop), if id == 0: "no" else: $id)
     if a.player.justLoaded and a.resuming:
       # Restarted into an update: the file as it was left.
       a.resuming = false
@@ -10296,7 +13895,7 @@ proc main() =
       for t in r.tracks:
         if t.file notin have: a.player.h.command(t.kind & "-add", t.file, "auto")
       for (prop, id) in [("aid", r.aid), ("sid", r.sid), ("vid", r.vid)]:
-        a.player.h.setProp(prop, if id == 0: "no" else: $id)
+        a.player.h.setProp(trackProp(prop), if id == 0: "no" else: $id)
       if r.speed != 1: a.player.h.setProp("speed", r.speed)
       if r.stopped: a.player.stop()
       (a.loopA, a.hasLoopA, a.loopB, a.hasLoopB) = (r.loopA, r.hasLoopA, r.loopB, r.hasLoopB)
@@ -10329,6 +13928,7 @@ proc main() =
     if a.fitPending and a.player.hasVideo:
       a.fitPending = false
       a.fitWindowToVideo()
+    a.queueGapless()
     a.handleEof()
     a.settleEnd()
     # Re-checked every iteration while unfocused, so menus opened or kept
@@ -10343,6 +13943,14 @@ proc main() =
        not (pointerButtonsDown() and a.menus.pointerOverPopup(a.ui)):
       a.menus.close()
       a.dirtyUntil = now() + 0.5
+    # Visualizers' menus: the same, for its window.
+    if not a.avsMenus.isOpen: a.avsMenuOpenedAt = 0
+    elif a.avsMenuOpenedAt == 0: a.avsMenuOpenedAt = now()
+    if a.avsMenus.isOpen and a.avsWin != nil and not a.avsWin.focused and
+       now() - a.avsMenuOpenedAt > 0.15 and
+       not (pointerButtonsDown() and a.avsMenus.pointerOverPopup(a.avsUi)):
+      a.avsMenus.close()
+      a.dirtyUntil = now() + 0.5
     a.applyOnTop()
     a.applyKeepAwake()
     a.syncMediaControls()
@@ -10352,6 +13960,9 @@ proc main() =
     let t = now()
     a.pollVideoFrame()
     a.pollTracker()
+    a.pollAvs()
+    a.pollQuickCover()
+    a.pollAnimCover()
     a.updateOsdApart()
     let wantDraw = a.renderNow or a.lfDue or a.previewFlag or a.osdFlag or changed or t < a.dirtyUntil or
       t - lastFrame > 0.25 or a.dialog != nil and t - lastFrame > 0.1
@@ -10378,7 +13989,7 @@ proc main() =
       discard step()
       # Handled: the main loop mustn't handle it again once pollEvents returns.
       for w in [a.window, a.optWin, a.renWin, a.cmdWin, a.pickWin, a.syncWin, a.ytWin, a.embWin,
-                a.upWin, a.eqWin]:
+                a.upWin, a.eqWin, a.tagWin, a.avsWin]:
         if w != nil: w.clearFrameInput()
       enableRunes()
       stepping = false)
@@ -10405,12 +14016,14 @@ proc main() =
   a.saved.save()
   a.saveLinkInfos()
   a.savePosition()
+  a.autosavePlaylist(force = true)
   a.rememberState()
   a.cfg.save()
   if a.upRestart or a.rdRestart.len > 0: a.saveResume()
   a.instance.close()
   a.peers.close()
   for c in a.children: c.close()
+  if a.avs != nil: a.avs.close()
   if a.preview != nil:
     if a.preview.render != nil: mpv_render_context_free(a.preview.render)
     mpv_terminate_destroy(a.preview.h)

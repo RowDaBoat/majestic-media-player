@@ -223,6 +223,9 @@ proc reposition(s: ptr ModStream, at: int64) =
   let t = frame.float / Rate
   let f = pitchFactor()
   s.shift = split(f)
+  if s.shift > 0 and s.raw == nil:
+    s.raw = cast[ptr UncheckedArray[float32]](streamAlloc0(RawCap * FrameBytes))
+    if s.raw == nil: s.shift = 0     # out of memory: pitch capped at MaxPitch
   s.setPitch(f)
   # At tempo 1, the seconds libopenmpt seeks to are the song's.
   discard api.ctlSetFloat(s.m, "play.tempo_factor", 1.0)
@@ -239,8 +242,6 @@ proc reposition(s: ptr ModStream, at: int64) =
   if s.shift > 0:
     # decimate renders on from the landing, a whole frame of the stream's.
     discard api.ctlSetFloat(s.m, "play.tempo_factor", 1 / float(1 shl s.shift))
-    if s.raw == nil:
-      s.raw = cast[ptr UncheckedArray[float32]](allocShared(RawCap * FrameBytes))
     s.rawBase = int64(round(landed * Rate)) shl s.shift
     s.rawLen = 0
     return
@@ -289,8 +290,8 @@ proc sizeCb(cookie: pointer): int64 {.cdecl.} =
 proc closeCb(cookie: pointer) {.cdecl.} =
   let s = cast[ptr ModStream](cookie)
   api.destroy(s.m)
-  if s.raw != nil: deallocShared(s.raw)
-  freeShared(s)
+  streamFree(s.raw)
+  streamFree(s)
 
 proc openCb(userData: pointer, uri: cstring, info: ptr MpvStreamCbInfo): cint {.cdecl.} =
   # The id after "mmpmod://", parsed without allocating.
@@ -310,7 +311,10 @@ proc openCb(userData: pointer, uri: cstring, info: ptr MpvStreamCbInfo): cint {.
                      api.ignoreErrors, nil, err.addr, msg.addr, nil)
       if msg != nil: api.freeString(msg)
   if m == nil: return MpvErrorLoadingFailed
-  let s = createShared(ModStream)
+  let s = streamCreate(ModStream)
+  if s == nil:
+    api.destroy(m)
+    return MpvErrorLoadingFailed
   s.m = m
   # WAV sizes are 32-bit: past ~3 hours the stream ends.
   let dataBytes = min(int64(api.duration(m) * Rate) * FrameBytes,

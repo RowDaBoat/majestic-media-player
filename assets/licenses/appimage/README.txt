@@ -49,3 +49,8 @@ Fonts inside majestic-media-player
 ----------------------------------
 IBM Plex Sans and IBM Plex Mono, SIL Open Font License 1.1 (IBM-Plex-OFL.txt).
 Source: https://github.com/IBM/plex
+
+The visualizer (Advanced Visualization Studio) and its built-in presets
+-----------------------------------------------------------------------
+AVS 2.81d by Nullsoft, ported, and the Winamp presets that came with it:
+BSD-style license (AVS-Nullsoft-BSD.txt). Source: https://github.com/visbot/vis_avs

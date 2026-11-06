@@ -24,6 +24,9 @@ type
     lock*: proc ()            ## set: a lock there instead, toggled by it
     locked*: bool             ## that lock is closed
     columns*: bool            ## its children (mkColumn) sit side by side
+    contextual*: bool         ## about what's open: drawn on a purple ground
+    listed*: bool             ## one of a list (files, tracks...): the command
+                              ## palette shows it only inside its own submenu
     width: float32            ## mkColumn: as laid out (popupSize)
 
   MenuMode = enum
@@ -85,6 +88,18 @@ proc column*(parent: MenuNode, label: string): MenuNode =
 
 proc sep*(parent: MenuNode) =
   parent.children.add MenuNode(kind: mkSeparator)
+
+proc markContextual*(parent: MenuNode) =
+  ## Makes the items added so far contextual, with the separators between
+  ## them (not a trailing one), so they read as one purple block.
+  var last = parent.children.high
+  while last >= 0 and parent.children[last].kind == mkSeparator: dec last
+  for i in 0 .. last: parent.children[i].contextual = true
+
+proc markListed*(parent: MenuNode, first = 0) =
+  ## Marks the items from index first on as a list (MenuNode.listed).
+  for i in first ..< parent.children.len:
+    if parent.children[i].kind != mkSeparator: parent.children[i].listed = true
 
 # --- state ---------------------------------------------------------------------
 
@@ -162,7 +177,10 @@ proc captureInput*(m: MenuSystem, ui: Ui) =
   if m.mode == mmContext and m.sticky and m.levels.len > 0:
     const Near = 24'f32  # how far the pointer may stray
     proc grown(r: Rect): Rect = rect(r.x - Near, r.y - Near, r.w + 2 * Near, r.h + 2 * Near)
-    if not m.mouse.inside(m.levels[0].rect.grown) and not m.mouse.inside(m.keep.grown):
+    var near = m.mouse.inside(m.keep.grown)
+    for lv in m.levels:  # its submenus too
+      if m.mouse.inside(lv.rect.grown): near = true
+    if not near:
       m.close()
       return
   if m.overMenu(m.mouse) or m.input.anyPressed:
@@ -302,6 +320,7 @@ proc drawPopup(m: MenuSystem, ui: Ui, lv: PopupLevel, depth: int) =
   ui.border(r, colBorder)
   for (i, c, row) in rows(lv.node, r):
     if c.kind == mkSeparator:
+      if c.contextual: ui.rect(row, colContextual)
       ui.rect(rect(row.x + 4, row.y + row.h / 2, row.w - 8, 1), colBorder)
       continue
     if c.kind == mkColumn:
@@ -312,7 +331,9 @@ proc drawPopup(m: MenuSystem, ui: Ui, lv: PopupLevel, depth: int) =
     let hov = c.enabled and top and mouse.inside(row)
     let isOpenSub = c.kind == mkSub and m.path.len > depth and m.path[depth] == i
     if hov or isOpenSub:
-      ui.rect(row, colHover)
+      ui.rect(row, if c.contextual: colContextualHover else: colHover)
+    elif c.contextual:
+      ui.rect(row, colContextual)
     let fg = if c.enabled: colText else: colTextDisabled
     if c.checked:
       let ic = if c.kind == mkRadio: "radio16" else: "check16"
@@ -390,12 +411,14 @@ proc updatePopups*(m: MenuSystem, ui: Ui, root, contextRoot: MenuNode) =
     a()
 
 proc renderPopups*(m: MenuSystem, ui: Ui,
-                   onDrawn: proc (level: int, image: Image) = nil) =
+                   onDrawn: proc (level: int, image: Image) = nil, main: Window = nil) =
   ## Shows one window per open level and draws it. Call outside the main
   ## window's beginUi/endUi, right after its swap; onDrawn gets each popup's
-  ## image (for screenshots).
+  ## image (for screenshots). `main`: the window whose GL context draws them,
+  ## when the menus belong to another (a dialog's); else ui's.
   ## While open, menus grab the pointer: presses anywhere then reach the main
   ## window, where captureInput closes the menus if they fall outside them.
+  let main = if main != nil: main else: ui.window
   if m.levels.len > 0 and not m.grabbed:
     m.grabbed = ui.window.grabPointer()
   for i, lv in m.levels:
@@ -411,11 +434,11 @@ proc renderPopups*(m: MenuSystem, ui: Ui,
       m.drawPopup(ui, lv, i)
       ui.sk.endUi()
       if onDrawn != nil: onDrawn(i, readFramebuffer(w.size))
-      w.endDraw(ui.window)
+      w.endDraw(main)
     else:
       # Drawn in the main window's buffer and put into the popup by X: no GL
       # buffers of its own (see xwin_x11's putPixelsOn).
-      ui.sk.beginOffscreen(ui.window.size, w.size, colPopup)
+      ui.sk.beginOffscreen(main.size, w.size, colPopup)
       ui.sk.beginUi(ui.window, w.size)
       m.drawPopup(ui, lv, i)
       ui.sk.endUi()

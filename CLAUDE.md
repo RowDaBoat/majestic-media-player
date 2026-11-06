@@ -76,7 +76,7 @@
         * Increase Rate (default x0.25) (Shift+.)
         * Decrease Rate (default -x0.25) (Shift+,)
         * Repeat
-            * Forever (toggle)
+            * Enabled (toggle)
             * (separator)
             * File (option)
             * Playlist (option, default)

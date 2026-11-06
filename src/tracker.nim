@@ -6,14 +6,18 @@
 ## without it (Windows' libmpv links it in statically) there's no chart.
 ##
 ## libopenmpt has no "which row plays at time t": the module is rendered once,
-## silently and at a low rate, a slice per frame (`build`), noting when each
-## row starts (`marks`) and every channel's VU level every `VuStep` seconds.
+## silently, a slice per frame (`build`), noting when each row starts (`marks`)
+## and every channel's VU level every `VuStep` seconds. It renders at the rate
+## the song plays at (48 kHz, FFmpeg's and modstream's): libopenmpt rounds
+## every tick to whole frames of the rate, so at another rate the rows' times
+## drift from the sound's, over a second by the end of some songs. Nearest
+## sample interpolation makes it cheaper, with the same rows and levels.
 
-import std/[dynlib, algorithm, tables, monotimes, times]
+import std/[dynlib, algorithm, tables, monotimes, times, strutils, sequtils]
 
 const
-  RenderRate = 8000           ## Hz: just enough for the levels
-  Chunk = 40                  ## frames rendered at a time: 5 ms
+  RenderRate = 48000          ## Hz: the song's own, for its tick lengths
+  Chunk = 240                 ## frames rendered at a time: 5 ms
   VuStep* = Chunk / RenderRate  ## seconds between level samples
   MaxLength = 3 * 3600.0      ## seconds: stop marking past this
 
@@ -31,6 +35,7 @@ type
     format, highlight: CellFn
     readMono: proc (m: Module, rate: int32, count: csize_t, buf: ptr int16): csize_t {.cdecl.}
     position*: proc (m: Module): cdouble {.cdecl.}
+    setRenderParam: proc (m: Module, param, value: int32): cint {.cdecl.}
     vu: proc (m: Module, channel: int32): cfloat {.cdecl.}
     metadata: proc (m: Module, key: cstring): cstring {.cdecl.}
     channelName: proc (m: Module, channel: int32): cstring {.cdecl.}
@@ -57,9 +62,19 @@ type
     marks*: seq[RowMark]       ## in play order
     vu*: seq[uint8]            ## level per VuStep, `channels` at a time
     done*: bool                ## the whole song is marked
+    length*: float             ## seconds, as libopenmpt plays it (modstream's)
     m: Module                  ## rendering, until done
     renderer: Module           ## the copy that renders (marks, levels)
     cells: Table[(int, int), seq[Cell]]   ## (pattern, width) -> rows * channels
+    # A song laid out here rather than by libopenmpt (a MIDI file's, midichart):
+    # its patterns' rows and beats, its cells, the columns' heads and a line
+    # about it for the chart's header.
+    patRows*: seq[int]
+    patBeats*: seq[(int, int)]
+    cellsOf*: proc (pattern, width: int): seq[Cell]
+    labels*: seq[string]
+    info*: string
+    placeBars*: bool           ## the header tells bars and rows, not orders and patterns
     rowsMost: int              ## most rows of any pattern played, 0: not yet known
     data: string
 
@@ -97,6 +112,7 @@ proc loadApi*(): bool =
   sym highlight, "openmpt_module_highlight_pattern_row_channel"
   sym readMono, "openmpt_module_read_mono"
   sym position, "openmpt_module_get_position_seconds"
+  sym setRenderParam, "openmpt_module_set_render_param"
   sym vu, "openmpt_module_get_current_channel_vu_mono"
   sym metadata, "openmpt_module_get_metadata"
   sym channelName, "openmpt_module_get_channel_name"
@@ -135,7 +151,9 @@ proc openTracker*(path: string): TrackerSong =
   if r == nil:
     api.destroy(m)
     return nil
-  result = TrackerSong(path: path, m: m, renderer: r, data: data)
+  const InterpolationFilterLength = 3'i32  # OPENMPT_MODULE_RENDER_INTERPOLATIONFILTER_LENGTH
+  discard api.setRenderParam(r, InterpolationFilterLength, 1)
+  result = TrackerSong(path: path, m: m, renderer: r, data: data, length: api.duration(r))
   result.title = take(api.metadata(m, "title"))
   result.tracker = take(api.metadata(m, "tracker"))
   result.channels = api.numChannels(m)
@@ -153,6 +171,7 @@ proc close*(s: TrackerSong) =
   s.m = nil
 
 proc rows*(s: TrackerSong, pattern: int): int =
+  if s.cellsOf != nil: return (if pattern in 0 ..< s.patRows.len: s.patRows[pattern] else: 0)
   if s.m == nil or pattern < 0: 0 else: api.patternRows(s.m, pattern.int32).int
 
 proc maxRows*(s: TrackerSong): int =
@@ -163,6 +182,7 @@ proc maxRows*(s: TrackerSong): int =
 
 proc beat*(s: TrackerSong, pattern: int): (int, int) =
   ## Rows per beat and per measure (libopenmpt guesses when the format has none).
+  if s.cellsOf != nil and pattern in 0 ..< s.patBeats.len: return s.patBeats[pattern]
   if s.m == nil or pattern < 0: return (4, 16)
   result = (api.rowsPerBeat(s.m, pattern.int32).int, api.rowsPerMeasure(s.m, pattern.int32).int)
   if result[0] <= 0: result[0] = 4
@@ -173,6 +193,9 @@ proc cells*(s: TrackerSong, pattern, width: int): lent seq[Cell] =
   ## characters wide (0: in full), padded to the same width.
   let key = (pattern, width)
   if key notin s.cells:
+    if s.cellsOf != nil:
+      s.cells[key] = s.cellsOf(pattern, width)
+      return s.cells[key]
     var cs: seq[Cell]
     let rows = s.rows(pattern)
     cs.setLen rows * s.channels
@@ -204,7 +227,8 @@ proc build*(s: TrackerSong, budget: float): bool =
     for c in 0 ..< s.channels:
       s.vu.add uint8(min(255.0, api.vu(s.renderer, c.int32) * 255))
     let (o, r) = (api.currentOrder(s.renderer), api.currentRow(s.renderer))
-    if o != s.marks[^1].order or r != s.marks[^1].row:
+    # Past the end, libopenmpt is back at the song's restart row: never heard.
+    if t < s.length and (o != s.marks[^1].order or r != s.marks[^1].row):
       s.marks.add RowMark(t: t.float32, order: o, row: r)
 
 proc markAt*(s: TrackerSong, t: float): int =
@@ -217,3 +241,89 @@ proc level*(s: TrackerSong, t: float, channel: int): float32 =
   ## The channel's VU level at t, 0..1.
   let i = int(t / VuStep) * s.channels + channel
   if i < 0 or i >= s.vu.len or channel >= s.channels: 0 else: s.vu[i].float32 / 255
+
+# --- File properties -----------------------------------------------------------
+# What a module holds besides its patterns, for the playlist's Properties:
+# libopenmpt's metadata, its counts, and the names of its samples, instruments
+# and channels (where trackers' musicians leave their greetings).
+
+type DetailApi = object
+  keys: proc (m: Module): cstring {.cdecl.}
+  subsongs, patterns, instruments, samples: proc (m: Module): int32 {.cdecl.}
+  instrumentName, sampleName: proc (m: Module, i: int32): cstring {.cdecl.}
+
+var
+  dapi: DetailApi
+  dapiTried, dapiOk: bool
+
+proc loadDetailApi(): bool =
+  if dapiTried: return dapiOk
+  dapiTried = true
+  if not loadApi(): return false
+  let names = when defined(windows): @["libopenmpt.dll", "libopenmpt-0.dll"]
+              elif defined(macosx): @["libopenmpt.0.dylib", "libopenmpt.dylib"]
+              else: @["libopenmpt.so.0", "libopenmpt.so"]
+  var lib: LibHandle
+  for n in names:
+    lib = loadLib(n)
+    if lib != nil: break
+  if lib == nil: return false
+  template sym(field, name: untyped) =
+    let p = lib.symAddr(name)
+    if p == nil: return false
+    dapi.field = cast[typeof(dapi.field)](p)
+  sym keys, "openmpt_module_get_metadata_keys"
+  sym subsongs, "openmpt_module_get_num_subsongs"
+  sym patterns, "openmpt_module_get_num_patterns"
+  sym instruments, "openmpt_module_get_num_instruments"
+  sym samples, "openmpt_module_get_num_samples"
+  sym instrumentName, "openmpt_module_get_instrument_name"
+  sym sampleName, "openmpt_module_get_sample_name"
+  dapiOk = true
+  true
+
+proc moduleDetails*(path: string): seq[tuple[title: string, rows: seq[(string, string)]]] =
+  ## The module's sections: Module (metadata and counts), then its message
+  ## and the names of its samples, instruments and channels, numbered. Empty
+  ## when libopenmpt is missing or can't read the file.
+  if not loadDetailApi(): return
+  var data: string
+  try: data = readFile(path)
+  except IOError, OSError: return
+  let m = openModule(data)
+  if m == nil: return
+  defer: api.destroy(m)
+  const labels = {"type_long": "Format", "originaltype_long": "Converted from",
+    "container_long": "Container", "tracker": "Tracker", "artist": "Artist",
+    "title": "Title", "date": "Date", "warnings": "Warnings"}
+  var info: seq[(string, string)]
+  let keys = take(dapi.keys(m)).split(';')
+  for (k, label) in labels:
+    if k in keys:
+      let v = take(api.metadata(m, k.cstring)).strip
+      if v.len > 0: info.add (label, v)
+  for k in keys:  # any newer libopenmpt adds
+    if k.len == 0 or k in ["type", "originaltype", "container", "message", "message_raw"] or
+       labels.anyIt(it[0] == k): continue
+    let v = take(api.metadata(m, k.cstring)).strip
+    if v.len > 0: info.add (k, v)
+  info.add ("Channels", $api.numChannels(m))
+  info.add ("Orders", $api.numOrders(m))
+  info.add ("Patterns", $dapi.patterns(m))
+  let subs = dapi.subsongs(m)
+  if subs > 1: info.add ("Subsongs", $subs)
+  info.add ("Instruments", $dapi.instruments(m))
+  info.add ("Samples", $dapi.samples(m))
+  result.add ("Module", info)
+  let msg = take(api.metadata(m, "message_raw")).strip(leading = false)
+  if msg.strip.len > 0: result.add ("Message", @[("", msg)])
+  template names(title: string, n: int32, get: untyped) =
+    var rows: seq[(string, string)]
+    for i in 0'i32 ..< n:
+      let s {.inject.} = i
+      let v = take(get).strip(leading = false)
+      if v.strip.len > 0: rows.add ($(i + 1), v)
+    if rows.len > 0: result.add (title, rows)
+  names("Sample names", dapi.samples(m), dapi.sampleName(m, s))
+  names("Instrument names", dapi.instruments(m), dapi.instrumentName(m, s))
+  names("Channel names", api.numChannels(m), api.channelName(m, s))

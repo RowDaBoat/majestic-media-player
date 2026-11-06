@@ -153,6 +153,26 @@ proc mpv_render_context_report_swap*(ctx: MpvRenderContext)
 proc mpv_render_context_free*(ctx: MpvRenderContext)
 {.pop.}
 
+# Memory for stream callbacks. mpv opens a stream on one of its threads,
+# often a short-lived one, then reads and closes it on another. Nim's
+# allocator gives each thread its own heap and hands a block freed elsewhere
+# back to the heap it came from, so a block allocated on a thread that has
+# since ended can't be freed: its heap went with the thread (a crash, or a
+# write into memory reused since). Stream callbacks use the C heap instead.
+proc c_calloc(n, size: csize_t): pointer {.importc: "calloc", header: "<stdlib.h>".}
+proc c_free(p: pointer) {.importc: "free", header: "<stdlib.h>".}
+
+proc streamAlloc0*(bytes: int): pointer =
+  ## Zeroed memory any thread may free with `streamFree`; nil when out of
+  ## memory (never raises: it runs in callbacks on mpv's threads).
+  c_calloc(1, max(1, bytes).csize_t)
+
+proc streamCreate*(T: typedesc): ptr T =
+  cast[ptr T](streamAlloc0(sizeof(T)))
+
+proc streamFree*(p: pointer) =
+  if p != nil: c_free(p)
+
 type MpvError* = object of CatchableError
 
 proc check*(code: cint, what: string) =
@@ -165,6 +185,46 @@ proc command*(h: MpvHandle, args: varargs[string]): cint {.discardable.} =
   for i, a in args: cargs[i] = a.cstring
   cargs[^1] = nil
   mpv_command(h, cargs[0].addr)
+
+type MpvByteArray = object
+  data: ptr UncheckedArray[uint8]
+  size: csize_t
+
+proc screenshotRaw*(h: MpvHandle, replyId: uint64) =
+  ## Asks for the frame shown, as mpv decoded it (no subtitles or OSD); the
+  ## reply's node goes to `rawShot`. Never synchronous from the thread that
+  ## renders: mpv's video output takes the screenshot through the renderer.
+  var cargs = [cstring"screenshot-raw", cstring"video", cstring"rgba", nil]
+  discard mpv_command_async(h, replyId, cargs[0].addr)
+
+proc rawShot*(node: MpvNode, maxSide = 2048): tuple[w, h: int, pixels: seq[uint32]] =
+  ## A screenshot-raw reply as RGBA pixels (R in the low byte), alpha laid
+  ## over black, shrunk to fit maxSide; none (w 0) when there was no frame.
+  if node.format != fmtNodeMap: return
+  var (w, ht, stride) = (0, 0, 0)
+  var data: ptr MpvByteArray
+  let l = node.u.list
+  for i in 0 ..< l.num:
+    let v = l.values[i]
+    case $l.keys[i]
+    of "w": w = v.u.int64.int
+    of "h": ht = v.u.int64.int
+    of "stride": stride = v.u.int64.int
+    of "data":
+      if v.format == fmtByteArray: data = cast[ptr MpvByteArray](v.u.ba)
+    else: discard
+  if w <= 0 or ht <= 0 or data == nil or stride < w * 4 or data.size.int < stride * ht: return
+  # Every f-th pixel each way: no side over maxSide.
+  let f = max(1, (max(w, ht) + maxSide - 1) div maxSide)
+  let (ow, oh) = (max(1, w div f), max(1, ht div f))
+  result = (ow, oh, newSeq[uint32](ow * oh))
+  for y in 0 ..< oh:
+    for x in 0 ..< ow:
+      let o = y * f * stride + x * f * 4
+      let al = data.data[o + 3].uint32
+      let px = (data.data[o].uint32 * al div 255) or (data.data[o + 1].uint32 * al div 255) shl 8 or
+               (data.data[o + 2].uint32 * al div 255) shl 16 or 0xFF000000'u32
+      result.pixels[y * ow + x] = px
 
 proc commandStr*(h: MpvHandle, cmd: string): cint {.discardable.} =
   ## Runs a command in input.conf syntax (supports prefixes like osd-msg).

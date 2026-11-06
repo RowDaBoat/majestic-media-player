@@ -16,7 +16,7 @@ deps:
 	./tools/fetch_deps.sh
 	touch vendor/.stamp
 
-$(BIN): VERSION deps.lock $(wildcard tools/*.sh) $(wildcard patches/*.patch) $(wildcard src/*.nim) $(wildcard assets/presets/*) assets/fonts/IBMPlexSans-Regular.ttf
+$(BIN): VERSION deps.lock $(wildcard tools/*.sh) $(wildcard patches/*.patch) $(wildcard src/*.nim) $(wildcard src/*/*.nim) $(wildcard assets/presets/*) assets/fonts/IBMPlexSans-Regular.ttf
 	@./tools/build.sh $(NIM) c $(NIMFLAGS) -o:$(BIN) $(SRC)
 
 debug:

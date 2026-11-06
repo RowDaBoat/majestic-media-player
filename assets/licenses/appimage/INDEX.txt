@@ -156,6 +156,7 @@ spirv-tools	1:1.4.363.0-1	Apache-2.0	libmpv/spirv-tools
 srt	1.5.7-2	MPL-2.0	libmpv/libsrt
 svt-av1	4.2.0-1	BSD-3-Clause LicenseRef-AOMPL-1.0	libmpv/svtav1
 systemd-libs	262.1-1	LGPL-2.1-or-later CC0-1.0 GPL-2.0-or-later WITH Linux-syscall-note	appimage/common/LGPL-2.1-or-later.txt appimage/common/CC0-1.0.txt appimage/common/GPL-2.0-or-later.txt
+taglib	2.3-1	LGPL-2.1-only MPL-1.1	appimage/common/LGPL-2.1-only.txt appimage/common/MPL-1.1.txt
 uchardet	0.0.8-4	MPL-1.1	libmpv/uchardet
 util-linux-libs	2.42.4-1	BSD-2-Clause BSD-3-Clause BSD-4-Clause-UC GPL-2.0-only GPL-2.0-or-later GPL-3.0-or-later ISC LGPL-2.1-or-later LicenseRef-PublicDomain	appimage/util-linux-libs
 v4l-utils	1.32.0-2	LGPL	appimage/common/LGPL-2.1-or-later.txt

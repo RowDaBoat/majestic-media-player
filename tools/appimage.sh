@@ -26,10 +26,10 @@ QUICK_SHARUN_URL=https://raw.githubusercontent.com/pkgforge-dev/Anylinux-AppImag
 QUICK_SHARUN_SHA256=b8c62cec6d1351206e5edb6c273c6e5ca723196465581ffca500ee7ce37e43a4
 BIN=majestic-media-player
 # What runs inside the AppImage: the player's libraries (libmpv and what it
-# links; libopenmpt and libdbus, loaded at run time), the programs it starts
+# links; libopenmpt, libtag_c, libdbus and libwebpdemux, loaded at run time), the programs it starts
 # (ffprobe for Properties, ffmpeg to save clips, curl for links and updates;
 # a desktop may have none of them) and the GPU drivers.
-RUNTIME_PKGS=(mpv libopenmpt dbus ffmpeg curl mesa vulkan-radeon vulkan-intel
+RUNTIME_PKGS=(mpv libopenmpt taglib dbus libwebp ffmpeg curl mesa vulkan-radeon vulkan-intel
               vulkan-icd-loader intel-media-driver libglvnd)
 BUILD_PKGS=(base-devel git nim libx11 libxrandr file patchelf strace xorg-server-xvfb)
 INDEX=$ROOT/assets/licenses/appimage/INDEX.txt
@@ -88,7 +88,7 @@ bundled_pkgs() {
 # audio plugins quick-sharun adds, and every library they link.
 linked_pkgs() {
   local files=() f
-  files+=(/usr/bin/{"$BIN",ffmpeg,ffprobe,curl} /usr/lib/{libopenmpt.so.0,libdbus-1.so.3,libfontconfig.so.1})
+  files+=(/usr/bin/{"$BIN",ffmpeg,ffprobe,curl} /usr/lib/{libopenmpt.so.0,libtag_c.so.2,libdbus-1.so.3,libfontconfig.so.1,libwebpdemux.so.2})
   for f in /usr/lib/dri/*.so /usr/lib/gbm/*.so /usr/lib/libvulkan_*.so /usr/lib/libgallium*.so \
            /usr/lib/lib{EGL,GLX}_mesa.so.0 /usr/lib/lib{GL,EGL,GLX,OpenGL,vulkan}.so.1 \
            /usr/lib/pipewire-0.3/*.so /usr/lib/spa-0.2/*/*.so /usr/lib/pulseaudio/*.so; do
@@ -207,6 +207,7 @@ stage() {
   mkdir -p "$dest"
   cp "$a/appimage/README.txt" "$dest/README.txt"
   cp "$a/IBM-Plex-OFL.txt" "$dest/"
+  cp "$a/AVS-Nullsoft-BSD.txt" "$dest/"
   cp "$ROOT/LICENSE" "$dest/Majestic-Media-Player.txt"
   cp -r "$a/appimage" "$dest/appimage"
   rm "$dest/appimage/README.txt"
@@ -237,7 +238,8 @@ bundle() {
     # what's named here.
     export STRACE_BINARY=$BIN
     ./quick-sharun /usr/bin/"$BIN" /usr/bin/ffmpeg /usr/bin/ffprobe /usr/bin/curl \
-      /usr/lib/libopenmpt.so.0 /usr/lib/libdbus-1.so.3 /usr/lib/libfontconfig.so.1
+      /usr/lib/libopenmpt.so.0 /usr/lib/libtag_c.so.2 /usr/lib/libdbus-1.so.3 /usr/lib/libfontconfig.so.1 \
+      /usr/lib/libwebpdemux.so.2
     # The player's own updater (Help > Check for Updates) replaces the
     # AppImage, so no update information: tools reading it would look for
     # .zsync files the releases don't have.

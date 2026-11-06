@@ -17,6 +17,7 @@ type
     opOnline = "Online"
     opWeb = "Media Cache"
     opAudioFiles = "Audio Files"
+    opReplayGain = "ReplayGain"
     opSubtitles = "Subtitles"
     opSubStyle = "Default"
     opMisc = "Miscellaneous"
@@ -28,7 +29,8 @@ type
   PathRequest* = enum
     ## Paths page buttons the caller carries out (file dialogs, file manager).
     prNone, prBrowseScreenshots, prBrowseOpen, prShowSettings,
-    prBrowseWeb, prOpenWebDir, prClearWeb, prDeleteWeb, prBrowseMkvpropedit, prBrowseYtdlp
+    prBrowseWeb, prOpenWebDir, prClearWeb, prDeleteWeb, prBrowseMkvpropedit, prBrowseYtdlp,
+    prBrowseSoundFont
 
   WebInfo* = object
     ## Playback > Media Cache: the cached links, filled in by the caller.
@@ -94,7 +96,7 @@ type
 
 const
   Tree = [(opPlayer, 0), (opInterface, 1), (opFormats, 1), (opPaths, 1), (opKeys, 1), (opPlayback, 0),
-          (opOnline, 1), (opWeb, 1), (opAudioFiles, 1), (opSubtitles, 0),
+          (opOnline, 1), (opWeb, 1), (opAudioFiles, 1), (opReplayGain, 1), (opSubtitles, 0),
           (opSubStyle, 1), (opMisc, 0), (opSystem, 0)]
   Parents = {opPlayer, opPlayback, opSubtitles}
   TreeWidth = 180'f32
@@ -181,7 +183,10 @@ proc pageChanged(p: OptionsPage, c, before: Config): bool =
   of opWeb: differs(webCount) or differs(webCountOn) or differs(webDir) or
     differs(webKeepHours) or differs(webKeepOn) or differs(webSizeGB) or differs(webSizeOn)
   of opAudioFiles: differs(coverNames) or differs(shortAudioDelay) or differs(shortAudioMs) or
-    differs(showCover) or differs(showTrackerChart)
+    differs(showCover) or differs(showFileCover) or differs(showTrackerChart) or differs(showVisualizer) or differs(soundFont) or
+    differs(avsBeatThreshold) or differs(avsBeatSensitivity)
+  of opReplayGain: differs(replayGain) or differs(replayGainFallback) or
+    differs(replayGainNoClip) or differs(replayGainPreamp)
   of opSubtitles: differs(subDelay) or differs(subPaths)
   of opSubStyle: differs(subBold) or differs(subColor) or differs(subFont) or
     differs(subItalic) or differs(subLineSpacing) or differs(subOpacity) or
@@ -442,6 +447,7 @@ proc playerPage(ui: Ui, c: var Config, p: var Pane) =
   ui.checkRow(p, "o-rsize", "Remember window size", c.rememberWindowSize)
   ui.checkRow(p, "o-rxf", "Remember last pan, rotation and zoom", c.rememberTransform)
   ui.checkRow(p, "o-rpl", "Remember playlist", c.rememberPlaylist)
+  ui.hint(p, "The Default playlist and the file playing. Playlists of your own are always kept.")
 
 proc interfacePage(ui: Ui, c: var Config, p: var Pane) =
   ui.group(p, "Interface")
@@ -920,9 +926,12 @@ proc onlinePage(ui: Ui, c: var Config, p: var Pane) =
   ui.hint(p, "Applies to links opened from now on; cached media plays as it was cached.")
   ui.hint(p, "When nothing fits a limit, the smallest version available is fetched instead.")
 
-proc audioFilesPage(ui: Ui, c: var Config, p: var Pane) =
+proc audioFilesPage(d: OptionsDialog, ui: Ui, c: var Config, p: var Pane) =
   ui.group(p, "Front cover")
   ui.checkRow(p, "o-cover", "Show an audio file's front cover", c.showCover)
+  ui.hint(p, "Animated GIFs move at their own pace, playing or paused.")
+  ui.checkRow(p, "o-coverfile", "Show a picture named after the audio file instead", c.showFileCover)
+  ui.hint(p, "Song.jpg for song.mp3: shown over the cover inside the file and the folder picture.")
   if ui.show(p, "Folder pictures", c.coverNames):
     ui.textIn("Folder pictures", rect(p.x + 8, p.y, LabelW, 26), colText)
     discard ui.textArea("o-covernames", rect(p.x + 8 + LabelW, p.y, max(120'f32, p.w - LabelW - 8), 96),
@@ -930,13 +939,45 @@ proc audioFilesPage(ui: Ui, c: var Config, p: var Pane) =
     p.y += 96 + 4
   ui.hint(p, "Without a cover inside it, a picture in its folder with one of these names, one per line.")
   ui.hint(p, "Earlier lines win; letter case and the extension (.jpg, .png...) don't matter.")
-  ui.group(p, "Tracker modules")
-  ui.checkRow(p, "o-trackerchart", "Show the tracker chart (MOD, XM, IT...)", c.showTrackerChart)
-  ui.hint(p, "Each channel's notes, scrolling as they play. Needs libopenmpt.")
+  ui.group(p, "Tracker chart")
+  ui.checkRow(p, "o-trackerchart", "Show the tracker chart (MOD, XM, IT, MIDI...)", c.showTrackerChart)
+  ui.hint(p, "Each channel's notes, scrolling as they play. Modules need libopenmpt.")
+  ui.group(p, "Visualizer")
+  ui.checkRow(p, "o-visualizer", "Show the visualizer for sound without a picture", c.showVisualizer)
+  ui.hint(p, "Winamp AVS presets, playing to what you hear. Add your own .avs files")
+  ui.hint(p, "to the presets folder (right-click the video: Visualizer Preset).")
+  ui.numberRow(p, "o-avsbeat", "Beat threshold (%)", c.avsBeatThreshold, 5, 0, 400)
+  ui.hint(p, "How loud the sound must be for beats: 100 is Winamp's, lower makes quiet music beat")
+  ui.hint(p, "(ReplayGain makes it quieter), 0 lets any sound. Presets can still beat by themselves.")
+  ui.numberRow(p, "o-avssens", "Beat sensitivity (%)", c.avsBeatSensitivity, 10, 0, 300)
+  ui.hint(p, "How readily beats come at any loudness: 100 is Winamp's, 200 about twice the beats,")
+  ui.hint(p, "300 the most. Presets that pass on every Nth beat (Custom BPM) change more often too.")
+  ui.group(p, "MIDI files")
+  if ui.folderRow(p, "o-soundfont", "SoundFont", c.soundFont, "None: only one beside the file"):
+    d.request = prBrowseSoundFont
+  ui.fileNote(p, c.soundFont)
+  ui.hint(p, "MIDI, HMI and XMI files play through FluidSynth with a SoundFont (.sf2, .sf3): one in")
+  ui.hint(p, "the file's folder, else this one. Without either, they don't play.")
   ui.group(p, "Very short files")
   ui.checkRow(p, "o-shortaudio", "Add delay after very short files", c.shortAudioDelay)
   ui.numberRow(p, "o-shortaudioms", "Delay (milliseconds)", c.shortAudioMs, 50, 1, 60_000)
   ui.hint(p, "A file shorter than this is followed by this much silence before the next item.")
+
+proc replayGainPage(ui: Ui, c: var Config, p: var Pane) =
+  ui.group(p, "Mode")
+  ui.radioRow(p, "o-rgoff", "Off", c.replayGain, rgOff)
+  ui.radioRow(p, "o-rgtrack", "Track gain (every file at the same loudness)", c.replayGain, rgTrack)
+  ui.radioRow(p, "o-rgalbum", "Album gain (albums keep their quiet and loud songs)", c.replayGain, rgAlbum)
+  ui.hint(p, "Uses the loudness values stored in a file's tags; files aren't scanned for them.")
+  ui.hint(p, "Album gain falls back to track gain for files with no album values.")
+  ui.group(p, "Gain")
+  ui.numberRow(p, "o-rgpreamp", "Pre-amp (dB)", c.replayGainPreamp, 0.5, -15, 15, 1)
+  ui.hint(p, "Added to every file's ReplayGain value; positive values play louder.")
+  ui.numberRow(p, "o-rgfallback", "Without ReplayGain (dB)", c.replayGainFallback, 0.5, -30, 15, 1)
+  ui.hint(p, "The gain for files without ReplayGain values (videos too) while ReplayGain is on.")
+  p.gap
+  ui.checkRow(p, "o-rgclip", "Prevent clipping", c.replayGainNoClip)
+  ui.hint(p, "Lowers the gain when it would push the file's peak past full scale.")
 
 proc webPage(d: OptionsDialog, ui: Ui, c: var Config, p: var Pane, bottom: float32) =
   let web = d.web
@@ -1590,7 +1631,8 @@ proc draw*(d: OptionsDialog, ui: Ui, c: var Config, before: Config, r: Rect): Op
       of opPlayback: playbackPage(ui, c, p)
       of opOnline: onlinePage(ui, c, p)
       of opWeb: d.webPage(ui, c, p, pageR.y + pageR.h)
-      of opAudioFiles: audioFilesPage(ui, c, p)
+      of opAudioFiles: d.audioFilesPage(ui, c, p)
+      of opReplayGain: replayGainPage(ui, c, p)
       of opSubtitles: d.subtitlesPage(ui, c, p)
       of opSubStyle: d.subStylePage(ui, c, p)
       of opMisc: miscPage(ui, c, p)
@@ -1607,7 +1649,8 @@ proc draw*(d: OptionsDialog, ui: Ui, c: var Config, before: Config, r: Rect): Op
     of opPlayback: playbackPage(ui, c, p)
     of opOnline: onlinePage(ui, c, p)
     of opWeb: d.webPage(ui, c, p, pageR.y + pageR.h)
-    of opAudioFiles: audioFilesPage(ui, c, p)
+    of opAudioFiles: d.audioFilesPage(ui, c, p)
+    of opReplayGain: replayGainPage(ui, c, p)
     of opSubtitles: d.subtitlesPage(ui, c, p)
     of opSubStyle: d.subStylePage(ui, c, p)
     of opMisc: miscPage(ui, c, p)

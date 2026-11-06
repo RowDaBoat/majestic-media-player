@@ -16,12 +16,15 @@ let
   colBorder* = c("#2d3038")
   colHover* = c("#2c2f37")
   colPressed* = c("#363a44")
+  colContextual* = c("#2c2240")       ## the video frame menu's items about the file opened
+  colContextualHover* = c("#3d3058")  ## one of those, hovered
   colText* = c("#e7e9ee")
   colTextDim* = c("#9aa0ab")
   colTextDisabled* = c("#5c616b")
   colAccent* = c("#9d8cff")
   colAccentHover* = c("#b5a8ff")
   colAccentDim* = c("#9d8cff", 0.35)
+  colFindHit* = c("#9d8cff", 0.16)  ## playlist rows matching the search
   colBuffered* = c("#473f73")   ## colAccent at 45% brightness: the seek bar's read-ahead
   colTrack* = c("#30333b")
   colMarker* = c("#ffc857")

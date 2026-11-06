@@ -358,15 +358,21 @@ proc hookProc(h: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM): LRESULT {.std
   else: discard
   CallWindowProcW(k.prev, h, msg, wParam, lParam)
 
+proc hookWindow(window: Window): Hook =
+  ## The window's hook, installing it over its window procedure if new.
+  result = hookFor(window.hwnd)
+  if result != nil: return
+  result = Hook(window: window)
+  hooks.add result
+  window.darkTitleBar()
+  result.prev = cast[WNDPROC](GetWindowLongPtrW(window.hwnd, GWLP_WNDPROC))
+  discard SetWindowLongPtrW(window.hwnd, GWLP_WNDPROC, cast[LONG_PTR](hookProc))
+
 proc initMainWindow*(window: Window) =
   ## Hooks the window procedure for what Windy doesn't do on Windows: file
   ## drops, minimum size, aspect-locked resizing and moving by the content.
   if hookFor(window.hwnd) != nil: return
-  let k = Hook(window: window)
-  hooks.add k
-  window.darkTitleBar()
-  k.prev = cast[WNDPROC](GetWindowLongPtrW(window.hwnd, GWLP_WNDPROC))
-  discard SetWindowLongPtrW(window.hwnd, GWLP_WNDPROC, cast[LONG_PTR](hookProc))
+  discard window.hookWindow()
   if not registerDrops(window.hwnd): DragAcceptFiles(window.hwnd, 1)
 
 proc setMessageHook*(window: Window, hook: MessageHook) =
@@ -481,8 +487,15 @@ proc setDialogFor*(window, parent: Window, modal = true) =
   let ex = GetWindowLongW(window.hwnd, GWL_EXSTYLE)
   discard SetWindowLongW(window.hwnd, GWL_EXSTYLE, ex and not WS_EX_APPWINDOW)
 
-proc placeDialog*(window: Window, pos, size: IVec2) =
+proc keepContentsOnResize*(window: Window, background: ColorRGBX) =
+  ## X11 only: a resized window here is drawn again by GL from the modal
+  ## sizing loop, never left blank by the system.
+  discard
+
+proc placeDialog*(window: Window, pos, size: IVec2, minSize = ivec2(0, 0)) =
   ## Gives the window a client area of size with its outer top-left at pos.
+  ## With minSize, a resizable window can't be made smaller than that.
+  if minSize.x > 0 and minSize.y > 0: window.hookWindow().minSize = minSize
   window.size = size
   window.moveFrame(pos)
 

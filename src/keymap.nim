@@ -20,6 +20,7 @@ type
     kgNavigate = "Navigate"
     kgSubtitles = "Subtitles"
     kgView = "View"
+    kgPlaylist = "Playlist"
     kgPan = "Pan, Rotate & Zoom"
 
   KeyAction* = enum
@@ -78,11 +79,24 @@ type
     kaControls = "controls"
     kaStatus = "status"
     kaPlaylist = "playlist"
+    kaFindPlaylist = "find-in-playlist"
+    kaNewPlaylist = "new-playlist"
+    kaClosePlaylist = "close-playlist"
+    kaRestorePlaylist = "restore-playlist"
+    kaRenamePlaylist = "rename-playlist"
+    kaNextPlaylist = "next-playlist"
+    kaPrevPlaylist = "previous-playlist"
+    kaShowPlaying = "show-playing-playlist"
+    kaUndoPlaylist = "undo-playlist"
+    kaRedoPlaylist = "redo-playlist"
+    kaQueue = "queue"
+    kaUnqueue = "unqueue"
     kaRunLog = "run-log"
     kaShowOsd = "show-osd"
     kaFullScreen = "full-screen"
     kaOptions = "options"
     kaShortcuts = "shortcuts"
+    kaCommandPalette = "command-palette"
     kaCenter = "center"
     kaMoveUp = "move-up"
     kaMoveDown = "move-down"
@@ -123,8 +137,8 @@ const
     (kgPlayback, "Stop", "Stop", ""),
     (kgPlayback, "Frame forward", "Frame Forward", "."),
     (kgPlayback, "Frame back", "Frame Back", ","),
-    (kgPlayback, "Faster playback", "Faster Playback", "Shift+."),
-    (kgPlayback, "Slower playback", "Slower Playback", "Shift+,"),
+    (kgPlayback, "Fast-forward", "Fast-Forward", "Shift+."),
+    (kgPlayback, "Slow down", "Slow Down", "Shift+,"),
     (kgPlayback, "Repeat forever", "Repeat Forever", ""),
     (kgPlayback, "Repeat ping-pong", "Repeat Ping-Pong", ""),
     (kgPlayback, "Volume up", "Volume Up", "Up"),
@@ -173,11 +187,24 @@ const
     (kgView, "Controls", "Controls", "Ctrl+3"),
     (kgView, "Status", "Status", "Ctrl+4"),
     (kgView, "Playlist", "Playlist", "Ctrl+5"),
+    (kgView, "Find in playlist", "Find in Playlist", "Ctrl+F"),
+    (kgPlaylist, "New playlist", "New Playlist", "Ctrl+N"),
+    (kgPlaylist, "Close playlist", "Close Playlist", "Ctrl+W"),
+    (kgPlaylist, "Restore closed playlist", "Restore Playlist", "Ctrl+Shift+T"),
+    (kgPlaylist, "Rename playlist", "Rename Playlist", "F2"),
+    (kgPlaylist, "Next playlist", "Next Playlist", "Ctrl+Tab"),
+    (kgPlaylist, "Previous playlist", "Previous Playlist", "Ctrl+Shift+Tab"),
+    (kgPlaylist, "Show playing playlist", "Show Playing Playlist", ""),
+    (kgPlaylist, "Undo playlist change", "Undo", "Ctrl+Z"),
+    (kgPlaylist, "Redo playlist change", "Redo", "Ctrl+Y|Ctrl+Shift+Z"),
+    (kgPlaylist, "Add selection to playback queue", "Queue", "Q"),
+    (kgPlaylist, "Remove selection from playback queue", "Unqueue", "Shift+Q"),
     (kgView, "Run log", "Run Log", "Ctrl+6"),
     (kgView, "Show OSD", "Show OSD", ""),
     (kgView, "Full screen", "Fullscreen", "Alt+Enter"),
     (kgView, "Options", "Options", "O"),
     (kgView, "Keyboard shortcuts", "Keyboard Shortcuts", "F1"),
+    (kgView, "Command palette", "Command Palette", "F3"),
     (kgPan, "Center", "Center", "Numpad 5"),
     (kgPan, "Move up", "Move Up", "Numpad 8"),
     (kgPan, "Move down", "Move Down", "Numpad 2"),
@@ -389,6 +416,8 @@ const
     @["chapter", "section", "part"],
     @["file", "media"],
     @["playlist", "queue", "list"],
+    @["undo", "revert"],
+    @["tab", "playlist"],
     @["options", "settings", "preferences", "config"],
     @["properties", "info", "information", "details", "metadata"],
     @["keyboard shortcuts", "help", "keys", "hotkeys"],
@@ -399,7 +428,8 @@ const
     @["smaller", "decrease"],
     @["align", "position", "place"],
     @["controls", "buttons", "toolbar"],
-    @["status", "status bar"]]
+    @["status", "status bar"],
+    @["timestamp", "time"]]
   ## Words that also find other commands, but not the other way round.
   Aliases = [
     ("reset", @["center", "0 degrees", "restore", "default"]),
@@ -443,3 +473,34 @@ proc matchesSearch*(c: Config, a: KeyAction, search: string): bool =
     if not hay.hasWordStart(word) and not word.alternatives.anyIt(label.hasWordStart(it)):
       return false
   true
+
+proc searchScore*(label, context, search: string): int =
+  ## How well search finds a menu command named label, with context (its
+  ## menu path and keys) around it; -1 when it doesn't. Each word of search
+  ## must begin a word of the label or the context, or one of its synonyms a
+  ## word of the label; failing that, a word of three letters or more may sit
+  ## inside a word of the label ("screen" in "Fullscreen"). A plural word
+  ## also finds its singular ("subtitles": "Subtitle Track"). Words found in
+  ## the label count most, at its start more still.
+  let words = strutils.splitWhitespace(search.toLowerAscii)
+  if words.len == 0: return 0
+  let label = label.toLowerAscii
+  let context = context.toLowerAscii
+  proc forms(word: string): seq[string] =
+    result = @[word]
+    if word.len > 3 and word.endsWith("s"): result.add word[0 ..< ^1]
+  proc bySynonym(fs: seq[string]): bool =
+    for f in fs:
+      if f.alternatives.anyIt(label.hasWordStart(it)): return true
+  for i, word in words:
+    let fs = word.forms
+    if fs.anyIt(label.hasWordStart(it)):
+      result += 100
+      if i == 0 and fs.anyIt(label.startsWith(it)): result += 30
+    elif fs.anyIt(context.hasWordStart(it)): result += 40
+    elif fs.bySynonym: result += 30
+    elif word.len >= 3 and fs.anyIt(it in label): result += 10
+    else: return -1
+  let whole = words.join(" ")
+  if whole.forms.anyIt(label == it): result += 200
+  elif whole.forms.anyIt(label.startsWith(it)): result += 60

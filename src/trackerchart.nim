@@ -157,12 +157,15 @@ proc draw*(c: TrackerChart, ui: Ui, area: Rect, t: float) =
   let m = s.marks[mi]
   let (order, row) = (m.order.int, m.row.int)
   # Between this row and the next one, if that one follows it in the
-  # pattern: the rows glide up rather than jump.
+  # pattern: the rows glide up rather than jump. The last row glides on
+  # until the song ends.
   var frac = 0'f32
   if mi + 1 < s.marks.len:
     let n = s.marks[mi + 1]
     if s.successor(order, row) == (n.order.int, n.row.int) and n.t > m.t:
       frac = clamp((t - m.t) / (n.t - m.t), 0, 1).float32
+  elif s.done and s.length > m.t:
+    frac = clamp((t - m.t) / (s.length - m.t), 0, 1).float32
 
   ui.sk.pushClipRect(area)
   defer: ui.sk.popClipRect()
@@ -173,12 +176,16 @@ proc draw*(c: TrackerChart, ui: Ui, area: Rect, t: float) =
   if showHeader:
     let pat = if order in 0 ..< s.orderPatterns.len: s.orderPatterns[order] else: -1
     let title = if s.title.len > 0: s.title else: "Untitled"
-    let place = &"Order {order:03} / {s.orderPatterns.len - 1:03}    " &
-      &"Pattern {pat:03}    Row {row:03} / {s.rows(pat) - 1:03}"
+    let place = if s.placeBars:
+        &"Bar {order + 1:03} / {s.orderPatterns.len:03}    Row {row:02} / {s.rows(pat) - 1:02}"
+      else:
+        &"Order {order:03} / {s.orderPatterns.len - 1:03}    " &
+          &"Pattern {pat:03}    Row {row:03} / {s.rows(pat) - 1:03}"
     let placeW = ui.textSize(place, FontMonoSmall).x
     let titleW = area.w - 2 * Margin - placeW - 24
     ui.text(ui.ellipsize(title, titleW, FontTitle), vec2(area.x + Margin, area.y + 6), colText, FontTitle)
-    let info = (if s.tracker.len > 0: s.tracker & "  ·  " else: "") & &"{s.channels} channels"
+    let info = if s.info.len > 0: s.info
+               else: (if s.tracker.len > 0: s.tracker & "  ·  " else: "") & &"{s.channels} channels"
     ui.text(ui.ellipsize(info, titleW, FontSmall), vec2(area.x + Margin, area.y + 29), colTextDim, FontSmall)
     ui.text(place, vec2(area.x + area.w - Margin - placeW, area.y + 13), colTextDim, FontMonoSmall)
     top += HeaderH
@@ -260,7 +267,7 @@ proc draw*(c: TrackerChart, ui: Ui, area: Rect, t: float) =
   for ch in firstCh .. lastCh:
     let cx = colsLeft + ch.float32 * colW
     let lv = max(s.level(t, ch), max(s.level(t - VuStep, ch), s.level(t - 2 * VuStep, ch)))
-    let label = $(ch + 1)
+    let label = if ch < s.labels.len: s.labels[ch] else: $(ch + 1)
     let lw = ui.textSize(label, FontSmall).x
     ui.text(label, vec2(cx + (colW - lw) / 2, headY), if lv > 0.02: colText else: colTextDim, FontSmall)
     let bar = rect(cx + CellPad, headY + 18, colW - 2 * CellPad, 3)

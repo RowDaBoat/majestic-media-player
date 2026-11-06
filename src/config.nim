@@ -31,6 +31,10 @@ type
     rdAdaptive    ## back and forth, as the GPU's memory runs short and frees up
     rdCpu         ## the CPU, always
 
+  ReplayGainMode* = enum
+    ## Options > Playback > ReplayGain: which of a file's gains is applied.
+    rgOff, rgTrack, rgAlbum
+
   AfterPlayback* = enum
     apNothing, apNextInFolder, apMonitorOff, apExit, apSleep, apHibernate,
     apShutdown, apLogOff, apLock
@@ -58,6 +62,8 @@ type
     showStatus*: bool = true
     showPlaylist*: bool = false
     playlistWidth*: float = 300    # pixels, changed by dragging its left edge
+    playlistTabsSide*: bool = false # the playlists in a column left of the entries, not tabs above them
+    playlistSideWidth*: float = 150 # pixels, that column's width, changed by dragging its right edge
     playlistColumns*: seq[PlaylistField]   # shown, left to right; set by loadConfig when empty
     playlistColumnWidths*: Table[string, float]  # pixels, by field name: the columns resized by hand
     playlistShowSize*: bool = false        # older versions' columns, read once into playlistColumns
@@ -85,7 +91,12 @@ type
     showRemaining*: bool = false   # status/OSD time as -remaining / duration
     showFrames*: bool = false      # the frame number left of the status/OSD time
     syncOffsetSeconds*: bool = false  # Synchronize > Properties: the offset in seconds, not frames
+    tagPatterns*: seq[string]          # playlist Properties > Autofill: patterns used, latest first
+    tagNumberTotal*: bool = true       # Autofill track numbers: set Total Tracks too
+    tagNumberPad*: bool = true         # and write them with two digits
+    tagColumnWidths*: Table[string, float]  # Autofill's preview columns resized by hand, by field
     showAllShortcuts*: bool = false  # status bar hints include view toggles and pan/rotate/scale
+    paletteRecent*: seq[string]      # command palette: commands run, latest first ("View › Seek Bar")
     autoFitWindow*: bool = true
     sphereDragMovesWindow*: bool = false  # 360° video: drag moves the window, Ctrl+drag looks around
     rememberTime*: bool = false
@@ -130,7 +141,35 @@ type
     ytThumbnail*: bool = true      # a YouTube link's thumbnail while no video track shows
     ytSeekPreview*: bool = true    # seek bar previews on YouTube links, from its storyboards
     showCover*: bool = true        # an audio file's front cover in the video frame
+    showFileCover*: bool = true    # Show Front Cover (file): a picture named after the audio
+                                   # file is its cover, over the one inside it and the folder's;
+                                   # off, it's never shown
+    noVideo*: bool                 # Video Track > Always Disable: files open without their video
     showTrackerChart*: bool = true # a tracker module's patterns in the video frame
+    showVisualizer*: bool = true   # an AVS preset playing to audio without a picture (avsview)
+    avsPreset*: string = ""        # its preset: builtin:NAME or a file's path, "" random
+    avsBeatThreshold*: float = 100 # the level beats need, % of Winamp's (an average of 16/128); 0: any sound
+    avsBeatSensitivity*: float = 100 # how readily beats come, % of Winamp's: 200 about twice the beats
+    avsDisabled*: seq[string]      # Visualizers...: presets turned off (not in the menu, never stepped to)
+    avsAdded*: seq[string]         # preset files listed where they are: ones Add... couldn't copy
+                                   # into the presets folder (and, before it copied, every one)
+    avsHidden*: seq[string]        # the folder's preset files removed from the list
+    avsColumnWidths*: Table[string, float]  # Visualizers' columns resized by hand, by column
+    avsStarRatings*: Table[string, int]  # Visualizers' Rating column, by preset: quarters
+    avsFrameRates*: Table[string, int]  # Visualizers' Frame Rate column: presets stepped
+                                        # slower than 60 times a second (avsview's rates)
+                                     # of a star, 1 to 20 (unrated presets are left out)
+    avsAddedDates*: Table[string, float]  # Visualizers' Added column, by preset file: when
+                                     # it was first listed, seconds since 1970
+    avsSort*: string = "added"     # the column Visualizers sorts by (avsdlg's keys)
+    avsSortDescending*: bool = false
+    avsRatings*: Table[string, int]  # the same in fifths of a star, from before quarters:
+                                     # read once into avsStarRatings, then emptied
+    avsLastDir*: string            # where Visualizers' Add... last took presets from
+    avsAddSubfolders*: bool = true # Visualizers' Add Folder... also lists its subfolders' presets
+    avsWindowW*, avsWindowH*: int = 0  # Visualizers' window as last resized, UI units; 0: AvsSize
+    soundFont*: string = ""        # the SoundFont MIDI files play with when their folder
+                                   # has none (midistream.soundFontFor)
     trackerPitch*: float = 0       # the tracker button's pitch shift, semitones
     trackerStretch*: bool = true   # samples stretched with the speed (mpv's time
                                    # stretching); off, they play as written, only the
@@ -140,6 +179,11 @@ type
                                    # extension, one per line, first found wins
     shortAudioDelay*: bool = true  # silence after a very short audio file, before the next
     shortAudioMs*: float = 500     # how short, and how much silence: milliseconds
+    # Options > Playback > ReplayGain
+    replayGain*: ReplayGainMode = rgOff
+    replayGainPreamp*: float = 0   # dB added to a file's gain
+    replayGainFallback*: float = 0 # dB for files without ReplayGain values (while on)
+    replayGainNoClip*: bool = true # lower the gain so the file's peak doesn't clip
     # Options > Playback > Media Cache
     webDir*: string = ""           # "" = the cache folder's "streams"
     webKeepOn*: bool = true        # forget links not opened for webKeepHours
@@ -178,10 +222,14 @@ type
     windowX*, windowY*: int
     windowW*, windowH*: int        # 0 = never saved
     transform*: SavedTransform
-    playlist*: seq[string]         # kept when "Remember playlist" is on
+    # The playlist before there were several (playlists.json): read once into
+    # the Default playlist, then left empty.
+    playlist*: seq[string]
     playlistIndex*: int = -1
     playlistTitles*: Table[string, string]  # its links' titles
     playlistListed*: seq[string]   # its YouTube playlist links already listed
+    playlistFile*: string          # the playlist file it was loaded from or saved to
+    playlistAutosave*: seq[string] # playlist files with Autosave on
 
 const
   MaxRecent = 15
@@ -243,7 +291,7 @@ proc configDir*(): string = getConfigDir() / "majestic-media-player"
 
 proc configPath(): string = configDir() / "config.json"
 
-proc writeAtomic(path, data: string) =
+proc writeAtomic*(path, data: string) =
   ## Saved through a temporary file, so a crash mid-write (now that state is
   ## saved while playing) can't leave a truncated file behind.
   let tmp = path & ".tmp"
@@ -269,6 +317,10 @@ proc loadConfig*(): Config =
     if result.playlistShowSize: result.playlistColumns.add pfSize
     if result.playlistShowDimensions: result.playlistColumns.add pfDimensions
   dropOldKeys(result.keys)
+  for id, fifths in result.avsRatings:
+    if id notin result.avsStarRatings:
+      result.avsStarRatings[id] = clamp(int(round(fifths * 4 / 5)), 1, 20)
+  result.avsRatings.clear()
 
 proc readKeys(keys: var Table[string, string]): bool =
   ## The file's keys; false, leaving keys as they are, when it can't be read.
@@ -373,6 +425,9 @@ type
     playlist*: seq[string]
     titles*: Table[string, string]  # its links' titles
     listed*: seq[string]           # its YouTube playlist links already listed
+    playlistFile*: string          # the playlist file it was loaded from or saved to
+    playlistTab*: int              # that playlist's id (playlists.json), 0 for none
+    shownTab*: int                 # the id of the playlist shown
     index*: int = -1               # the entry open, else -1
     selected*: int = -1            # the entry selected
     time*: float
@@ -458,6 +513,33 @@ proc save*(s: SubScales) =
   try:
     createDir(path.parentDir)
     writeAtomic(path, s.toJson)
+  except CatchableError as e:
+    stderr.writeLine "config: cannot save ", path, ": ", e.msg
+
+# --- saved quick covers --------------------------------------------------------
+
+type QuickCovers* = OrderedTable[string, string]
+  ## file -> the picture dropped or pasted on it, shown whenever it opens
+
+proc quickCoversPath(): string = configDir() / "quickcovers.json"
+
+proc quickCoverDir*(): string =
+  ## Pasted pictures: they have no file of their own.
+  configDir() / "quickcovers"
+
+proc loadQuickCovers*(): QuickCovers =
+  let path = quickCoversPath()
+  if fileExists(path):
+    try:
+      result = readFile(path).fromJson(QuickCovers)
+    except CatchableError as e:
+      stderr.writeLine "config: ignoring unreadable ", path, ": ", e.msg
+
+proc save*(q: QuickCovers) =
+  let path = quickCoversPath()
+  try:
+    createDir(path.parentDir)
+    writeAtomic(path, q.toJson)
   except CatchableError as e:
     stderr.writeLine "config: cannot save ", path, ": ", e.msg
 
@@ -805,9 +887,23 @@ const AssocTrackerExtensions* = [
   "mptm", "mod", "s3m", "xm", "it", "mo3", "669", "mtm", "med", "stm", "ult",
   "okt", "umx"]
 
-const MediaExtensions* = @VideoExtensions & @AudioExtensions & @TrackerExtensions
+const MidiExtensions* = [
+  ## MIDI songs, played through FluidSynth with a SoundFont (midistream):
+  ## standard MIDI files, RIFF-wrapped ones, karaoke files, HMI and XMI songs.
+  "mid", "midi", "rmi", "kar", "hmi", "xmi"]
+
+const MediaExtensions* = @VideoExtensions & @AudioExtensions & @TrackerExtensions &
+  @MidiExtensions
 
 const SubtitleExtensions* = ["srt", "ass", "ssa", "vtt", "sub", "sup", "idx", "smi"]
+
+const ImageExtensions* = [
+  ## Pictures a quick cover can be: what mpv shows as a cover (animated GIF,
+  ## APNG and WebP moving through animpic).
+  "jpg", "jpeg", "jfif", "png", "apng", "gif", "webp", "bmp", "tif", "tiff", "avif", "jxl"]
+
+proc isImageFile*(path: string): bool =
+  path.splitFile.ext.toLowerAscii.strip(chars = {'.'}) in ImageExtensions
 
 proc isMediaFile*(path: string): bool =
   path.splitFile.ext.toLowerAscii.strip(chars = {'.'}) in MediaExtensions

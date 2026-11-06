@@ -677,6 +677,55 @@ proc mpvSections(h: MpvHandle, path: string): seq[InfoSection] =
 
 # --- entry point -------------------------------------------------------------------
 
+proc probedSections(probed: JsonNode, path: string): seq[InfoSection] =
+  ## General, Video, Audio, Text, Other and Image sections from ffprobe's report.
+  let fmt = probed["format"]
+  let streams = probed{"streams"}.getElems
+  let matroska = fmt.str("format_name").startsWith("matroska")
+  let module = fmt.str("format_name") == "libopenmpt"
+  let fileSize = fmt.num("size")
+  var g = generalSection(fmt, streams, path)
+  g.title = "General"
+  result.add g
+  var video, audio, text, image, other: seq[InfoSection]
+  for st in streams:
+    case st.str("codec_type")
+    of "video":
+      if st.disposition("attached_pic"): image.add imageSection(st)
+      else: video.add videoSection(st, matroska, fileSize)
+    of "audio":
+      audio.add(if module: moduleAudioSection(st) else: audioSection(st, matroska, fileSize))
+    of "subtitle": text.add textSection(st, matroska, fileSize)
+    of "data": other.add otherSection(st)
+    else: discard
+  result.numbered("Video", video)
+  result.numbered("Audio", audio)
+  result.numbered("Text", text)
+  result.numbered("Other", other)
+  result.numbered("Image", image)
+
+proc fileSections*(path: string): seq[InfoSection] =
+  ## The sections of a file not open in mpv: ffprobe's alone, chapters included.
+  let probed = if fileExists(path): probe(path) else: nil
+  if probed == nil or probed{"format"} == nil: return
+  result = probedSections(probed, path)
+  var chapters: seq[(float, string)]
+  for c in probed{"chapters"}.getElems:
+    chapters.add (c.num("start_time"), c.tag("title"))
+  if chapters.len > 0:
+    var m = menuSection(chapters)
+    m.title = "Menu"
+    result.add m
+
+proc fileTags*(path: string): seq[(string, string)] =
+  ## The container's tags as ffprobe reads them, for files TagLib can't open.
+  let probed = if fileExists(path): probe(path) else: nil
+  if probed == nil: return
+  let tags = probed{"format", "tags"}
+  if tags != nil and tags.kind == JObject:
+    for k, v in tags:
+      if k.toLowerAscii notin hiddenTags: result.add (k.toUpperAscii, v.getStr)
+
 proc gatherMediaInfo*(h: MpvHandle, path: string): seq[InfoSection] =
   ## General, Video, Audio, Text, Other, Image and Menu sections for the open
   ## file, followed by the tracks mpv loaded from other files.
@@ -684,30 +733,7 @@ proc gatherMediaInfo*(h: MpvHandle, path: string): seq[InfoSection] =
   if probed == nil or probed{"format"} == nil:
     result = mpvSections(h, path)
   else:
-    let fmt = probed["format"]
-    let streams = probed{"streams"}.getElems
-    let matroska = fmt.str("format_name").startsWith("matroska")
-    let module = fmt.str("format_name") == "libopenmpt"
-    let fileSize = fmt.num("size")
-    var g = generalSection(fmt, streams, path)
-    g.title = "General"
-    result.add g
-    var video, audio, text, image, other: seq[InfoSection]
-    for st in streams:
-      case st.str("codec_type")
-      of "video":
-        if st.disposition("attached_pic"): image.add imageSection(st)
-        else: video.add videoSection(st, matroska, fileSize)
-      of "audio":
-        audio.add(if module: moduleAudioSection(st) else: audioSection(st, matroska, fileSize))
-      of "subtitle": text.add textSection(st, matroska, fileSize)
-      of "data": other.add otherSection(st)
-      else: discard
-    result.numbered("Video", video)
-    result.numbered("Audio", audio)
-    result.numbered("Text", text)
-    result.numbered("Other", other)
-    result.numbered("Image", image)
+    result = probedSections(probed, path)
     # Subtitle / audio files loaded beside the main one.
     var ext: seq[InfoSection]
     for t in h.getNode("track-list").getElems:

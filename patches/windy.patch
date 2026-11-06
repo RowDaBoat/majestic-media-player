@@ -1,5 +1,5 @@
 diff --git a/src/windy/platforms/linux/x11.nim b/src/windy/platforms/linux/x11.nim
-index 5b29e3c..a48ba81 100644
+index 5b29e3c..32afaac 100644
 --- a/src/windy/platforms/linux/x11.nim
 +++ b/src/windy/platforms/linux/x11.nim
 @@ -52,6 +52,8 @@ type
@@ -50,7 +50,80 @@ index 5b29e3c..a48ba81 100644
    result.data = newString(len)
    if len != 0:
      copyMem(result.data[0].addr, data, len)
-@@ -788,6 +799,19 @@ proc newWindow*(
+@@ -200,6 +211,10 @@ proc property(
+ proc setProperty(
+   window: XWindow, property: Atom, kind: Atom, format: cint, data: string
+ ) =
++  ## Xlib takes format-32 data as C longs (8 bytes on 64-bit systems), so data
++  ## must hold clong-sized items; counting 4-byte ones would claim twice as
++  ## many and read past the end (garbage values after the real ones).
++  let itemSize = if format == 32: sizeof(clong) else: format div 8
+   display.XChangeProperty(
+     window,
+     property,
+@@ -207,7 +222,7 @@ proc setProperty(
+     format,
+     pmReplace,
+     data,
+-    data.len.cint div (format div 8)
++    data.len.cint div itemSize.cint
+   )
+ 
+ proc delProperty(window: XWindow, property: Atom) =
+@@ -471,6 +486,23 @@ proc size*(window: Window): IVec2 =
+ proc framebufferSize*(window: Window): IVec2 =
+   window.size
+ 
++type ResizeWatch = object
++  ## A size request waiting for the window manager's answer (see `size=`).
++  window: XWindow
++  serial: culong  ## the request's: earlier events can't be its answer
++  size: IVec2     ## the size before it
++  refused: bool
++
++proc spotRefusal(d: Display, event: ptr XEvent, p: pointer): cint {.cdecl.} =
++  ## XCheckIfEvent predicate that only looks: it takes no event off the queue
++  ## (pollEvents still handles them all), it just notes the WM's refusal.
++  let w = cast[ptr ResizeWatch](p)
++  if event.kind == xeConfigure and event.configure.send_event and
++      event.configure.window == w.window and event.configure.serial >= w.serial and
++      event.configure.size == w.size:
++    w.refused = true
++  0
++
+ proc `size=`*(window: Window, v: IVec2) =
+   let originalValue = window.size
+   if originalValue == v:
+@@ -479,9 +511,18 @@ proc `size=`*(window: Window, v: IVec2) =
+   # Its important to swap buffers so that openGL viewport updates.
+   window.swapBuffers()
+   # TODO: for some reason Chrome GLFW just do display.XFlush() and its enough?
++  var watch = ResizeWatch(window: window.handle, serial: display.XNextRequest(),
++    size: originalValue)
+   display.XResizeWindow(window.handle, v.x.uint32, v.y.uint32)
+ 
+-  blockUntil(originalValue != window.size)
++  # A window manager that refuses the request answers with a synthetic
++  # ConfigureNotify of the unchanged geometry (ICCCM 4.1.5): KWin does for a
++  # window in a tile, within milliseconds. Stop waiting then, rather than
++  # freezing the app for the whole half second. An accepted (or clamped)
++  # request changes the size first, its synthetic notify carrying the new one.
++  var ev: XEvent
++  blockUntil(originalValue != window.size or
++    (discard display.XCheckIfEvent(ev.addr, spotRefusal, watch.addr); watch.refused))
+ 
+ proc centerWindow*(window: Window) =
+   ## Calculate centered position for a window on the primary screen.
+@@ -580,7 +621,7 @@ proc `style=`*(window: Window, v: WindowStyle) =
+       )
+     of WmForDecoratedKind.kwm, WmForDecoratedKind.other:
+       window.handle.setProperty(
+-        decoratedAtom, decoratedAtom, 32, @[0'i32].asString
++        decoratedAtom, decoratedAtom, 32, @[0.clong].asString
+       )
+     else:
+       return
+@@ -788,6 +829,19 @@ proc newWindow*(
      result.handle, wmProtocols[0].addr, cint wmProtocols.len
    )
  
@@ -70,7 +143,7 @@ index 5b29e3c..a48ba81 100644
    result.im = display.XOpenIM
    result.ic = result.im.XCreateIC(
      "clientWindow",
-@@ -814,8 +838,11 @@ proc newWindow*(
+@@ -814,8 +868,11 @@ proc newWindow*(
    result.applyCursor()
  
    # Enable XDnD awareness (version 5)
@@ -84,7 +157,33 @@ index 5b29e3c..a48ba81 100644
  
    makeContextCurrent result
  
-@@ -849,6 +876,41 @@ proc newWindow*(
+@@ -829,9 +886,11 @@ proc newWindow*(
+     else:
+       raise WindyError.newException("VSync is not supported")
+ 
+-  if visible:
+-    result.visible = true
+-
++  # The sync counter must exist before the window is mapped. KWin on X11
++  # reads it when it manages the window and then shows it once the client
++  # answers a first sync request (or after a 1 s failsafe); a counter that
++  # appears later makes it wait for an answer to a request it never sends,
++  # so the window stays invisible (only taskbar thumbnails show it).
+   block xsync:
+     var vEv, vEr: cint
+     if display.XSyncQueryExtension(vEv.addr, vEr.addr):
+@@ -842,13 +901,51 @@ proc newWindow*(
+         xaNetWMSyncRequestCounter,
+         xaCardinal,
+         32,
+-        @[result.xSyncCounter].asString
++        @[result.xSyncCounter.clong].asString
+       )
+ 
++  if visible:
++    result.visible = true
++
+   result.style = style
  
    windows.add result
  
@@ -126,7 +225,7 @@ index 5b29e3c..a48ba81 100644
  proc pollEvents(window: Window) =
  
    # Clear all per-frame data
-@@ -865,8 +927,8 @@ proc pollEvents(window: Window) =
+@@ -865,8 +962,8 @@ proc pollEvents(window: Window) =
      d: Display,
      event: ptr XEvent,
      userData: pointer
@@ -137,7 +236,7 @@ index 5b29e3c..a48ba81 100644
  
    template pushButtonEvent(
      button: Button,
-@@ -909,25 +971,35 @@ proc pollEvents(window: Window) =
+@@ -909,25 +1006,35 @@ proc pollEvents(window: Window) =
          window.xdndSource = cast[XWindow](ev.client.data.l[0])
          window.xdndVersion = (ev.client.data.l[1] shr 24).int32
          window.xdndFormat = 0
@@ -180,7 +279,7 @@ index 5b29e3c..a48ba81 100644
              window.xdndFormat = fmt
              break
  
-@@ -941,6 +1013,13 @@ proc pollEvents(window: Window) =
+@@ -941,6 +1048,13 @@ proc pollEvents(window: Window) =
          if window.xdndVersion > 5:
            continue
  
@@ -194,7 +293,7 @@ index 5b29e3c..a48ba81 100644
          # Send status back to source.
          let acceptFlag: clong = if window.xdndFormat != 0: 1 else: 0
          let action: clong = if window.xdndVersion >= 2 and window.xdndFormat != 0: cast[clong](xaXdndActionCopy) else: 0
-@@ -993,13 +1072,15 @@ proc pollEvents(window: Window) =
+@@ -993,13 +1107,15 @@ proc pollEvents(window: Window) =
        if window.ic != nil:
          XSetICFocus window.ic
  
@@ -212,7 +311,7 @@ index 5b29e3c..a48ba81 100644
  
        if window.onFocusChange != nil:
          window.onFocusChange()
-@@ -1055,10 +1136,13 @@ proc pollEvents(window: Window) =
+@@ -1055,10 +1171,13 @@ proc pollEvents(window: Window) =
  
      of xeButtonPress, xeButtonRelease:
  
@@ -229,7 +328,7 @@ index 5b29e3c..a48ba81 100644
  
        let
          now = getTime()
-@@ -1122,36 +1206,39 @@ proc pollEvents(window: Window) =
+@@ -1122,36 +1241,39 @@ proc pollEvents(window: Window) =
  
      of xeSelection:
        # Handle XDnD selection data.
@@ -294,7 +393,7 @@ index 5b29e3c..a48ba81 100644
  
      else:
        discard
-@@ -1224,8 +1311,8 @@ proc processClipboardEvents: bool =
+@@ -1224,8 +1346,8 @@ proc processClipboardEvents: bool =
      d: Display,
      event: ptr XEvent,
      userData: pointer
@@ -305,7 +404,37 @@ index 5b29e3c..a48ba81 100644
  
    while display.XCheckIfEvent(
      ev.addr, checkEvent, cast[pointer](clipboardWindow)
-@@ -1348,8 +1435,12 @@ proc `icon=`*(window: Window, icon: Image) =
+@@ -1234,8 +1356,13 @@ proc processClipboardEvents: bool =
+     of xeSelection:
+       template e: untyped = ev.selection
+ 
+-      if e.property == 0 or e.selection != xaClipboard:
++      if e.selection != xaClipboard:
+         continue
++      if e.property == 0:
++        # The owner refused (the clipboard holds no text, only a picture,
++        # say): nothing, rather than waiting for an answer that never comes.
++        clipboardContent = ""
++        return true
+ 
+       clipboardContent = clipboardWindow.property(
+         xaWindyClipboardTargetProperty
+@@ -1296,7 +1423,13 @@ proc getClipboardString*: string =
+     clipboardWindow
+   )
+ 
+-  while not processClipboardEvents(): discard
++  # An owner that never answers can't hold the program up for long.
++  let giveUp = epochTime() + 2
++  while not processClipboardEvents():
++    if epochTime() > giveUp:
++      clipboardContent = ""
++      break
++    sleep(1)
+   result = clipboardContent
+   clipboardContent = ""
+ 
+@@ -1348,8 +1481,12 @@ proc `icon=`*(window: Window, icon: Image) =
    var data: seq[uint64]
    data.add icon.width.uint64
    data.add icon.height.uint64
@@ -320,7 +449,7 @@ index 5b29e3c..a48ba81 100644
  
    display.XChangeProperty(
      window.handle,
-@@ -1455,3 +1546,4 @@ proc saveFileDialog*(
+@@ -1455,3 +1592,4 @@ proc saveFileDialog*(
      args.add("--file-filter=" & filter.name & " | " &
        filter.extensions.replace(";", " ").replace(",", " "))
    result = runZenity(args)
@@ -338,6 +467,20 @@ index 1147b56..f88aa59 100644
    ErrorHandleProc* = proc (d: Display, event: ptr XErrorEvent): bool {.cdecl.}
  
    XEventKind* {.size: cint.sizeof.} = enum
+diff --git a/src/windy/platforms/linux/x11/xlib.nim b/src/windy/platforms/linux/x11/xlib.nim
+index c84b559..b267d9b 100644
+--- a/src/windy/platforms/linux/x11/xlib.nim
++++ b/src/windy/platforms/linux/x11/xlib.nim
+@@ -323,6 +323,9 @@ proc XGetGeometry*(
+ )
+ 
+ proc XResizeWindow*(d: Display, window: Window; w, h: uint32)
++proc XNextRequest*(d: Display): culong
++  ## Serial number of the next request sent; events carry the last one the
++  ## server had processed when they were generated.
+ proc XMoveWindow*(d: Display, window: Window; x, y: int32)
+ 
+ proc XGetInputFocus*(d: Display, window: ptr Window; revertTo: ptr RevertTo)
 diff --git a/src/windy/platforms/win32/platform.nim b/src/windy/platforms/win32/platform.nim
 index e790375..2124a33 100644
 --- a/src/windy/platforms/win32/platform.nim

@@ -97,10 +97,12 @@ const
     LeaveWindowMask or PointerMotionMask or ExposureMask
   CwBackPixel = 1.culong shl 1
   CwBorderPixel = 1.culong shl 3
+  CwBitGravity = 1.culong shl 4
   CwOverrideRedirect = 1.culong shl 9
   CwEventMask = 1.culong shl 11
   CwColormap = 1.culong shl 13
   TrueColor = 4.cint
+  NorthWestGravity = 1.cint
   InputOutput = 1.cuint
   XaAtom = 4.Atom
   XcLeftPtr = 68.cuint
@@ -320,15 +322,34 @@ proc setDialogFor*(window, parent: Window, modal = true) =
   discard XChangeProperty(d, window.xid, XInternAtom(d, "_NET_WM_STATE", 0),
     XaAtom, 32, 0, state.addr, 1)
 
-proc placeDialog*(window: Window, pos, size: IVec2) =
-  ## Fixes the window's size and puts its outer top-left corner at pos. The
-  ## position hints make the WM use it instead of its own placement; call
+proc XChangeWindowAttributes(d: XDisplay, w: XID, mask: culong, attrs: ptr XSetWindowAttributes): cint {.importc, cdecl.}
+
+proc keepContentsOnResize*(window: Window, background: ColorRGBX) =
+  ## Makes a resize keep the window's picture, filling only the area it
+  ## gains with background, until the next one is put in. X's defaults
+  ## (forget gravity, no background) leave the whole window black, which
+  ## shows as a blink at every step of a resize drag.
+  let d = glXGetCurrentDisplay()
+  if d == nil: return
+  let c = background  # opaque, so premultiplied == straight
+  var attrs = XSetWindowAttributes(bitGravity: NorthWestGravity,
+    backgroundPixel: (c.r.culong shl 16) or (c.g.culong shl 8) or c.b.culong)
+  discard XChangeWindowAttributes(d, window.xid, CwBitGravity or CwBackPixel, attrs.addr)
+  discard XFlush(d)
+
+proc placeDialog*(window: Window, pos, size: IVec2, minSize = ivec2(0, 0)) =
+  ## Sizes the window and puts its outer top-left corner at pos. The size is
+  ## fixed, unless minSize is given: then the user can resize it down to that.
+  ## The position hints make the WM use it instead of its own placement; call
   ## while the window is unmapped.
   let d = glXGetCurrentDisplay()
   if d == nil: return
   var hints = XSizeHints(flags: USPosition or PPosition or PMinSize or PMaxSize,
     x: pos.x, y: pos.y, width: size.x, height: size.y,
     minWidth: size.x, minHeight: size.y, maxWidth: size.x, maxHeight: size.y)
+  if minSize.x > 0 and minSize.y > 0:
+    hints.flags = USPosition or PPosition or PMinSize
+    (hints.minWidth, hints.minHeight) = (minSize.x, minSize.y)
   XSetWMNormalHints(d, window.xid, hints.addr)
   discard XMoveResizeWindow(d, window.xid, pos.x, pos.y, size.x.cuint, size.y.cuint)
   discard XFlush(d)
