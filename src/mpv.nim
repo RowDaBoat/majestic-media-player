@@ -17,6 +17,9 @@ when defined(windows):
     if result == nil: quit("could not import: " & $name)
   {.pragma: mpvImport, importc, cdecl, dynlib: mpvSym("").}
 else:
+  when defined(macosx):
+    # Homebrew's prefix on Apple silicon, then on Intel.
+    {.passL: "-L/opt/homebrew/lib -L/usr/local/lib".}
   {.passL: "-lmpv".}
   {.pragma: mpvImport, importc, cdecl.}
 

@@ -9,5 +9,7 @@ type
 
 when defined(windows):
   include dialogs_win32
+elif defined(macosx):
+  include dialogs_macos
 else:
   include dialogs_unix

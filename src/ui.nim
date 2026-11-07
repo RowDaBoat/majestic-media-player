@@ -154,6 +154,9 @@ proc scroll*(ui: Ui): float32 =
   when defined(windows):
     # Windy reports notches there (WHEEL_DELTA = 1), + = up.
     -ui.window.scrollDelta.y * 10
+  elif defined(macosx):
+    # Windy reports X11 units there too, but + = up.
+    -ui.window.scrollDelta.y
   else:
     ui.window.scrollDelta.y
 

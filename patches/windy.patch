@@ -481,6 +481,73 @@ index c84b559..b267d9b 100644
  proc XMoveWindow*(d: Display, window: Window; x, y: int32)
  
  proc XGetInputFocus*(d: Display, window: ptr Window; revertTo: ptr RevertTo)
+diff --git a/src/windy/platforms/macos/macdefs.nim b/src/windy/platforms/macos/macdefs.nim
+index 55c8772..ef2c6ca 100644
+--- a/src/windy/platforms/macos/macdefs.nim
++++ b/src/windy/platforms/macos/macdefs.nim
+@@ -228,6 +228,7 @@ objc:
+   proc defaultManager*(class: typedesc[NSFileManager]): NSFileManager
+   proc screens*(class: typedesc[NSScreen]): NSArray
+   proc frame*(self: NSScreen): NSRect
++  proc backingScaleFactor*(self: NSScreen): float64
+   proc frame*(self: NSWindow): NSRect
+   proc frame*(self: NSView): NSRect
+   proc generalPasteboard*(class: typedesc[NSPasteboard]): NSPasteboard
+diff --git a/src/windy/platforms/macos/platform.nim b/src/windy/platforms/macos/platform.nim
+index 2e09ee2..841318b 100644
+--- a/src/windy/platforms/macos/platform.nim
++++ b/src/windy/platforms/macos/platform.nim
+@@ -127,15 +127,23 @@ proc size*(window: Window): IVec2 =
+       backing = contentView.convertRectToBacking(frame)
+     result = ivec2(backing.size.width.int32, backing.size.height.int32)
+ 
++proc primaryScreen(): tuple[frame: NSRect, scale: float64] =
++  ## The menu bar's screen: Cocoa's global coordinates start at its bottom left.
++  let screen = NSScreen.screens.objectAtIndex(0).NSScreen
++  (screen.frame, screen.backingScaleFactor)
++
+ proc pos*(window: Window): IVec2 =
++  ## The content's top-left corner from the primary screen's top left, in
++  ## pixels of that screen (as on X11 and Windows, and as size is).
+   autoreleasepool:
+     let
+-      windowFrame = window.inner.frame
+-      screenFrame = window.inner.screen.frame
+-    result = vec2(
+-      windowFrame.origin.x,
+-      screenFrame.size.height - windowFrame.origin.y - windowFrame.size.height - 1
+-    ).ivec2
++      content = window.inner.contentRectForFrameRect(window.inner.frame)
++      (primary, scale) = primaryScreen()
++    result = ivec2(
++      round(content.origin.x * scale).int32,
++      round((primary.origin.y + primary.size.height - content.origin.y -
++        content.size.height) * scale).int32
++    )
+ 
+ proc minimized*(window: Window): bool =
+   window.minimizedState
+@@ -246,13 +254,16 @@ proc `size=`*(window: Window, size: IVec2) =
+     window.inner.setFrame(frameRect, true)
+ 
+ proc `pos=`*(window: Window, pos: IVec2) =
++  ## Puts the content's top-left corner at pos (see pos).
+   autoreleasepool:
+     let
+-      windowFrame = window.inner.frame
+-      screenFrame = window.inner.screen.frame
++      frame = window.inner.frame
++      content = window.inner.contentRectForFrameRect(frame)
++      (primary, scale) = primaryScreen()
++      top = primary.origin.y + primary.size.height - pos.y.float64 / scale
+       newOrigin = NSPoint(
+-        x: pos.x.float64,
+-        y: screenFrame.size.height - windowFrame.size.height - pos.y.float64 - 1
++        x: pos.x.float64 / scale - (content.origin.x - frame.origin.x),
++        y: top - content.size.height - (content.origin.y - frame.origin.y)
+       )
+     window.inner.setFrameOrigin(newOrigin)
+ 
 diff --git a/src/windy/platforms/win32/platform.nim b/src/windy/platforms/win32/platform.nim
 index e790375..2124a33 100644
 --- a/src/windy/platforms/win32/platform.nim

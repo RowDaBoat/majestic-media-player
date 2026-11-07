@@ -1,5 +1,6 @@
 # Majestic Media Player — build with `make`, run with `make run`.
 # Requires: nim >= 2.2, git, mpv (libmpv), mesa/libGL, libX11, libXrandr.
+# On macOS: nim >= 2.2, git, the Xcode command line tools and Homebrew's mpv.
 
 NIM      ?= nim
 BIN      := majestic-media-player
@@ -16,7 +17,7 @@ deps:
 	./tools/fetch_deps.sh
 	touch vendor/.stamp
 
-$(BIN): VERSION deps.lock $(wildcard tools/*.sh) $(wildcard patches/*.patch) $(wildcard src/*.nim) $(wildcard src/*/*.nim) $(wildcard assets/presets/*) assets/fonts/IBMPlexSans-Regular.ttf
+$(BIN): VERSION deps.lock $(wildcard tools/*.sh) $(wildcard patches/*.patch) $(wildcard src/*.nim) $(wildcard src/*.m) $(wildcard src/*/*.nim) $(wildcard assets/presets/*) assets/fonts/IBMPlexSans-Regular.ttf
 	@./tools/build.sh $(NIM) c $(NIMFLAGS) -o:$(BIN) $(SRC)
 
 debug:
@@ -40,6 +41,16 @@ ICONDIR := $(PREFIX)/share/icons/hicolor
 DESKTOP := majestic-media-player.desktop
 
 .PHONY: install uninstall
+ifeq ($(shell uname -s),Darwin)
+# macOS: the binary only (BSD install has no -D); there's no launcher entry.
+install: $(BIN)
+	install -d $(DESTDIR)$(BINDIR)
+	install -m755 $(BIN) $(DESTDIR)$(BINDIR)/$(BIN)
+	@echo "Installed $(BINDIR)/$(BIN)."
+
+uninstall:
+	rm -f $(DESTDIR)$(BINDIR)/$(BIN)
+else
 install: $(BIN)
 	install -Dm755 $(BIN) $(DESTDIR)$(BINDIR)/$(BIN)
 	install -dm755 $(DESTDIR)$(APPDIR)
@@ -58,6 +69,7 @@ uninstall:
 	      $(DESTDIR)$(ICONDIR)/scalable/apps/majestic-media-player.svg
 ifeq ($(DESTDIR),)
 	@$(MAKE) --no-print-directory refresh-caches
+endif
 endif
 
 # Best effort: lets the launcher, "Open With" and the icon theme notice the

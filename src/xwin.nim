@@ -5,6 +5,9 @@
 when defined(windows):
   import xwin_win32
   export xwin_win32
+elif defined(macosx):
+  import xwin_macos
+  export xwin_macos
 else:
   import xwin_x11
   export xwin_x11

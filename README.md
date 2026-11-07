@@ -32,7 +32,7 @@ Majestic's aim is to be the video player I wish I had.
 - **A very, VERY resizable compact mode.**
 - **Zoom, pan and rotate** the video (Ctrl+mouse).
 - **A-B loops, ping-pong playback and an equalizer.**
-- **Play/Pause, Previous and Next in the taskbar's window preview**, on Windows and KDE Plasma.
+- **Play/Pause, Previous and Next in the taskbar's window preview**, on Windows and KDE Plasma (on macOS: the media keys and Now Playing).
 
 Hold Ctrl, Shift or Alt to see what else you can do, or press F1 for every shortcut. Try right-clicking everything, too!
 
@@ -67,6 +67,18 @@ cd majestic-media-player
 ```
 
 Majestic shows up in the Start menu.
+
+### macOS from source
+
+Install the Xcode command line tools (`xcode-select --install`), [Nim](https://nim-lang.org) 2.2+ and [Homebrew](https://brew.sh). Then:
+
+```sh
+git clone https://github.com/arkl1te/majestic-media-player.git
+cd majestic-media-player
+./install.sh
+```
+
+It installs mpv with Homebrew if it's missing, builds, and puts `majestic-media-player` in `~/.local/bin` (`./install.sh --system` for `/usr/local/bin`). Or just `make run` to try it from the checkout. On macOS the media keys and Control Center's Now Playing drive playback; there's no app bundle yet, so Options > Formats (file associations), the visualizer's sound capture and the color picker aren't available there.
 
 To update a source install, `git pull` and run `./install.sh` again. `./install.sh --uninstall` removes it.
 
