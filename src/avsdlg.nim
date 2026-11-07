@@ -404,7 +404,7 @@ proc checkBox(ui: Ui, c: Vec2, on: bool, hov: bool) =
 proc draw*(d: AvsDialog, ui: Ui, r: Rect, v: AvsView): AvsAction =
   let w = ui.window
   let presets = v.presets
-  let ctrl = w.buttonDown[KeyLeftControl] or w.buttonDown[KeyRightControl]
+  let ctrl = w.ctrlDown
   let enter = w.buttonPressed[KeyEnter] or w.buttonPressed[NumpadEnter]
   let subR = rect(r.x + 256, r.y + 15, 22 + ui.textSize("Include subfolders").x, 22)
   let remR = rect(subR.x + subR.w + 12, r.y + 12, 104, 28)
@@ -424,7 +424,7 @@ proc draw*(d: AvsDialog, ui: Ui, r: Rect, v: AvsView): AvsAction =
   const Placeholder = "Search name, author, file, rating"
   discard ui.textField(SearchId, fieldR, d.search,
     if ui.textSize(Placeholder).x + 16 <= fieldR.w: Placeholder else: "Search")
-  ui.tip(fieldR, "Name, author or file name; ratings: 4 stars, 3.5*, >=4, 4+, ***, unrated (Ctrl+F)")
+  ui.tip(fieldR, "Name, author or file name; ratings: 4 stars, 3.5*, >=4, 4+, ***, unrated (" & keyLabel("Ctrl+F") & ")")
   if d.search.len > 0 and ui.iconButton("av-search-clear", clearR, "close16", "Clear the search (Esc)"):
     d.search = ""
   elif d.search.len == 0:

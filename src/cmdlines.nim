@@ -440,7 +440,7 @@ proc commandField(d: CmdDialog, ui: Ui, r: Rect) =
   if focused:
     d.caret = clamp(d.caret, 0, d.toks.len)
     d.anchor = clamp(d.anchor, 0, d.toks.len)
-    let ctrl = w.buttonDown[KeyLeftControl] or w.buttonDown[KeyRightControl]
+    let ctrl = w.ctrlDown
     let shift = w.shiftDown
     let (s0, s1) = (min(d.anchor, d.caret), max(d.anchor, d.caret))
     proc deleteSelection() =

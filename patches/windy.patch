@@ -494,10 +494,21 @@ index 55c8772..ef2c6ca 100644
    proc frame*(self: NSView): NSRect
    proc generalPasteboard*(class: typedesc[NSPasteboard]): NSPasteboard
 diff --git a/src/windy/platforms/macos/platform.nim b/src/windy/platforms/macos/platform.nim
-index 2e09ee2..841318b 100644
+index 2e09ee2..02a77ef 100644
 --- a/src/windy/platforms/macos/platform.nim
 +++ b/src/windy/platforms/macos/platform.nim
-@@ -127,15 +127,23 @@ proc size*(window: Window): IVec2 =
+@@ -56,6 +56,10 @@ const
+ 
+ var
+   WindyAppDelegate, WindyWindow, WindyView: Class
++  onQuitRequest*: Callback
++    ## Called for Quit in the app menu (Cmd+Q) or the Dock instead of ending
++    ## the process there and then; nil ends it.
++  openedPaths: seq[string]
+   windows: seq[Window]
+   # App activation is process-level, not per-window. While this deadline
+   # is in the future, pollEvents re-requests activation until it succeeds.
+@@ -127,15 +131,23 @@ proc size*(window: Window): IVec2 =
        backing = contentView.convertRectToBacking(frame)
      result = ivec2(backing.size.width.int32, backing.size.height.int32)
  
@@ -527,7 +538,7 @@ index 2e09ee2..841318b 100644
  
  proc minimized*(window: Window): bool =
    window.minimizedState
-@@ -246,13 +254,16 @@ proc `size=`*(window: Window, size: IVec2) =
+@@ -246,13 +258,16 @@ proc `size=`*(window: Window, size: IVec2) =
      window.inner.setFrame(frameRect, true)
  
  proc `pos=`*(window: Window, pos: IVec2) =
@@ -548,6 +559,45 @@ index 2e09ee2..841318b 100644
        )
      window.inner.setFrameOrigin(newOrigin)
  
+@@ -389,6 +404,29 @@ proc createMenuBar() =
+   appMenu.addItem(quitMenuItem)
+   appMenuItem.setSubmenu(appMenu)
+ 
++proc takeOpenedPaths*(): seq[string] =
++  ## Files (and URLs) the system asked the app to open since the last call:
++  ## from Finder, Open With or the Dock, at launch or while running.
++  result = move openedPaths
++
++objc:
++  proc isFileURL(self: NSURL): bool
++  proc absoluteString(self: NSURL): NSString
++
++proc applicationOpenURLs(self: ID, cmd: SEL, app: ID, urls: NSArray): ID {.cdecl.} =
++  for i in 0 ..< urls.count.int:
++    let url = urls[i].NSURL
++    let s = if url.isFileURL: url.path else: url.absoluteString
++    openedPaths.add $s
++
++proc applicationShouldTerminate(self: ID, cmd: SEL, sender: ID): uint {.cdecl.} =
++  ## NSTerminateNow (1) without a handler; else NSTerminateCancel (0), and the
++  ## handler decides.
++  if onQuitRequest == nil:
++    return 1
++  onQuitRequest()
++  0
++
+ proc applicationWillFinishLaunching(
+   self: ID,
+   cmd: SEL,
+@@ -987,6 +1025,8 @@ proc init() {.raises: [].} =
+     addClass "WindyAppDelegate", "NSObject", WindyAppDelegate:
+       addMethod "applicationWillFinishLaunching:", applicationWillFinishLaunching
+       addMethod "applicationDidFinishLaunching:", applicationDidFinishLaunching
++      addMethod "application:openURLs:", applicationOpenURLs
++      addMethod "applicationShouldTerminate:", applicationShouldTerminate
+ 
+     addClass "WindyWindow", "NSWindow", WindyWindow:
+       addMethod "windowDidResize:", windowDidResize
 diff --git a/src/windy/platforms/win32/platform.nim b/src/windy/platforms/win32/platform.nim
 index e790375..2124a33 100644
 --- a/src/windy/platforms/win32/platform.nim

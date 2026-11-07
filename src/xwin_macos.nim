@@ -106,10 +106,12 @@ proc pointerButtonsDown*(): bool =
 const
   ShiftFlag = 1'u shl 17
   ControlFlag = 1'u shl 18
+  CommandFlag = 1'u shl 20
 
 proc ctrlHeld*(): bool =
-  ## Whether Ctrl is held, even while another window has the keyboard.
-  (mmpModifiers().uint and ControlFlag) != 0
+  ## Whether Ctrl or Cmd (the shortcut modifier, see modkeys) is held, even
+  ## while another window has the keyboard.
+  (mmpModifiers().uint and (ControlFlag or CommandFlag)) != 0
 
 proc shiftHeld*(): bool =
   ## Whether Shift is held, even while another window has the keyboard.

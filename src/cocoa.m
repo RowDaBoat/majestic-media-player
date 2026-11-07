@@ -495,3 +495,272 @@ void mmpMediaUpdate(int status, const char *title, const char *artist, const cha
   np.nowPlayingInfo = info;
   np.playbackState = status == 2 ? MPNowPlayingPlaybackStatePlaying : MPNowPlayingPlaybackStatePaused;
 }
+
+// --- the visualizer's sound -----------------------------------------------------
+
+// A Core Audio process tap (macOS 14.2+) on this process's own output, the
+// counterpart of WASAPI's process loopback on Windows: mpv's sound after its
+// volume and filters. It feeds a private aggregate device whose IO block
+// resamples to the visualizer's rate into a ring read by mmpTapLatest. The
+// process only shows up in Core Audio once it has played something, so a
+// failed start is retried now and then while the visualizer asks for sound.
+// macOS asks the user once for permission to capture audio.
+
+#import <CoreAudio/CoreAudio.h>
+#import <CoreAudio/AudioHardwareTapping.h>
+#import <CoreAudio/CATapDescription.h>
+#import <os/lock.h>
+#include <time.h>
+
+enum { TapRingFrames = 8192, TapRate = 44100 };
+
+static struct {
+  os_unfair_lock lock;
+  float ring[TapRingFrames * 2];
+  long written;            // frames ever written
+  uint64_t lastWrite;      // CLOCK_UPTIME_RAW ns
+  double pos;              // next output sample, in input frames from the buffer start
+  float prevL, prevR;      // the previous buffer's last frame
+} tapRing = {OS_UNFAIR_LOCK_INIT};
+
+static BOOL tapWanted, tapRunning;
+static uint64_t tapTriedAt;
+static AudioObjectID tapID = kAudioObjectUnknown, tapAggregate = kAudioObjectUnknown;
+static AudioDeviceIOProcID tapProc;
+static dispatch_queue_t tapQueue;
+
+static uint64_t nowNs(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
+
+static void tapFeed(const AudioBufferList *in, double rate) {
+  if (in->mNumberBuffers == 0 || rate <= 0) return;
+  // Stereo mixdown: one interleaved buffer, or one buffer per channel.
+  const AudioBuffer *b0 = &in->mBuffers[0];
+  BOOL interleaved = in->mNumberBuffers == 1;
+  UInt32 ch = interleaved ? MAX(b0->mNumberChannels, 1) : 1;
+  long n = b0->mDataByteSize / (sizeof(float) * ch);
+  const float *l = b0->mData;
+  const float *r = in->mNumberBuffers > 1 ? in->mBuffers[1].mData : l;
+  if (l == NULL || r == NULL || n <= 0) return;
+  UInt32 stride = interleaved ? ch : 1;
+  UInt32 rOff = interleaved && ch > 1 ? 1 : 0;
+  BOOL silent = YES;
+  for (long i = 0; i < n * stride && silent; i++) silent = l[i] == 0;
+  os_unfair_lock_lock(&tapRing.lock);
+  if (!silent) {
+    // Linear interpolation from the device's rate to TapRate.
+    double step = rate / TapRate;
+    double pos = tapRing.pos;
+    while (pos <= n - 1) {
+      long i = (long)floor(pos);
+      double f = pos - i;
+      float l0 = i < 0 ? tapRing.prevL : l[i * stride];
+      float r0 = i < 0 ? tapRing.prevR : r[i * stride + rOff];
+      float l1 = f > 0 ? l[(i + 1) * stride] : l0;
+      float r1 = f > 0 ? r[(i + 1) * stride + rOff] : r0;
+      long w = (tapRing.written % TapRingFrames) * 2;
+      tapRing.ring[w] = (float)(l0 + (l1 - l0) * f);
+      tapRing.ring[w + 1] = (float)(r0 + (r1 - r0) * f);
+      tapRing.written++;
+      pos += step;
+    }
+    tapRing.pos = pos - n;
+    tapRing.lastWrite = nowNs();
+  }
+  tapRing.prevL = l[(n - 1) * stride];
+  tapRing.prevR = r[(n - 1) * stride + rOff];
+  os_unfair_lock_unlock(&tapRing.lock);
+}
+
+static void tapTeardown(void) {
+  if (tapAggregate != kAudioObjectUnknown) {
+    if (tapProc != NULL) {
+      AudioDeviceStop(tapAggregate, tapProc);
+      AudioDeviceDestroyIOProcID(tapAggregate, tapProc);
+      tapProc = NULL;
+    }
+    AudioHardwareDestroyAggregateDevice(tapAggregate);
+    tapAggregate = kAudioObjectUnknown;
+  }
+  if (tapID != kAudioObjectUnknown) {
+    if (@available(macOS 14.2, *)) AudioHardwareDestroyProcessTap(tapID);
+    tapID = kAudioObjectUnknown;
+  }
+  tapRunning = NO;
+}
+
+static NSString *defaultOutputUID(void) {
+  AudioObjectPropertyAddress a = {kAudioHardwarePropertyDefaultSystemOutputDevice,
+    kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
+  AudioDeviceID dev = kAudioObjectUnknown;
+  UInt32 size = sizeof dev;
+  if (AudioObjectGetPropertyData(kAudioObjectSystemObject, &a, 0, NULL, &size, &dev) != noErr)
+    return nil;
+  a.mSelector = kAudioDevicePropertyDeviceUID;
+  CFStringRef uid = NULL;
+  size = sizeof uid;
+  if (AudioObjectGetPropertyData(dev, &a, 0, NULL, &size, &uid) != noErr || uid == NULL) return nil;
+  return (__bridge_transfer NSString *)uid;
+}
+
+static BOOL tapSetUp(void) {
+  if (@available(macOS 14.2, *)) {
+    AudioObjectPropertyAddress a = {kAudioHardwarePropertyTranslatePIDToProcessObject,
+      kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
+    pid_t pid = getpid();
+    AudioObjectID process = kAudioObjectUnknown;
+    UInt32 size = sizeof process;
+    if (AudioObjectGetPropertyData(kAudioObjectSystemObject, &a, sizeof pid, &pid, &size,
+                                   &process) != noErr || process == kAudioObjectUnknown)
+      return NO;  // nothing played yet
+    NSString *output = defaultOutputUID();
+    if (output == nil) return NO;
+
+    CATapDescription *desc = [[CATapDescription alloc] initStereoMixdownOfProcesses:@[@(process)]];
+    desc.name = @"Majestic Media Player visualizer";
+    desc.privateTap = YES;
+    desc.muteBehavior = CATapUnmuted;
+    if (AudioHardwareCreateProcessTap(desc, &tapID) != noErr) {
+      tapID = kAudioObjectUnknown;
+      return NO;
+    }
+    NSDictionary *agg = @{
+      @(kAudioAggregateDeviceNameKey): @"Majestic Media Player visualizer",
+      @(kAudioAggregateDeviceUIDKey): [NSUUID UUID].UUIDString,
+      @(kAudioAggregateDeviceMainSubDeviceKey): output,
+      @(kAudioAggregateDeviceIsPrivateKey): @YES,
+      @(kAudioAggregateDeviceIsStackedKey): @NO,
+      @(kAudioAggregateDeviceTapAutoStartKey): @YES,
+      @(kAudioAggregateDeviceSubDeviceListKey): @[@{@(kAudioSubDeviceUIDKey): output}],
+      @(kAudioAggregateDeviceTapListKey): @[@{
+        @(kAudioSubTapDriftCompensationKey): @YES,
+        @(kAudioSubTapUIDKey): desc.UUID.UUIDString}],
+    };
+    if (AudioHardwareCreateAggregateDevice((__bridge CFDictionaryRef)agg, &tapAggregate) != noErr) {
+      tapAggregate = kAudioObjectUnknown;
+      tapTeardown();
+      return NO;
+    }
+    AudioStreamBasicDescription fmt = {0};
+    a.mSelector = kAudioTapPropertyFormat;
+    size = sizeof fmt;
+    if (AudioObjectGetPropertyData(tapID, &a, 0, NULL, &size, &fmt) != noErr ||
+        fmt.mFormatID != kAudioFormatLinearPCM || !(fmt.mFormatFlags & kAudioFormatFlagIsFloat) ||
+        fmt.mBitsPerChannel != 32) {
+      tapTeardown();
+      return NO;
+    }
+    double rate = fmt.mSampleRate;
+    if (tapQueue == nil)
+      tapQueue = dispatch_queue_create("majestic.visualizer.tap", DISPATCH_QUEUE_SERIAL);
+    if (AudioDeviceCreateIOProcIDWithBlock(&tapProc, tapAggregate, tapQueue,
+          ^(const AudioTimeStamp *now, const AudioBufferList *in, const AudioTimeStamp *inTime,
+            AudioBufferList *out, const AudioTimeStamp *outTime) {
+            tapFeed(in, rate);
+          }) != noErr) {
+      tapProc = NULL;
+      tapTeardown();
+      return NO;
+    }
+    if (AudioDeviceStart(tapAggregate, tapProc) != noErr) {
+      tapTeardown();
+      return NO;
+    }
+    tapRunning = YES;
+    return YES;
+  }
+  return NO;
+}
+
+void mmpTapStart(void) {
+  tapWanted = YES;
+  tapTriedAt = nowNs();
+  if (!tapRunning) tapSetUp();
+}
+
+void mmpTapStop(void) {
+  tapWanted = NO;
+  tapTeardown();
+}
+
+// The newest n frames (older first) into left and right; 0, and silence,
+// when nothing has played for 150 ms.
+int mmpTapLatest(float *left, float *right, int n) {
+  for (int k = 0; k < n; k++) left[k] = right[k] = 0;
+  if (tapWanted && !tapRunning && nowNs() - tapTriedAt > 1000000000ull) {
+    tapTriedAt = nowNs();
+    tapSetUp();
+  }
+  int fresh = 0;
+  os_unfair_lock_lock(&tapRing.lock);
+  if (tapRing.written > 0 && nowNs() - tapRing.lastWrite < 150000000ull) {
+    fresh = 1;
+    for (int k = 0; k < n; k++) {
+      long f = tapRing.written - n + k;
+      if (f < 0) continue;
+      long r = (f % TapRingFrames) * 2;
+      left[k] = tapRing.ring[r];
+      right[k] = tapRing.ring[r + 1];
+    }
+  }
+  os_unfair_lock_unlock(&tapRing.lock);
+  return fresh;
+}
+
+// --- file associations ----------------------------------------------------------
+
+#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
+
+// The app's bundle identifier; empty when not running from the app bundle.
+int mmpBundleId(char *buf, int len) {
+  NSString *bid = [NSBundle mainBundle].bundleIdentifier;
+  if (bid == nil || [NSBundle mainBundle].bundleURL == nil ||
+      ![[NSBundle mainBundle].bundlePath hasSuffix:@".app"]) { buf[0] = 0; return 0; }
+  strlcpy(buf, bid.UTF8String, len);
+  return 1;
+}
+
+// The type macOS gives files with this extension (a dynamic "dyn." one for
+// extensions it doesn't know).
+int mmpUtiForExt(const char *ext, char *buf, int len) {
+  buf[0] = 0;
+  if (@available(macOS 11.0, *)) {
+    UTType *t = [UTType typeWithFilenameExtension:str(ext)];
+    if (t == nil) return 0;
+    strlcpy(buf, t.identifier.UTF8String, len);
+    return 1;
+  }
+  return 0;
+}
+
+// Whether the app is the default for opening the type.
+int mmpIsDefaultFor(const char *uti) {
+  NSString *bid = [NSBundle mainBundle].bundleIdentifier;
+  if (bid == nil) return 0;
+  CFStringRef h = LSCopyDefaultRoleHandlerForContentType((__bridge CFStringRef)str(uti), kLSRolesAll);
+  if (h == NULL) return 0;
+  BOOL same = [(__bridge_transfer NSString *)h caseInsensitiveCompare:bid] == NSOrderedSame;
+  return same;
+}
+
+// Makes the app the type's default (on), or hands it to another app that
+// opens it (off): the first other handler macOS lists. 0, or an OSStatus.
+int mmpSetDefaultFor(const char *uti, int on) {
+  NSString *bid = [NSBundle mainBundle].bundleIdentifier;
+  if (bid == nil) return -1;
+  static BOOL registered;
+  if (!registered) {
+    LSRegisterURL((__bridge CFURLRef)[NSBundle mainBundle].bundleURL, true);
+    registered = YES;
+  }
+  CFStringRef type = (__bridge CFStringRef)str(uti);
+  NSString *handler = bid;
+  if (!on) {
+    handler = nil;
+    NSArray *all = (__bridge_transfer NSArray *)LSCopyAllRoleHandlersForContentType(type, kLSRolesAll);
+    for (NSString *h in all) {
+      if ([h caseInsensitiveCompare:bid] != NSOrderedSame) { handler = h; break; }
+    }
+    if (handler == nil) return 0;  // nothing else opens it: leave it
+  }
+  return (int)LSSetDefaultRoleHandlerForContentType(type, kLSRolesAll, (__bridge CFStringRef)handler);
+}

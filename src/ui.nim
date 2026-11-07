@@ -3,7 +3,8 @@
 import std/[strformat, strutils, math]
 from std/times import epochTime
 import silky, vmath, bumpy, chroma, pixie, opengl
-import theme, xwin
+import theme, xwin, modkeys
+export modkeys
 
 type
   Ui* = ref object
@@ -184,7 +185,7 @@ proc tabNavigate*(ui: Ui): int =
   let w = ui.window
   result = -1
   if not w.buttonPressed[KeyTab] or ui.tabStops.len == 0: return
-  if w.buttonDown[KeyLeftControl] or w.buttonDown[KeyRightControl] or
+  if w.ctrlDown or
      w.buttonDown[KeyLeftAlt] or w.buttonDown[KeyRightAlt]: return
   let n = ui.tabStops.len
   var i = -1
@@ -661,7 +662,7 @@ proc textField*(ui: Ui, id: string, r: Rect, text: var string,
   if focused:
     ui.caret = clamp(ui.caret, 0, text.len)
     ui.selAnchor = clamp(ui.selAnchor, 0, text.len)
-    let ctrl = w.buttonDown[KeyLeftControl] or w.buttonDown[KeyRightControl]
+    let ctrl = w.ctrlDown
     let shift = w.shiftDown
     let (s0, s1) = (min(ui.selAnchor, ui.caret), max(ui.selAnchor, ui.caret))
     proc deleteSelection(text: var string) =
@@ -827,7 +828,7 @@ proc textArea*(ui: Ui, id: string, r: Rect, text: var string,
   if focused:
     ui.caret = clamp(ui.caret, 0, text.len)
     ui.selAnchor = clamp(ui.selAnchor, 0, text.len)
-    let ctrl = w.buttonDown[KeyLeftControl] or w.buttonDown[KeyRightControl]
+    let ctrl = w.ctrlDown
     let shift = w.shiftDown
     let (s0, s1) = (min(ui.selAnchor, ui.caret), max(ui.selAnchor, ui.caret))
     proc deleteSelection(text: var string) =

@@ -487,7 +487,7 @@ proc formatsResults(d: OptionsDialog, ui: Ui, p: var Pane) =
   ui.group(p, "File association")
   for it in d.assoc:
     let kind = if it.video: "Video" else: "Audio"
-    let mimes = if it.mimes.len > 0: it.mimes.join(", ") else: "not in the MIME database"
+    let mimes = if it.mimes.len > 0: it.mimes.join(", ") else: NoTypeText
     if ui.show(p, "." & it.ext, kind, mimes) and
        ui.resultRow(p, "." & it.ext, kind & (if it.checked: ", opens here" else: "") & "  " & mimes):
       d.search = it.ext
@@ -497,7 +497,7 @@ proc formatsPage(d: OptionsDialog, ui: Ui, p: var Pane, bottom: float32) =
   d.loadAssoc()
   ui.group(p, "File association")
   discard ui.textField("o-search", rect(p.x + 8, p.y, p.w - 8, 26), d.search,
-    "Search extensions or MIME types")
+    TypeSearchHint)
   p.y += 34
 
   let footer = 8'f32 + 34 + 18  # buttons and the status line below the list
@@ -560,7 +560,7 @@ proc formatsPage(d: OptionsDialog, ui: Ui, p: var Pane, bottom: float32) =
                                            elif changed: colAccent else: colText)
     ui.textIn(if it.video: "Video" else: "Audio", rect(row.x + 112, row.y, 60, rowH),
       colTextDim, FontSmall)
-    let mimes = if ok: it.mimes.join(", ") else: "not in the MIME database"
+    let mimes = if ok: it.mimes.join(", ") else: NoTypeText
     ui.textIn(ui.ellipsize(mimes, row.w - 186, FontSmall),
       rect(row.x + 176, row.y, row.w - 180, rowH),
       if ok: colTextDim else: colTextDisabled, FontSmall)

@@ -11,6 +11,9 @@
 ## Windows (10 2004+): WASAPI's process loopback records this process's
 ## sound (mpv's output, its children's too) on a thread of its own, polled
 ## every 5 ms. Older Windows hands back silence.
+##
+## macOS (14.2+): a Core Audio process tap on this process's sound, kept in
+## cocoa.m (it resamples to TapRate itself). Older macOS hands back silence.
 
 import std/[locks, monotimes, times, os]
 
@@ -39,6 +42,9 @@ type
     quit: bool                ## Windows: the capture thread stops
 
   AudioTap* = ptr TapState
+
+when defined(macosx):
+  import cocoa
 
 when defined(linux):
   proc dlopen(path: cstring, mode: cint): pointer {.importc, header: "<dlfcn.h>".}
@@ -470,6 +476,8 @@ proc startTap*(): AudioTap =
     discard paMlStart(t.ml)
   elif defined(windows):
     createThread(capThread, capture, result)
+  elif defined(macosx):
+    mmpTapStart()
 
 proc stopTap*(t: AudioTap) =
   if t == nil: return
@@ -487,6 +495,8 @@ proc stopTap*(t: AudioTap) =
   elif defined(windows):
     t.quit = true
     joinThread(capThread)
+  elif defined(macosx):
+    mmpTapStop()
   deinitLock(t.lock)
   deallocShared(t)
 
@@ -497,6 +507,9 @@ proc latest*(t: AudioTap, left, right: var openArray[float32]): bool =
   for v in right.mitems: v = 0
   if t == nil: return false
   let n = min(left.len, right.len)
+  when defined(macosx):
+    if n == 0: return false
+    return mmpTapLatest(left[0].addr, right[0].addr, n.cint) != 0
   let now = getMonoTime().ticks
   acquire(t.lock)
   for s in t.slots.mitems:

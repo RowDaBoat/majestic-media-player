@@ -42,14 +42,28 @@ DESKTOP := majestic-media-player.desktop
 
 .PHONY: install uninstall
 ifeq ($(shell uname -s),Darwin)
-# macOS: the binary only (BSD install has no -D); there's no launcher entry.
-install: $(BIN)
-	install -d $(DESTDIR)$(BINDIR)
-	install -m755 $(BIN) $(DESTDIR)$(BINDIR)/$(BIN)
-	@echo "Installed $(BINDIR)/$(BIN)."
+# macOS: an app bundle, installed to ~/Applications (/Applications for a
+# system-wide install), with the command linked into $(BINDIR).
+APP     := Majestic Media Player.app
+MACAPPS ?= $(if $(filter /usr/local,$(PREFIX)),/Applications,$(HOME)/Applications)
+
+.PHONY: app
+app: $(BIN) tools/make_app.nim
+	./tools/macos_app.sh $(BIN) "$(APP)"
+
+install: app
+	install -d "$(DESTDIR)$(MACAPPS)" "$(DESTDIR)$(BINDIR)"
+	rm -rf "$(DESTDIR)$(MACAPPS)/$(APP)"
+	cp -R "$(APP)" "$(DESTDIR)$(MACAPPS)/"
+	ln -sf "$(MACAPPS)/$(APP)/Contents/MacOS/$(BIN)" "$(DESTDIR)$(BINDIR)/$(BIN)"
+ifeq ($(DESTDIR),)
+	-@/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$(MACAPPS)/$(APP)"
+endif
+	@echo "Installed $(MACAPPS)/$(APP) — find it in Launchpad or Finder as 'Majestic Media Player'."
 
 uninstall:
-	rm -f $(DESTDIR)$(BINDIR)/$(BIN)
+	rm -rf "$(DESTDIR)$(MACAPPS)/$(APP)"
+	rm -f "$(DESTDIR)$(BINDIR)/$(BIN)"
 else
 install: $(BIN)
 	install -Dm755 $(BIN) $(DESTDIR)$(BINDIR)/$(BIN)

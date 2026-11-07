@@ -78,7 +78,9 @@ cd majestic-media-player
 ./install.sh
 ```
 
-It installs mpv with Homebrew if it's missing, builds, and puts `majestic-media-player` in `~/.local/bin` (`./install.sh --system` for `/usr/local/bin`). Or just `make run` to try it from the checkout. On macOS the media keys and Control Center's Now Playing drive playback; there's no app bundle yet, so Options > Formats (file associations), the visualizer's sound capture and the color picker aren't available there.
+It installs mpv with Homebrew if it's missing, builds **Majestic Media Player.app** and puts it in `~/Applications` (`./install.sh --system` for `/Applications`), with the `majestic-media-player` command linked into `~/.local/bin` (`/usr/local/bin`). Then open it from Launchpad or Finder, or right-click a video → Open With. `make app` only builds the bundle, `make run` tries the bare binary from the checkout.
+
+On macOS shortcuts use Cmd where they say Ctrl elsewhere, the media keys and Control Center's Now Playing drive playback, Options > Formats sets the default app per type, and the visualizer hears the player through a Core Audio tap (macOS 14.2+). The screen color picker isn't available there.
 
 To update a source install, `git pull` and run `./install.sh` again. `./install.sh --uninstall` removes it.
 

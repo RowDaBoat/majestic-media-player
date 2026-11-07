@@ -1,8 +1,8 @@
 ## Bindings to cocoa.m, the macOS helpers behind xwin_macos, dialogs_macos,
-## inhibit_macos and mediactl_macos.
+## inhibit_macos, mediactl_macos and audiotap.
 
 {.compile("cocoa.m", "-fobjc-arc").}
-{.passL: "-framework Cocoa -framework QuartzCore -framework IOKit -framework MediaPlayer".}
+{.passL: "-framework Cocoa -framework QuartzCore -framework IOKit -framework MediaPlayer -framework CoreAudio -framework UniformTypeIdentifiers -framework CoreServices".}
 
 type
   MmpInput* {.bycopy.} = object
@@ -49,4 +49,11 @@ proc mmpMediaPoll*(cmd: var MmpMediaCommand): cint
 proc mmpMediaUpdate*(status: cint, title, artist, album: cstring,
                      position, duration, rate: cdouble,
                      canPlay, canPause, canSeek, canNext, canPrevious: cint)
+proc mmpBundleId*(buf: cstring, len: cint): cint
+proc mmpUtiForExt*(ext, buf: cstring, len: cint): cint
+proc mmpIsDefaultFor*(uti: cstring): cint
+proc mmpSetDefaultFor*(uti: cstring, on: cint): cint
+proc mmpTapStart*()
+proc mmpTapStop*()
+proc mmpTapLatest*(left, right: ptr float32, n: cint): cint
 {.pop.}

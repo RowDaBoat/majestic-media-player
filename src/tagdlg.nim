@@ -641,7 +641,7 @@ proc drawMetadata(d: TagDialog, ui: Ui, r: Rect) =
   ui.border(body, colBorder)
 
   # Keys, while nothing is edited: move, edit, clear, copy or paste.
-  let ctrl = w.buttonDown[KeyLeftControl] or w.buttonDown[KeyRightControl]
+  let ctrl = w.ctrlDown
   if keysFree and d.editKey.len == 0:
     let page = max(1, int(inner.h / RowH) - 1)
     if w.buttonPressed[KeyDown]: d.moveSel(rows, 1)

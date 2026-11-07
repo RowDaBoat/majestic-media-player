@@ -4,7 +4,7 @@
 
 import std/[strutils, tables, sequtils]
 import windy
-import config
+import config, modkeys
 
 type
   KeyMod* = enum
@@ -297,17 +297,19 @@ proc shortKeyName*(b: Button): string =
 
 proc `$`*(k: KeyCombo): string =
   if k.key == ButtonUnknown: return ""
-  if kmCtrl in k.mods: result.add "Ctrl+"
+  if kmCtrl in k.mods: result.add CtrlName & "+"
   if kmShift in k.mods: result.add "Shift+"
   if kmAlt in k.mods: result.add "Alt+"
   result.add keyName(k.key)
 
 proc parseCombo*(s: string): KeyCombo =
-  ## "Ctrl+Shift+O" -> combo; anything unreadable is no key.
+  ## "Ctrl+Shift+O" -> combo ("Cmd+" reads as "Ctrl+"); anything unreadable
+  ## is no key.
   var rest = s.strip
   while true:
     let low = rest.toLowerAscii
     if low.startsWith("ctrl+"): result.mods.incl kmCtrl; rest = rest[5 .. ^1]
+    elif low.startsWith("cmd+"): result.mods.incl kmCtrl; rest = rest[4 .. ^1]
     elif low.startsWith("shift+"): result.mods.incl kmShift; rest = rest[6 .. ^1]
     elif low.startsWith("alt+"): result.mods.incl kmAlt; rest = rest[4 .. ^1]
     else: break
@@ -366,7 +368,7 @@ proc keyClashes*(c: Config): set[KeyAction] =
       seen.add (k, a)
 
 proc heldMods*(w: Window): set[KeyMod] =
-  if w.buttonDown[KeyLeftControl] or w.buttonDown[KeyRightControl]: result.incl kmCtrl
+  if w.ctrlDown: result.incl kmCtrl
   if w.buttonDown[KeyLeftShift] or w.buttonDown[KeyRightShift]: result.incl kmShift
   if w.buttonDown[KeyLeftAlt] or w.buttonDown[KeyRightAlt]: result.incl kmAlt
 

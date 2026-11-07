@@ -818,7 +818,7 @@ proc pollTracker(a: App) =
 
 # --- small helpers ----------------------------------------------------------
 
-proc ctrl(w: Window): bool = w.buttonDown[KeyLeftControl] or w.buttonDown[KeyRightControl]
+proc ctrl(w: Window): bool = w.ctrlDown
 proc shift(w: Window): bool = w.buttonDown[KeyLeftShift] or w.buttonDown[KeyRightShift]
 proc alt(w: Window): bool = w.buttonDown[KeyLeftAlt] or w.buttonDown[KeyRightAlt]
 
@@ -7694,7 +7694,7 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
         a.cfg.save())
     ctx.sep()
   if p.isSpherical:
-    ctx.check("Ctrl+Drag to Look",
+    ctx.check(keyLabel("Ctrl+Drag to Look"),
       checked = a.cfg.sphereDragMovesWindow, action = proc () =
         a.cfg.sphereDragMovesWindow = not a.cfg.sphereDragMovesWindow
         a.cfg.save())
@@ -12767,6 +12767,8 @@ proc shortcutColumns(a: App): array[2, seq[ShortcutGroup]] =
       ("Draw, resize or move the rectangle", "Drag video / its side / inside it")])]
   for col in result.mitems:
     col.keepItIf(it.rows.len > 0)
+    for g in col.mitems:
+      for r in g.rows.mitems: r[1] = keyLabel(r[1])
 
 proc shortcutsOverlay(a: App) =
   let ui = a.ui
@@ -13669,6 +13671,10 @@ proc main() =
   # Ties the window to majestic-media-player.desktop (taskbar icon, audio
   # stream matching), whatever the binary is called.
   when defined(linux): x11ClassName = "majestic-media-player"
+  # Quit in the app menu (Cmd+Q) or the Dock: like closing the main window.
+  when defined(macosx):
+    onQuitRequest = proc () =
+      if a.window != nil: a.window.closeRequested = true
   try:
     a.window = newWindow(AppName, startSize, vsync = false)
     makeContextCurrent(a.window)
@@ -13829,7 +13835,9 @@ proc main() =
        now() - a.instanceRetry > 2:
       a.instanceRetry = now()
       a.instance = startServer()
-    let incoming = a.instance.poll()
+    var incoming = a.instance.poll()
+    # Files opened from Finder, Open With or the Dock (the app bundle's).
+    when defined(macosx): incoming.add takeOpenedPaths()
     if incoming.len > 0 and a.playlistLocked:
       # The master's playlist rules; the files go there.
       a.peers.send(a.syncMaster, @["open"] & incoming.mapIt(

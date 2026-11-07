@@ -223,7 +223,7 @@ proc popupSize(ui: Ui, node: MenuNode): Vec2 =
       h += MenuSeparatorHeight
     else:
       labelW = max(labelW, ui.textSize(c.label).x)
-      if c.shortcut.len > 0: scW = max(scW, ui.textSize(c.shortcut).x)
+      if c.shortcut.len > 0: scW = max(scW, ui.textSize(keyLabel(c.shortcut)).x)
       h += MenuRowHeight
   let w = checkW + labelW + (if scW > 0: shortcutGap + scW else: 0) + arrowW + padX
   vec2(ceil(max(w, 160)), ceil(h))
@@ -341,7 +341,7 @@ proc drawPopup(m: MenuSystem, ui: Ui, lv: PopupLevel, depth: int) =
         if c.enabled: colAccent else: colTextDisabled)
     ui.textIn(c.label, rect(row.x + checkW, row.y, row.w, row.h), fg)
     if c.shortcut.len > 0:
-      ui.textIn(c.shortcut, rect(row.x, row.y, row.w - arrowW, row.h),
+      ui.textIn(keyLabel(c.shortcut), rect(row.x, row.y, row.w - arrowW, row.h),
         if c.enabled: colTextDim else: colTextDisabled, h = RightAlign)
     if c.remove != nil and c.enabled:
       let xr = removeRect(row)

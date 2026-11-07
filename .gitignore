@@ -11,4 +11,5 @@
 draft.txt
 ideas.txt
 /*.AppImage
+/*.app
 /.vscode
