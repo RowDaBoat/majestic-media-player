@@ -64,3 +64,27 @@ Stop listed YouTube playlists from adding their videos again after a restart.
 - Don't include `.claude/` in the summary.
 - After the code block, flag anything that shouldn't go into the commit unnoticed, such as leftover
   debug code or untracked personal notes. Leave these out of the list itself.
+
+### No redundancy, one kind per item
+
+These two rules are strict. Check them before every summary, including a revised one.
+
+1. **Every item is one unique action, listed once, in exactly one list.** Never describe the same
+   action twice, in the same list or across lists:
+   - not as a "Make ..." in Changes and again as its "Fix ..." in Fixes;
+   - not as several items for its parts, its result or its mechanism: a bug and what fixes it are
+     one item, and so are a feature and its edge cases;
+   - not as separate items for something done only to support another change. For example, a
+     dialog made to grow to fit its text so a reworded message can have bullet points belongs in
+     the rewording's item;
+   - not as separate items for pieces added together to the same spot. For example, a
+     percentage and a time-left estimate added beside the same progress bar are one item.
+2. **Every item is exactly one kind: a change, something new or a fix, never two at once.** An
+   item can't be part change and part new feature, or a fix that also adds something. If an action
+   has aspects of more than one kind, decide which kind it mainly is, describe it only as that, and
+   leave the other aspect out, or mention it only as a detail of that item. If the aspects really
+   are separate actions, split them into separate items, one in each list, that don't overlap.
+
+Before writing the code block, go through every pair of items. If two describe the same action, or
+one is part of, a support for, or a result of the other, merge them or drop the lesser. Then check
+each item on its own: if it mixes kinds, settle it on one kind as above.

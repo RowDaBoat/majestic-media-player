@@ -65,6 +65,9 @@ type
     expected: int           ## files the index had under it as the walk began (0: none known)
     error*: string
     timeouts: int           ## files that timed out while their tags were read
+    prior: RootState        ## the state before the walk under way
+    cancelled: bool         ## the walk under way was cancelled; its thread hasn't said it stopped
+    rewalk: bool            ## walk it again once the cancelled walk stops
 
   EvKind = enum
     evFound, evDone, evLoaded, evProbed, evBeat
@@ -81,6 +84,7 @@ type
     state: RootState
     isFile: bool
     err: string
+    cancelled: bool         ## evDone: the walk stopped partway, cancelled
     loaded: seq[LibFile]
     probed: LibFile
     timedOut: bool
@@ -114,6 +118,7 @@ type
     probeQueue: seq[string]
     events: seq[Event]
     busy: bool              ## something plays: go slowly
+    cancelGen: int          ## walks up to this one are cancelled
     workers: int            ## threads started
     ws: array[MaxThreads, WorkerState]
 
@@ -166,6 +171,7 @@ type
     unreadAt: float
     runFrom: int            ## the first walk of the scan under way (or last made)
     readDone: int           ## tags read since the reading last ran out of files
+    stopped*: bool          ## the scan was cancelled: no tags are read until the next walk
 
 var
   sh: Shared
@@ -247,6 +253,11 @@ proc busy(): bool =
   {.cast(gcsafe).}:
     withLock sh.lock: result = sh.busy
 
+proc cancelled(gen: int): bool =
+  ## Whether walk gen was cancelled.
+  {.cast(gcsafe).}:
+    withLock sh.lock: result = gen <= sh.cancelGen
+
 proc skipName(name: string): bool =
   name.len == 0 or name[0] == '.' or name in ["$RECYCLE.BIN", "System Volume Information", "lost+found"]
 
@@ -278,6 +289,10 @@ proc walk(i: int, job: Job) =
   ## Lists a top folder's media files (or checks a path is there), posting
   ## them in batches as they're found.
   var done = Event(kind: evDone, root: job.path, gen: job.gen, state: rsReady)
+  if cancelled(job.gen):
+    done.cancelled = true
+    post done
+    return
   var info: FileInfo
   try: info = getFileInfo(job.path)
   except OSError as e:
@@ -311,12 +326,20 @@ proc walk(i: int, job: Job) =
       post Event(kind: evFound, root: job.path, gen: job.gen, files: move batch)
       batch = @[]
       lastPost = epochTime()
+    if cancelled(job.gen):
+      done.cancelled = true
+      post done
+      return
     let dir = stack.pop()
     try:
       for kind, path in walkDir(dir):
         inc count
         if count mod 64 == 0:
           beat(i)
+          if cancelled(job.gen):
+            done.cancelled = true
+            post done
+            return
           if count mod 512 == 0 and busy(): sleep(2)
         let name = path.extractFilename
         if name.skipName: continue
@@ -558,12 +581,18 @@ proc walkRoot(ix: LibIndex, root: string) =
     return
   let r = ix.roots[root].addr
   if r.state in {rsScanning, rsStuck}: return
+  if r.cancelled:  # walked again once the cancelled walk's thread is free
+    r.rewalk = true
+    ix.stopped = false
+    return
+  ix.stopped = false
   if not ix.scanning: ix.runFrom = ix.walkGen + 1
   inc ix.walkGen
   r.gen = ix.walkGen
   r.found = 0
   r.walked = root in ix.topRoots
   r.expected = 0
+  r.prior = r.state
   if r.walked:
     # What the last walk (or the saved index) had: how far this one is.
     for f in ix.files:
@@ -573,8 +602,29 @@ proc walkRoot(ix: LibIndex, root: string) =
 
 proc rescan*(ix: LibIndex) =
   ## Walks every library path again.
+  ix.stopped = false
   for p in toSeq(ix.roots.keys).sorted: ix.walkRoot(p)
   ix.unreadAt = 0
+
+proc cancelScan*(ix: LibIndex) =
+  ## Stops the walks under way (their files found so far are kept, none
+  ## dropped for not being found) and the reading of tags, until the next
+  ## walk (Rescan, a path added). A walk stuck on a path that doesn't
+  ## answer can't be stopped: its root isn't walked again until it returns.
+  ix.stopped = true
+  ix.pending.setLen 0
+  if inited:
+    withLock sh.lock:
+      sh.cancelGen = ix.walkGen
+      for p in sh.probeQueue: ix.queued.excl p
+      sh.probeQueue.setLen 0
+  for r in ix.roots.mvalues:
+    if r.state in {rsScanning, rsStuck}:
+      r.cancelled = true
+      r.rewalk = false
+      r.state = r.prior
+  ix.unreadAt = 0
+  inc ix.gen
 
 proc activate*(ix: LibIndex) =
   ## Starts using the index: reads the saved one and walks every path once.
@@ -670,6 +720,14 @@ proc walkDone(ix: LibIndex, e: Event) =
   if e.root notin ix.roots: return
   let r = ix.roots[e.root].addr
   if r.gen != e.gen: return  # an older walk's
+  if r.cancelled:
+    # Stopped (or done anyway, just as it was cancelled): what it found
+    # is kept, nothing it didn't is dropped; the state is as before it.
+    r.cancelled = false
+    if r.rewalk:
+      r.rewalk = false
+      ix.walkRoot(e.root)
+    return
   r.state = e.state
   r.error = e.err
   if e.state == rsReady:
@@ -749,7 +807,8 @@ proc feedProbers(ix: LibIndex, first: seq[int]) =
   ## Keeps the tag readers' queue topped up: the rows in view first, then the
   ## rest from where the last look stopped. Looks through at most a slice of
   ## the index each time, and only now and then once nothing was left.
-  if not ix.loaded: return
+  ## Nothing while the scan is cancelled.
+  if not ix.loaded or ix.stopped: return
   let now = epochTime()
   var room: int
   withLock sh.lock: room = ProbeQueueLen - sh.probeQueue.len
@@ -831,7 +890,7 @@ proc poll*(ix: LibIndex, visible: seq[int] = @[]): bool =
     result = true
     case e.kind
     of evFound:
-      if e.root in ix.roots and ix.roots[e.root].gen == e.gen:
+      if e.root in ix.roots and ix.roots[e.root].gen == e.gen and not ix.roots[e.root].cancelled:
         for f in e.files: ix.addFound(f, e.gen)
         ix.roots[e.root].found += e.files.len
         ix.feedAt = 0

@@ -37,7 +37,7 @@ const
   CommandsSize = ivec2(880, 520)
   YtdlpSize = ivec2(460, 176)
   EmbedSize = ivec2(460, 176)
-  ConfirmSize = ivec2(460, 216)
+  ConfirmWidth = 480'i32     ## the Yes/Cancel window's width; its height fits the text
   UpdateSize = ivec2(500, 260)
   EqualizerSize = ivec2(520, 336)
   EqMaxGain = 12.0          ## dB at the top of the equalizer's sliders
@@ -213,9 +213,19 @@ type
     sfSeeking   ## going to where the next frames start
     sfStepping  ## stepping through them, a frame taken each step
 
+  BridgeState = enum
+    rbOff       ## nothing taken, nor being taken
+    rbOpening   ## the bridge player opening the file
+    rbFinding   ## the bridge player finding the keyframe playback goes back to next
+    rbSeeking   ## going to where the frames before it start
+    rbStepping  ## stepping through them, a frame taken each step
+    rbReady     ## all taken, waiting for playback to get there
+    rbIdle      ## nothing to take (the file's first keyframe): waits for a jump or a turn
+
   LoopFrame = object
     t: float                  ## its time
     target: VideoTarget
+    sig: seq[uint8]           ## keyframe bridge: a few of its pixels (pictureSig)
 
   MasterClock = object
     ## A slave's view of its master's playback, in the master's time.
@@ -329,6 +339,42 @@ type
     sfMovedAt: float          ## when it last paused or was sent elsewhere
     sfWanted: float           ## when stepping last seemed likely
     sfPlainAt: float          ## when it last stepped the plain way
+    rbState: BridgeState      ## keyframe bridge (a video playing backward)
+    rbKey: string             ## the file, size and look its frames are for
+    rbFrames: seq[LoopFrame]  ## the frames just before rbK, in time order
+    rbBytes: int              ## memory they take
+    rbK: float = -1           ## the keyframe they lead up to
+    rbFrom: float             ## where the bridge player was last sent (-1 opening ahead of time)
+    rbAsked: int              ## its restarts then
+    rbAskedAt: float          ## when the last seek or step was asked for
+    rbLastT: float            ## its time at the frame last taken
+    rbPending: bool           ## it has a new frame to take
+    rbUpdated: bool           ## it gave a frame since it was last sent on
+    rbSlot: LoopFrame         ## the frame being taken, until it settles
+    rbSlotOpen: bool
+    rbSettleAt: float         ## when it was last rendered
+    rbFillAt: float           ## when it was sent to find the keyframe
+    rb: Player                ## the bridge player (no sound), made when first wanted
+    rbPlayerFailed: bool      ## it couldn't be made
+    rbUsedAt: float           ## when it was last wanted
+    rbOpenFailed: string      ## the file it couldn't open
+    rbShow: int = -1          ## the frame to show, -1 for the player's own
+    rbJumps: int              ## the player's jumps, as last seen
+    rbClock: tuple[pos: float, at: int64]  ## the player's last frame shown before
+                              ## standing still, and when it was due (mpv's clock, ns)
+    rbPicAt: float            ## when a new picture of the player's was last drawn
+    rbPicDue: int64           ## and when it was due, mpv's clock (ns)
+    rbPicSig: seq[uint8]      ## and a few of its pixels, near a keyframe (pictureSig)
+    rbPicSigAt: float         ## when they were read
+    rbSigFbo, rbSigTex: GLuint  ## where pictureSig shrinks a picture
+    rbPlayer: Player          ## the player they're for
+    rbSince: float            ## since when (its frames before then don't count)
+    rbStaleAt: float          ## when the player's picture last fell behind, 0: it hasn't
+    rbShowBelow: float        ## then: only frames before this time are shown
+    rbNeed: float = 0.4       ## how long a stand-still to bridge, seconds (learned)
+    rbFirst: bool             ## the next keyframe is the first since a turn or a seek
+    rbTraceT: float = NaN     ## the time of the frame last shown, for the trace
+    rbTraceSrc: int = -1
     preview: Preview
     cfg: Config
     # The playlist shown is in `playlist` and the pl* fields stashTab moves;
@@ -438,6 +484,9 @@ type
     libBusy: bool             ## something plays, as the workers were last told
     libBarSliding: bool       ## the bottom line's bar slides (how far the scan is isn't known)
     libBarDrawn: float        ## when it was last drawn
+    libEta: tuple[kind: int, t0, p0, at: float, text: string]
+      ## the bottom line's time left: what it's for (0: nothing, 1: the scan,
+      ## 2: reading tags), when and how far that was first seen, when the text was made
     typesDlg: TypesDialog     ## Options > Libraries > Custom..., its window created on first use
     typesWin: Window
     typesSk: Silky
@@ -494,6 +543,7 @@ type
     cfmUi: Ui
     cfmText: string           ## what saying Yes means
     cfmQuestion: string       ## the question itself, under it
+    cfmSize: IVec2            ## its size, fitted to the text (confirmLayout)
     cfmYes: proc ()           ## run on Yes
     upJob: UpJob              ## Check for Updates at work: the check, then getting the release
     thumb: ThumbJob           ## the YouTube link's thumbnail, for while no video track shows
@@ -3011,9 +3061,11 @@ proc mediaState(a: App): MediaState =
     elif p.playing or a.padRunning: msPlaying
     else: msPaused
   if p.loaded:
-    result.title = p.h.getStr("media-title")
-    result.artist = p.h.getStr("metadata/by-key/Artist")
-    result.album = p.h.getStr("metadata/by-key/Album")
+    # As observed: asked for, a player playing backward could keep the
+    # window waiting out a keyframe's decoding.
+    result.title = p.info.getOrDefault("media-title")
+    result.artist = p.info.getOrDefault("metadata/by-key/Artist")
+    result.album = p.info.getOrDefault("metadata/by-key/Album")
   if result.title.len == 0 and p.path.len > 0: result.title = p.path.fileTitle
 
 proc runMediaCommand(a: App, c: MediaCommand) =
@@ -4443,17 +4495,21 @@ proc loopRegion(a: App): tuple[a, b: float] =
   elif a.abLoop and a.loopReady and not a.pingPongAb: (a.loopA, a.loopB)
   else: (0.0, 0.0)  # a ping-pong loop turns around instead of jumping
 
-proc mirrorStandby(a: App) =
-  ## The playing player's settings and added tracks, onto the standby.
-  ## Nothing here waits on the standby: it may be busy loading or seeking.
-  let (p, sb) = (a.player, a.standby)
+proc mirrorOnto(a: App, sb: Player, skip: openArray[string] = []) =
+  ## The playing player's settings (but skip) and added tracks, onto sb.
+  ## Nothing here waits on sb: it may be busy loading or seeking.
+  let p = a.player
   let have = sb.tracks.filterIt(it.external).mapIt(it.file)
   for t in p.tracks:  # in the same order, so track ids match
     if t.external and t.file notin have and t.kind in ["sub", "audio"]:
       sb.h.commandAsync(t.kind & "-add", t.file, "auto", t.title, t.lang)
   for name in MirroredProps:
-    if name in p.props and sb.props.getOrDefault(name) != p.props[name]:
+    if name in p.props and name notin skip and sb.props.getOrDefault(name) != p.props[name]:
       sb.h.setProp(trackProp(name), p.props[name])
+
+proc mirrorStandby(a: App) =
+  ## The playing player's settings and added tracks, onto the standby.
+  a.mirrorOnto(a.standby)
 
 proc standbyForward(a: App) =
   ## The standby as seamless loops, loop frames and step frames want it
@@ -4834,6 +4890,10 @@ proc sendStandby(a: App, start: float, back: bool, fadeIn: float, startIn = fals
   if sb.path != p.path or sb.source != p.source or not sb.loaded or not sb.threadless:
     sb.setDemuxing(true)
     (sb.path, sb.source, sb.partStart, sb.partEnd, sb.fullDuration) = (p.path, p.source, 0.0, 0.0, 0.0)
+    # How far back mpv reads at a time goes by the file's size and length:
+    # the one opening, not the one the standby had (or none).
+    sb.duration = p.duration
+    if back: sb.setBackStep()
     sb.loaded = false
     sb.loadError = ""
     sb.sphere = p.sphere  # its added tracks come with mirroring
@@ -4894,7 +4954,7 @@ proc turnHere(a: App, back: bool) =
   # formats turnFormat names; others would have mpv reopen its output).
   let center = if a.smeared and p.turnFormat.len > 0: at - dir * TurnHereFade / 2 else: NaN
   let restarts = p.restarts
-  p.turnAt(back, at, fadeIn = center, d = TurnHereFade)
+  p.turnAt(back, at, fadeIn = center, d = TurnHereFade, soft = back and p.hasVideo and not a.softDecode)
   if not math.isNaN(center):
     (a.tnFadeIn, a.tnFadeInAt, a.tnFadeInLen, a.tnFadeInRestarts) = (p, center, TurnHereFade, restarts)
   a.turnTrace(&"here at {at:.4f} back={back}")
@@ -6094,6 +6154,440 @@ proc stepFrames(a: App) =
       a.stepOn()
     else: a.stepFill(last + d / 4, last + ahead.float * d, false)
 
+# --- keyframe bridge --------------------------------------------------------
+# Played backward, mpv decodes a keyframe's whole span of frames before it
+# shows the last of them, and only once it has shown the span after it: at
+# every keyframe the picture stands still while it decodes (0.1-0.2 s for
+# 1080p60 with keyframes 4 s apart, 0.35 s for 4K60, the sound playing on),
+# then skips frames to catch up. Nothing in mpv starts that decoding sooner
+# (its decoder thread, vd-queue-enable, breaks backward playback threadless:
+# tmp/rvs). So a player of its own, without sound (the bridge player), takes
+# the frames just before the keyframe playback goes back to next, ahead of
+# time, as step frames are taken: it finds the keyframe (a keyframe seek
+# from the shown frame's time), seeks exactly to a little before it going
+# forward (hardware decoding, if on), and steps through to it, a texture each
+# frame (and a few past it). When the playing player's picture stands still
+# there, they're shown instead, from the one after its last picture (told by
+# a few of its pixels), timed by the sound playing on, until its own
+# pictures catch up; checked picture by picture on a clip with each frame's
+# number on it (tmp/rvs: mkcheck.sh, chk.py), no frame skipped or shown out
+# of order. (The standby can't: parked for a turn, its sound makes each
+# step wait ~60 ms, and its sound turned off and on again leaves the next
+# seek's decoding broken, AV1 failing over from hardware decoding, the
+# window waiting on that.)
+
+const
+  BridgeMin = 0.25    ## the shortest stand-still bridged, seconds
+  BridgeMax = 1.5     ## the longest
+  BridgeFirst = 0.7   ## the shortest for the first keyframe after a turn or a seek
+  BridgeLate = 1.25   ## no new picture this many frames after the last was due: standing still
+  BridgeStale = 3.0   ## seconds standing still at most: anything longer isn't a keyframe's
+  BridgeAfter = 3     ## frames taken past the keyframe too (the player's last
+                      ## picture before standing still can be one of those)
+  SigW = 32           ## pictureSig's grid
+  SigH = 18
+  BridgeSkip = ["aid", "volume", "speed"]  ## the playing player's settings it doesn't take
+
+let noBridge = existsEnv("MMP_NO_BRIDGE")  ## tests: stand-stills shown as mpv has them (traced)
+
+proc bridgePlayer(a: App): Player =
+  ## The bridge player, made the first time it's wanted; nil if it can't be.
+  if a.rbPlayerFailed: return nil
+  if a.rb == nil:
+    try:
+      let t0 = now()
+      a.rb = newPlayer(a.cfg.volume, true, false, pictureOnly = true)
+      a.turnTrace(&"bridge player made in {int((now() - t0) * 1000)} ms")
+    except MpvError as e:
+      stderr.writeLine "keyframe bridge disabled: ", e.msg
+      a.rbPlayerFailed = true
+      return nil
+  a.rb
+
+proc bridgeDrop(a: App) =
+  ## Frees the frames (in the next GL pass), the player's own picture shown.
+  if a.rbSlotOpen:
+    a.rbSlotOpen = false
+    a.lfTrash.add a.rbSlot
+  a.lfTrash.add a.rbFrames
+  a.rbFrames.setLen 0
+  a.rbBytes = 0
+  if a.rbShow >= 0: a.lfDue = true
+  a.rbShow = -1
+
+proc bridgeOff(a: App) =
+  ## No more frames taken or shown. A file opening goes on opening, sought
+  ## anew once open.
+  a.bridgeDrop()
+  if a.rbState == rbOpening: a.rbFrom = -1
+  else: a.rbState = rbOff
+  a.rbK = -1
+  a.rbStaleAt = 0
+
+proc bridgeStep(a: App) =
+  a.rbState = rbStepping
+  a.rbUpdated = false
+  a.rb.h.commandAsync("frame-step")
+  a.rbAskedAt = now()
+
+proc bridgeKeep(a: App, f: LoopFrame) =
+  ## A frame taken; the earliest go when they don't fit in memory, the ones
+  ## right before the keyframe being those wanted first.
+  a.rbFrames.add f
+  a.rbBytes += f.target.w * f.target.h * 4
+  while a.rbFrames.len > 1 and a.rbBytes > a.loopFramesMax:
+    a.rbBytes -= a.rbFrames[0].target.w * a.rbFrames[0].target.h * 4
+    a.lfTrash.add a.rbFrames[0]
+    a.rbFrames.delete(0)
+
+proc bridgeDone(a: App) =
+  a.rbState = rbReady
+  a.turnTrace(&"bridge ready: {a.rbFrames.len} frames {(if a.rbFrames.len > 0: a.rbFrames[0].t else: NaN):.3f}..{(if a.rbFrames.len > 0: a.rbFrames[^1].t else: NaN):.3f} before {a.rbK:.3f} in {now() - a.rbFillAt:.3f} s")
+
+proc pictureSig(a: App, t: VideoTarget): seq[uint8] =
+  ## A few of a picture's pixels (SigW x SigH, nearest), GL pass: enough to
+  ## tell frames apart, the same for the bridge player's and the playing
+  ## player's renderings of one (but for rounding).
+  if t.fbo == 0: return
+  if a.rbSigFbo == 0:
+    var sig = VideoTarget()
+    sig.ensureSize(SigW, SigH)
+    (a.rbSigFbo, a.rbSigTex) = (sig.fbo, sig.tex)
+  glBindFramebuffer(GL_READ_FRAMEBUFFER, t.fbo)
+  glBindFramebuffer(GL_DRAW_FRAMEBUFFER, a.rbSigFbo)
+  glBlitFramebuffer(0, 0, GLint(t.w), GLint(t.h), 0, 0, SigW, SigH, GLbitfield(GL_COLOR_BUFFER_BIT), GLenum(GL_NEAREST))
+  glBindFramebuffer(GL_READ_FRAMEBUFFER, a.rbSigFbo)
+  result.setLen SigW * SigH * 4
+  glReadPixels(0, 0, SigW, SigH, GL_RGBA, GL_UNSIGNED_BYTE, result[0].addr)
+  glBindFramebuffer(GL_FRAMEBUFFER, 0)
+
+proc bridgeMatch(a: App, sig: seq[uint8]): int =
+  ## The bridge frame a picture is, by pictureSig; -1 when none is clearly
+  ## it (not among them, or alike: a still picture, where any will do).
+  result = -1
+  var best, second = int.high
+  for i, f in a.rbFrames:
+    if f.sig.len != sig.len: continue
+    var dist = 0
+    for k in 0 ..< sig.len: dist += abs(sig[k].int - f.sig[k].int)
+    if dist < best: (second, best, result) = (best, dist, i)
+    elif dist < second: second = dist
+  # The same frame: apart by rounding at most (hardware and software
+  # decoding, ~0.03 a value on AV1); the next one, clearly more, though
+  # in a still scene not by much (~0.1 a value: by then which one hardly
+  # shows).
+  if result >= 0 and not (best <= sig.len and (second == int.high or 2 * second >= 3 * best + 16)):
+    result = -1
+
+proc bridgeSeek(a: App, t: float, how: string) =
+  ## Sends the bridge player to t ("keyframes" or "exact"); its landing is
+  ## the next restart showing another time (until it lands, mpv tells the
+  ## spot asked for as its time).
+  let b = a.rb
+  discard b.pollEvents()  # restarts from before don't count
+  a.rbFrom = t
+  a.rbAsked = b.restarts
+  a.rbAskedAt = now()
+  a.rbUpdated = false
+  b.h.commandAsync("seek", formatFloat(t, ffDecimal, 6), "absolute+" & how)
+
+proc takeBridgeFrame(a: App, tw, th: int): bool =
+  ## One go at the bridge player's frame, as takeStepFrame; true if it's
+  ## waiting for mpv, nothing else to do for now.
+  let b = a.rb
+  discard b.pollEvents()
+  if b.render == nil: return false  # not set up for a picture (yet)
+  if (b.render.update() and MpvRenderUpdateFrame) != 0:
+    a.rbPending = true
+    a.rbUpdated = true
+  if a.rbSlotOpen:
+    if a.rbPending:
+      a.rbPending = false
+      b.render.render(a.rbSlot.target, untimed = true)
+      b.render.reportSwap()
+      a.rbSettleAt = now()
+    elif now() - a.rbSettleAt > StepSettle:
+      a.rbSlotOpen = false
+      a.rbLastT = a.rbSlot.t
+      a.rbSlot.sig = a.pictureSig(a.rbSlot.target)
+      a.bridgeKeep(a.rbSlot)
+      a.bridgeStep()
+    return true
+  let landed = b.loaded and b.restarts > a.rbAsked and not b.seeking and
+    abs(b.timePos - a.rbFrom) > 0.0002
+  if a.rbState == rbFinding:
+    # Any frame it shows meanwhile goes somewhere: mpv waits for each.
+    if a.rbPending:
+      a.rbPending = false
+      b.target.ensureSize(tw, th)
+      b.render.render(b.target, untimed = true)
+      b.render.reportSwap()
+    if landed:
+      let k = b.timePos
+      a.rbK = k
+      if k < a.stepDur / 2 or k > a.player.timePos + 0.01 or
+         a.pingPongAb and a.hasLoopA and k <= a.loopA + a.stepDur / 2:
+        # The file's first keyframe (nothing before it), not one found
+        # before the frame shown, or one before Ping-Pong turns at A: nothing
+        # to bridge until playback jumps (or turns).
+        a.rbState = rbIdle
+        a.turnTrace(&"bridge idle: keyframe {k:.3f}, shown {a.player.timePos:.3f}")
+        return true
+      # Off the frames' grid, a third of a frame before one: where it lands
+      # isn't mistaken for where it was sent.
+      let d = a.stepDur
+      # The first keyframe after a turn or a seek takes longer (mpv reads
+      # back from there too: ~0.3 s for 1080p60 where later ones take 0.2,
+      # up to 0.65 s in the window).
+      let need = if a.rbFirst: max(a.rbNeed, BridgeFirst) else: a.rbNeed
+      a.rbFirst = false
+      let n = ceil((need + d) / d)
+      a.rbState = rbSeeking
+      a.bridgeSeek(max(k - n * d - d / 3, 0), "exact")
+      a.turnTrace(&"bridge keyframe {k:.3f} (shown {a.player.timePos:.3f}) after {now() - a.rbFillAt:.3f} s: from {a.rbFrom:.3f}")
+    return true
+  if a.rbState == rbStepping and b.eofReached and b.timePos == a.rbLastT:
+    a.bridgeDone()
+    return true
+  # The time and the frame both new, whichever came first.
+  let fresh = a.rbUpdated and (if a.rbState == rbSeeking: landed and b.timePos >= a.rbFrom - 0.001
+                               else: b.timePos != a.rbLastT)
+  if not fresh:
+    if a.rbPending:
+      a.rbPending = false
+      b.target.ensureSize(tw, th)
+      b.render.render(b.target, untimed = true)
+      b.render.reportSwap()
+    return true
+  let t = b.timePos
+  if t > a.rbK + (BridgeAfter.float + 0.5) * a.stepDur:
+    a.bridgeDone()
+    return true
+  for _ in 1 .. 8:  # errors from before, not to be taken for this one's
+    if glGetError() == GL_NO_ERROR: break
+  a.rbSlot = LoopFrame(t: t)
+  a.rbSlot.target.ensureSize(tw, th)
+  if glGetError() == GL_OUT_OF_MEMORY:
+    a.lfTrash.add a.rbSlot
+    a.bridgeDrop()
+    a.bridgeDone()
+    return true
+  a.rbPending = false
+  b.render.render(a.rbSlot.target, untimed = true)
+  b.render.reportSwap()
+  a.rbSlotOpen = true
+  a.rbSettleAt = now()
+  true
+
+proc takeBridgeFrames(a: App, tw, th: int) =
+  ## GL pass: takes frames for a few milliseconds.
+  let until = now() + 0.004
+  while a.rbState in {rbFinding, rbSeeking, rbStepping} and a.takeBridgeFrame(tw, th) and
+        now() < until: discard
+
+proc bridgeClock(a: App): float =
+  ## Where playback is heard to be now: from the player's last frame shown
+  ## before standing still, the sound playing on from when it was due
+  ## (mpv's clock: the frames are timed by it, and reading it waits on
+  ## nothing).
+  a.rbClock.pos - float(mpv_get_time_ns(a.player.h) - a.rbClock.at) / 1e9 * a.player.speed
+
+proc bridgeDue(a: App): int =
+  ## Standing still, the bridge frame to show now: the one whose time the
+  ## clock is at or a frame before (one shows from its time back to the
+  ## next), the earliest once the clock's past them all (held until the
+  ## player's own picture gets there: an older one after it would be a step
+  ## back); -1 none (none taken, or none newer than the player's last).
+  if a.rbStaleAt == 0 or a.rbState != rbReady or a.rbFrames.len == 0 or noBridge: return -1
+  let d = a.stepDur
+  let c = a.bridgeClock
+  for i, f in a.rbFrames:
+    if f.t >= c - 0.0005 and f.t < c + d + 0.002 and f.t < a.rbShowBelow - d / 2: return i
+  if c < a.rbFrames[0].t and a.rbFrames[0].t < a.rbShowBelow - d / 2: return 0
+  -1
+
+proc bridgeCaughtUp(a: App): bool =
+  ## Standing still, whether the player's own pictures have caught up, to be
+  ## shown again: its picture (found among the bridge's, or else at most two
+  ## frames before the time told) at or past the frame due (or the bridge's
+  ## earliest, held). Asked again right after it draws a new one
+  ## (drawVideo): a pass later, the next could already be on its way.
+  let p = a.player
+  if a.rbStaleAt == 0: return
+  let d = a.stepDur
+  let c = a.bridgeClock
+  let drew = a.rbPicAt > a.rbStaleAt  # a new picture since
+  let fresh = a.rbPicSigAt >= a.rbPicAt and a.rbPicSig.len > 0 and drew
+  let m = if fresh: a.bridgeMatch(a.rbPicSig) else: -1
+  let due = a.bridgeDue
+  let target = if due >= 0: a.rbFrames[due].t else: c
+  let behind = (if m >= 0: a.rbFrames[m].t elif drew: p.timePos + 2 * d else: a.rbClock.pos) - target
+  # Drawing again with nothing of the bridge's due (none taken, or not yet
+  # past its last: it didn't stand still after all), it's its own; or
+  # standing still too long for a keyframe.
+  let idle = drew and due < 0
+  if behind > d / 2 and not idle and now() - a.rbStaleAt <= BridgeStale: return
+  # That much was bridged (or would have been), for the next.
+  let stood = a.rbClock.pos - c
+  if behind <= d / 2 and abs(a.rbClock.pos - a.rbK) < 2 * d:
+    # Up quickly but not all at once: now and then mpv (or the computer)
+    # stands still far longer, and frames for that would take a lot of
+    # memory every time.
+    a.rbNeed = clamp(max(0.8 * a.rbNeed, min(1.3 * stood, 1.6 * a.rbNeed + 0.1)), BridgeMin, BridgeMax)
+  a.turnTrace(&"bridge caught up at {p.timePos:.3f}: stood {stood:.3f} s (behind {behind:.3f}), need {a.rbNeed:.3f}")
+  a.rbStaleAt = 0
+  if a.rbShow >= 0:
+    a.rbShow = -1
+    a.lfDue = true
+  true
+
+proc bridgeOpen(a: App, at: float) =
+  ## Opens the playing player's file in the bridge player (paused, forward,
+  ## without sound), its first keyframe seek at `at` once it's open.
+  let (p, b) = (a.player, a.rb)
+  b.setDemuxing(true)  # as the playing player reads it: no cache
+  (b.path, b.source, b.partStart, b.partEnd, b.fullDuration) = (p.path, p.source, 0.0, 0.0, 0.0)
+  b.loaded = false
+  b.loadError = ""
+  b.sphere = p.sphere
+  b.stopped = false
+  discard b.pollEvents()
+  a.rbAsked = b.restarts
+  b.h.commandAsync("loadfile", if p.source.len > 0: p.source else: p.path, "replace", "-1",
+    "start=" & formatFloat(at, ffDecimal, 6) & ",hr-seek=no" &
+    (if p.openOpts.len > 0: "," & p.openOpts else: ""))
+  a.rbState = rbOpening
+  a.rbAskedAt = now()
+  a.rbFrom = if p.backward and p.playing: at else: -1.0  # -1: opened ahead of time
+
+proc bridgeFrames(a: App) =
+  ## Keeps the frames before the next keyframe taken while a video plays
+  ## backward, and shows them while the player's picture stands still there.
+  let p = a.player
+  # A video that may play backward (Ping-Pong, Enable reverse playback):
+  # the bridge player has it open (paused), as setting up its picture (its
+  # render context) holds the window up ~0.1 s; playing backward, it takes
+  # the frames.
+  let fits = not cpuWanted and p.loaded and p.hasRealVideo and not p.isSpherical and
+    p.path.len > 0 and not p.path.contains("://") and
+    (p.source.len == 0 or p.source.startsWith("edl://")) and p.partEnd <= 0
+  let need = fits and p.backward and p.playing and not p.seeking and a.lfSize[0] > 1
+  if not need:
+    if a.rbState notin {rbOff, rbOpening} or a.rbShow >= 0: a.bridgeOff()
+    a.rbPlayer = nil  # anew when it's needed again
+    if fits and a.backwardReady and a.bridgePlayer != nil:
+      a.rbUsedAt = now()
+      let b = a.rb
+      if a.rbState == rbOpening:
+        discard b.pollEvents()
+        if b.justLoaded:
+          b.justLoaded = false
+          a.mirrorOnto(b, BridgeSkip)
+        if b.loaded and b.restarts > a.rbAsked and not b.seeking or b.loadError.len > 0 or
+           now() - a.rbAskedAt > 3:
+          a.rbState = rbOff
+      elif (b.path != p.path or b.source != p.source or not b.loaded) and p.path != a.rbOpenFailed:
+        if b.loadError.len > 0 and b.path == p.path: a.rbOpenFailed = p.path
+        else: a.bridgeOpen(max(p.timePos, 0))
+    elif a.rb != nil and a.rb.render != nil and now() - a.rbUsedAt > ContextIdle:
+      # Its file and render context (video memory) let go once unused a while.
+      let b = a.rb
+      discard b.pollEvents()
+      if b.path.len > 0: b.close()
+      else: b.freeRender()
+    return
+  let b = a.bridgePlayer
+  if b == nil: return
+  a.rbUsedAt = now()
+  var key = p.path & "\n" & $a.lfSize & "\n" & $a.loopFramesMax
+  for name in LoopFrameLook: key.add "\n" & p.props.getOrDefault(name)
+  if key != a.rbKey or p.jumps != a.rbJumps or p != a.rbPlayer:
+    a.bridgeOff()
+    a.rbFirst = p.jumps != a.rbJumps or p != a.rbPlayer
+    a.rbKey = key
+    a.rbJumps = p.jumps
+    a.rbPlayer = p
+    a.rbSince = now()
+  let d = a.stepDur
+  let (pos, at, _) = p.timeSince
+  # mpv tells a frame's time as it hands it on, up to two frames before
+  # it's shown (one waits in its output's queue, one for the window to draw
+  # it: read back from a clip with each frame's number on it,
+  # tmp/rvs/numclip2.mkv), and standing still, those don't always come. So
+  # it's the picture itself that tells which frame the window last drew,
+  # found among the bridge's by a few of its pixels (pictureSig, read near
+  # the keyframe). Its picture stands still once none new has been drawn for
+  # BridgeLate frames after it was due (none waiting); the sound plays on
+  # from then (bridgeClock). Not found, it's taken as one frame before the
+  # time told, and only frames past that time are shown (the ones before it
+  # may still come): an older picture after a newer one would be worse than
+  # a frame skipped.
+  let moving = at > a.rbSince and a.rbPicAt > a.rbSince
+  let picFresh = a.rbPicSigAt >= a.rbPicAt and a.rbPicSig.len > 0
+  if a.rbStaleAt == 0:
+    if moving and not a.framePending and
+       float(mpv_get_time_ns(p.h) - a.rbPicDue) / 1e9 > BridgeLate * d / p.speed:
+      let m = if picFresh: a.bridgeMatch(a.rbPicSig) else: -1
+      let last = if m >= 0: a.rbFrames[m].t else: pos + d
+      a.rbStaleAt = now()
+      a.rbClock = (last, a.rbPicDue)
+      a.rbShowBelow = if m >= 0: last else: pos
+      let how = if m >= 0: "seen" else: "guessed"
+      a.turnTrace(&"bridge stale at {last:.3f} ({how}, told {pos:.3f}; keyframe {a.rbK:.3f}, {a.rbState}, {a.rbFrames.len} frames)")
+  else: discard a.bridgeCaughtUp()
+  let show = a.bridgeDue
+  if show != a.rbShow:
+    a.rbShow = show
+    a.lfDue = true
+  # Past the keyframe and caught up: the next one's frames.
+  if a.rbState in {rbReady, rbFinding, rbSeeking, rbStepping} and a.rbK >= 0 and
+     pos < a.rbK - d / 2 and a.rbStaleAt == 0:
+    if a.rbState != rbReady: a.turnTrace(&"bridge too slow for {a.rbK:.3f}")
+    a.bridgeDrop()
+    a.rbState = rbOff
+  if a.rbState == rbOff and a.rbStaleAt == 0 and pos > d and p.path != a.rbOpenFailed:
+    a.rbFillAt = now()
+    a.rbK = -1
+    if b.path != p.path or b.source != p.source or not b.loaded:
+      a.bridgeOpen(pos + 0.0005)
+    else:
+      a.rbState = rbFinding
+      a.bridgeSeek(pos + 0.0005, "keyframes")
+  if a.rbState == rbOpening and a.rbFrom < 0:
+    # Opened ahead of time, elsewhere: a keyframe seek from here once it's open.
+    discard b.pollEvents()
+    if b.justLoaded:
+      b.justLoaded = false
+      a.mirrorOnto(b, BridgeSkip)
+    if b.loaded and b.restarts > a.rbAsked and not b.seeking:
+      a.rbFillAt = now()
+      a.rbState = rbFinding
+      a.bridgeSeek(pos + 0.0005, "keyframes")
+  elif a.rbState == rbOpening:
+    discard b.pollEvents()
+    if b.justLoaded:
+      b.justLoaded = false
+      a.mirrorOnto(b, BridgeSkip)
+    # Opened at the spot (a keyframe seek, hr-seek off): as found by a seek.
+    if b.loaded and b.restarts > a.rbAsked and not b.seeking:
+      a.rbFrom = pos + 0.0005
+      a.rbAsked = b.restarts - 1
+      a.rbState = rbFinding
+  elif a.rbState in {rbFinding, rbSeeking, rbStepping}:
+    discard b.pollEvents()
+    if b.justLoaded:
+      b.justLoaded = false
+      a.mirrorOnto(b, BridgeSkip)
+  if a.rbState in {rbOpening, rbFinding, rbSeeking, rbStepping}:
+    if b.loadError.len > 0 or now() - a.rbAskedAt > 3:
+      a.turnTrace("bridge: player stuck")
+      a.bridgeDrop()
+      a.rbState = rbIdle
+  if a.rbState in {rbFinding, rbSeeking, rbStepping}:
+    a.mirrorOnto(b, BridgeSkip)  # subtitles chosen meanwhile
+  if a.rbState != rbOff and a.rbState != rbIdle:
+    a.dirtyUntil = max(a.dirtyUntil, now() + 0.05)  # GL passes to take and show them
+
 # --- synchronize: Properties window ---------------------------------------
 
 proc syncInstances(a: App): seq[SyncInstance] =
@@ -6766,7 +7260,7 @@ proc applyUiScale(a: App) =
     sk.uploadAtlas()
   for (w, size) in [(a.optWin, OptionsSize), (a.renWin, RenameSize), (a.cmdWin, CommandsSize),
                     (a.syncWin, SyncSize), (a.ytWin, YtdlpSize), (a.embWin, EmbedSize),
-                    (a.cfmWin, ConfirmSize),
+                    (a.cfmWin, a.cfmSize),
                     (a.tagWin, TagSize),
                     (a.upWin, UpdateSize), (a.eqWin, EqualizerSize)]:
     if w != nil and w.visible: a.showDialog(w, size)
@@ -6869,18 +7363,47 @@ proc closeEmbed(a: App) =
     a.embWin.visible = false
     a.window.activate()
 
+type ConfirmLine = tuple[s: string, x, y: float32, dot: bool]
+
+proc confirmLayout(ui: Ui, text, question: string, width: float32):
+    tuple[lines: seq[ConfirmLine], height: float32] =
+  ## The Yes/Cancel window's lines in UI units, wrapped to width: text's
+  ## paragraphs split by blank lines, a line starting with "- " a bullet
+  ## point (its wrapped lines hang under its text), the question last; and
+  ## the window height that shows them all above the buttons.
+  const LineH = 22'f32
+  const Bullet = 18'f32   # a bullet point's text indent, past its dot
+  var lines: seq[ConfirmLine]
+  var y = 14'f32
+  let paras = (text & "\n\n" & question).split("\n\n")
+  for i, para in paras:
+    if i > 0: y += 12
+    let items = para.split('\n')
+    for k, item in items:
+      let point = item.startsWith("- ")
+      if point and k > 0: y += 4  # bullet points a little apart
+      let x = if point: 16 + Bullet else: 16'f32
+      for j, line in ui.wrapText(if point: item[2 .. ^1] else: item, width - 16 - x, 100):
+        lines.add (line, x, y, point and j == 0)
+        y += LineH
+  (lines, y + 16 + 28 + 16)  # a gap, the buttons and the bottom margin
+
 proc showConfirm(a: App, title, text, question: string, yes: proc ()) =
   ## Asks question (text explaining it above) with Yes and Cancel; Yes runs
-  ## yes.
+  ## yes. text may hold paragraphs and "- " bullet points (confirmLayout);
+  ## the window is as tall as they need.
   a.menus.close()
   if a.overlay notin {ovNone, ovConfirm}: a.closeDialogs()
   if a.cfmWin == nil:
-    (a.cfmWin, a.cfmSk, a.cfmUi) = a.newDialogWindow(title, ConfirmSize)
+    (a.cfmWin, a.cfmSk, a.cfmUi) = a.newDialogWindow(title, ivec2(ConfirmWidth, 200))
   else: a.cfmWin.title = title
   (a.cfmText, a.cfmQuestion, a.cfmYes) = (text, question, yes)
-  if a.overlay != ovConfirm:
+  let h = confirmLayout(a.cfmUi, text, question, ConfirmWidth.float32).height
+  let size = ivec2(ConfirmWidth, ceil(h).int32)
+  if a.overlay != ovConfirm or size != a.cfmSize:
+    a.cfmSize = size
     a.cfmUi.focusId = ""
-    a.showDialog(a.cfmWin, ConfirmSize)
+    a.showDialog(a.cfmWin, size)
     a.overlay = ovConfirm
 
 proc closeConfirm(a: App) =
@@ -6900,11 +7423,13 @@ proc askReverseAlways(a: App) =
   ## The Play button menu's Always: keeping Enable reverse playback on from
   ## one session to the next costs all the time, so it asks first.
   a.showConfirm("Always Enable Reverse Playback",
-    "With reverse playback enabled, every file opens without read-ahead (mpv's " &
-      "demuxer thread and cache), and every video playing is also kept open a " &
-      "second time, decoded and paused, facing the other way. That takes more " &
-      "memory, video memory and CPU, and big or slow-to-read files can stutter.",
-    "Enable reverse playback at every start?",
+    "Reverse playback uses extra computer power the whole time it's on, " &
+      "even when nothing is playing backward:\n\n" &
+      "- More RAM and video memory: each video is loaded up to three " &
+      "times, so it can switch direction instantly and play backward smoothly.\n" &
+      "- More work for the CPU and GPU.\n" &
+      "- Very large files, or files on a slow drive or network, may stutter.",
+    "Turn on reverse playback every time the player starts?",
     proc () =
       a.cfg.reversePlaybackAlways = true
       a.cfg.reversePlayback = true
@@ -11925,9 +12450,20 @@ proc drawVideo(a: App, area: Rect, fb: IVec2) =
   a.player.target.ensureSize(tw, th)
   if resized or (flags and MpvRenderUpdateFrame) != 0:
     a.player.render.render(a.player.target)
+    if (flags and MpvRenderUpdateFrame) != 0:  # a picture of its own
+      a.rbPicAt = now()
+      a.rbPicDue = if a.frameDue != 0: a.frameDue else: mpv_get_time_ns(a.player.h)
+      # Near the keyframe the bridge is ready for, or standing still there:
+      # which frame it is (bridgeFrames).
+      if a.rbState == rbReady and a.rbFrames.len > 0 and a.player.backward and
+         (a.rbStaleAt > 0 or a.player.timePos < a.rbFrames[^1].t + 0.5):
+        a.rbPicSig = a.pictureSig(a.player.target)
+        a.rbPicSigAt = now()
+        discard a.bridgeCaughtUp()
   a.renderStandby()
   a.takeLoopFrames(tw, th)
   a.takeStepFrames(tw, th)
+  a.takeBridgeFrames(tw, th)
   a.renderOsdLayer(area)
   glEnable(GL_SCISSOR_TEST)
   glScissor(GLint(area.x), GLint(fb.y.float32 - area.y - area.h), GLsizei(area.w), GLsizei(area.h))
@@ -11944,7 +12480,17 @@ proc drawVideo(a: App, area: Rect, fb: IVec2) =
             elif a.sfShow >= 0 and a.sfShow < a.sfFrames.len and
                  a.sfFrames[a.sfShow].target.w == tw and a.sfFrames[a.sfShow].target.h == th:
               a.sfFrames[a.sfShow].target.tex
+            elif a.rbShow >= 0 and a.rbShow < a.rbFrames.len and
+                 a.rbFrames[a.rbShow].target.w == tw and a.rbFrames[a.rbShow].target.h == th:
+              a.rbFrames[a.rbShow].target.tex
             else: a.player.target.tex
+  if traceTurns and a.player.backward:
+    # Each frame shown playing backward: the player's own (0) or a bridge's (1).
+    let bridged = a.rbShow >= 0 and a.rbShow < a.rbFrames.len and tex == a.rbFrames[a.rbShow].target.tex
+    let (src, ft) = if bridged: (1, a.rbFrames[a.rbShow].t) else: (0, a.player.timePos)
+    if src != a.rbTraceSrc or ft != a.rbTraceT:
+      (a.rbTraceSrc, a.rbTraceT) = (src, ft)
+      a.turnTrace(&"shown {src} {ft:.4f}")
   a.videoCorners = transformedCorners(center + shift, quadSize, a.xf.rotation)
   a.quad.draw(tex, a.videoCorners, fb.vec2)
   if a.animOn: a.drawAnim(center, size, fb)
@@ -13788,13 +14334,36 @@ proc libraryKeys(a: App): bool =
 
 const LibNoBar = -2.0  ## libraryStatus's progress: no bar
 
+proc libTimeLeft(a: App, kind: int, progress: float): string =
+  ## The bottom line's estimate of the time left for the scan (kind 1) or the
+  ## tag reading (kind 2) at progress 0..1, from how fast it went since first
+  ## seen; "" for the first two seconds, or when how far it is isn't known.
+  ## Made again once a second, so it doesn't flicker.
+  let t = now()
+  if progress < 0 or progress >= 1 or kind != a.libEta.kind or progress < a.libEta.p0:
+    a.libEta = (kind: (if progress < 0 or progress >= 1: 0 else: kind), t0: t, p0: progress, at: 0.0, text: "")
+    return
+  if t - a.libEta.at < 1: return a.libEta.text
+  a.libEta.at = t
+  let (spent, done) = (t - a.libEta.t0, progress - a.libEta.p0)
+  a.libEta.text =
+    if spent < 2 or done < 0.005: ""
+    else:
+      let left = spent * (1 - progress) / done
+      if left < 60: $max(5, int(ceil(left / 5)) * 5) & " s left"
+      elif left < 3600: $int(ceil(left / 60)) & " min left"
+      else:
+        let m = int(ceil(left / 60))
+        $(m div 60) & " h " & $(m mod 60) & " min left"
+  a.libEta.text
+
 proc libraryStatus(a: App): tuple[text: string, color: ColorRGBX, progress: float] =
   ## The panel's bottom line: what the scan is doing, what doesn't answer;
   ## progress: how far the scan or the tag reading is, 0..1 (-1: not known,
   ## LibNoBar: neither under way).
   let ix = a.library
   let scanning = ix.scanning
-  let left = if scanning: 0 else: ix.unread
+  let left = if scanning or ix.stopped: 0 else: ix.unread
   result.progress = if scanning: ix.scanProgress elif left > 0: ix.readProgress else: LibNoBar
   for p, r in ix.roots:
     if r.state == rsStuck:
@@ -14458,11 +15027,36 @@ proc libraryPanel(a: App, r: Rect, under: bool) =
   let (text, col, progress) = a.libraryStatus
   var textW = st.w - 16
   a.libBarSliding = false
+  var barRight = st.x + st.w - 8
+  if progress != LibNoBar:
+    # Stops the scan (or the tag reading); Rescan starts it again.
+    let scanning = ix.scanning
+    let tipText = if scanning: "Stop scanning (Rescan starts it again)" else: "Stop reading tags (Rescan starts it again)"
+    if ui.iconButton("lib-cancel", rect(st.x + st.w - 23, st.y + 1, 20, 20), "close16", tipText):
+      ix.cancelScan()
+    barRight = st.x + st.w - 28
+    textW -= 20
+    let eta = a.libTimeLeft(if scanning: 1 else: 2, progress)
+    if progress >= 0 and st.w >= 220:
+      # How far it is, and the time left, beside the bar (dropped when narrow).
+      let pct = $int(clamp(progress, 0, 1) * 100) & "%"
+      let pw = ui.textSize("100%", FontSmall).x
+      let bw = clamp(st.w * 0.35, 60, 140) + 10  # the bar and its gap
+      let right = barRight - bw
+      ui.textIn(pct, rect(right - pw, st.y, pw, st.h), colTextDim, FontSmall, h = RightAlign)
+      textW -= pw + 8
+      if eta.len > 0:
+        let ew = ui.textSize(eta, FontSmall).x
+        if textW - ew - 8 - bw >= 90:
+          ui.textIn(eta, rect(right - pw - 8 - ew, st.y, ew, st.h), colTextDim, FontSmall)
+          textW -= ew + 8
+  else:
+    a.libEta.kind = 0
   if progress != LibNoBar and st.w >= 160:
     # How far the scan (or the tag reading) is, on the right; sliding back
     # and forth when that isn't known (a folder never walked before).
     let bw = clamp(st.w * 0.35, 60, 140)
-    let bar = rect(st.x + st.w - 8 - bw, st.y + st.h / 2 - 3, bw, 6)
+    let bar = rect(barRight - bw, st.y + st.h / 2 - 3, bw, 6)
     textW -= bw + 10
     ui.rect(bar, colTrack)
     if progress < 0:
@@ -14474,7 +15068,6 @@ proc libraryPanel(a: App, r: Rect, under: bool) =
       a.libBarDrawn = t
     else:
       ui.rect(rect(bar.x, bar.y, bw * clamp(progress, 0, 1), bar.h), colAccent)
-      ui.tip(rect(bar.x, st.y, bar.w, st.h), $int(clamp(progress, 0, 1) * 100) & "%")
   ui.textIn(ui.ellipsize(text, textW, FontSmall), rect(st.x + 8, st.y, textW, st.h), col, FontSmall)
 
 
@@ -15148,14 +15741,9 @@ proc renderConfirm(a: App, shot: string) =
   glClear(GL_COLOR_BUFFER_BIT)
   let W = ui.size.x
   let H = ui.size.y
-  var y = 14'f32
-  for line in ui.wrapText(a.cfmText, W - 32, 5):
-    ui.textIn(line, rect(16, y, W - 32, 22), colText)
-    y += 22
-  y += 8
-  for line in ui.wrapText(a.cfmQuestion, W - 32, 2):
-    ui.textIn(line, rect(16, y, W - 32, 22), colText)
-    y += 22
+  for (s, x, y, dot) in confirmLayout(ui, a.cfmText, a.cfmQuestion, W).lines:
+    if dot: ui.roundRect(rect(x - 12, y + 9, 5, 5), colText, 2.5)
+    ui.textIn(s, rect(x, y, W - 16 - x, 22), colText)
   let bw = 100'f32
   let br = rect(W - 16 - bw, H - 44, bw, 28)
   let yes = ui.textButton("cfm-yes", br, "Yes", primary = true)
@@ -17099,6 +17687,9 @@ proc main() =
   a.media = newMediaControls(a.window)
   if c.compactMode: a.window.setDecorated(false)
   when defined(windows): setDialogOwner(a.window.getHWND)
+  else:
+    let window = a.window
+    setDialogOwner(window.windowId, proc (pid: int): bool = window.adoptDialog(pid))
   a.window.disableVsync()
   if c.rememberWindowPos and c.windowW > 0:
     # Only onto a monitor that still exists.
@@ -17273,6 +17864,7 @@ proc main() =
     a.turnTick()
     a.loopFrames()
     a.stepFrames()
+    a.bridgeFrames()
     a.releaseStandby()
     a.pollProbe()
     a.pollMediaKey()
@@ -17465,7 +18057,7 @@ proc main() =
   if a.preview != nil:
     if a.preview.render != nil: mpv_render_context_free(a.preview.render)
     mpv_terminate_destroy(a.preview.h)
-  for p in [a.player, a.standby]:
+  for p in [a.player, a.standby, a.rb]:
     if p != nil:
       if p.render != nil: mpv_render_context_free(p.render)
       mpv_terminate_destroy(p.h)

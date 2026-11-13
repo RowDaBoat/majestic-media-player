@@ -11,6 +11,7 @@ type
     filters: seq[(string, seq[string])]
     paths: seq[string]         ## written by the thread before done is set
     done: Atomic[int]          ## int: see player.nim on MSVC atomics
+    tid: Atomic[int]           ## the dialog thread's id, once it runs
 
   Dialog* = ref object
     job: ptr DialogJob
@@ -166,6 +167,7 @@ proc folderDialog(job: ptr DialogJob) =
   discard dlg.vtbl.release(dlg)
 
 proc runDialog(job: ptr DialogJob) {.thread.} =
+  job.tid.store(GetCurrentThreadId().int)
   let com = CoInitializeEx(nil, COINIT_APARTMENTTHREADED)
   # The job is ours alone until done is set; COM's function pointers just
   # aren't marked gcsafe.
@@ -191,12 +193,29 @@ proc startDialog*(kind: DialogKind, purpose, title, startPath: string,
   result = Dialog(purpose: purpose, job: job)
   createThread(result.thread, runDialog, job)
 
+proc followOnTop(h: HWND, topmost: LPARAM): BOOL {.stdcall.} =
+  ## One of the dialog thread's windows: made topmost while the player is.
+  ## Being owned by the player isn't enough: every topmost window ranks above
+  ## every other, so a non-topmost dialog falls behind an On Top player.
+  result = 1  # go on with the next window
+  if IsWindowVisible(h) == 0: return  # COM's hidden windows
+  let want = topmost != 0
+  if ((GetWindowLongW(h, GWL_EXSTYLE) and WS_EX_TOPMOST) != 0) == want: return
+  # Async: the dialog's thread applies it, never waiting on this one.
+  discard SetWindowPos(h, if want: HWND_TOPMOST else: HWND_NOTOPMOST, 0, 0, 0, 0,
+    SWP_NOMOVE or SWP_NOSIZE or SWP_NOACTIVATE or SWP_ASYNCWINDOWPOS)
+
 proc poll*(d: Dialog, done: var bool): seq[string] =
   ## Returns the selected paths once the dialog has closed (empty if cancelled).
+  ## Until then, keeps the dialog (and its own prompts) in front of the player.
   done = true
   if d == nil or d.job == nil: return
   if d.job.done.load == 0:
     done = false
+    let tid = d.job.tid.load
+    if tid != 0 and dialogOwner != 0:
+      let topmost = (GetWindowLongW(dialogOwner, GWL_EXSTYLE) and WS_EX_TOPMOST) != 0
+      discard EnumThreadWindows(tid.int32, followOnTop, LPARAM(topmost))
     return
   joinThread(d.thread)
   result = move d.job.paths

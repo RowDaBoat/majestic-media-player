@@ -2,8 +2,12 @@
 ## desktop's own, through the xdg-desktop-portal's FileChooser (any desktop
 ## with a portal: Cinnamon, XFCE, ... without either program). Included by
 ## dialogs.nim.
+##
+## Each is made a dialog of the player's (X11) window, so the window manager
+## puts it in front of the player, even an On Top one, and focuses it. Left
+## alone, KWin's focus-stealing prevention opened them behind the player.
 
-import std/[osproc, streams, strutils, uri]
+import std/[osproc, streams, strutils, strtabs, uri]
 import portal
 
 type
@@ -11,6 +15,26 @@ type
     process: Process
     request: string          # the portal's request path, when it's the portal's
     purpose*: string         # caller-defined tag, e.g. "open", "subtitle"
+    adopt: bool              # its window is still to be made the player's dialog
+
+var
+  dialogOwner: uint64        ## the player window's X11 id, 0 = none
+  adoptDialog: proc (pid: int): bool  ## makes pid's window a dialog of the player
+
+proc setDialogOwner*(xid: uint64, adopt: proc (pid: int): bool) =
+  ## The window dialogs center over and stay in front of. adopt does that for
+  ## a program that can't be told (zenity 4): true once pid's window was found.
+  dialogOwner = xid
+  adoptDialog = adopt
+
+proc x11Env(): StringTableRef =
+  ## The environment with the dialog program forced onto X11 (XWayland under
+  ## Wayland), where it can be a dialog of the player's X11 window.
+  result = newStringTable(modeCaseSensitive)
+  for k, v in envPairs(): result[k] = v
+  if dialogOwner != 0 and getEnv("DISPLAY").len > 0:
+    result["QT_QPA_PLATFORM"] = "xcb"
+    result["GDK_BACKEND"] = "x11"
 
 proc which(exe: string): bool = findExe(exe).len > 0
 
@@ -28,7 +52,9 @@ proc portalDialog(kind: DialogKind, title, startPath: string,
     else: (startPath.parentDir, startPath.extractFilename)
   request("FileChooser", if kind == dkSaveFile: "SaveFile" else: "OpenFile",
     proc (it: ptr Iter) =
-      appendString(it, "")  # no parent window handle
+      # The parent window's handle: "x11:" and its id in hex.
+      appendString(it, if dialogOwner == 0: "" else:
+        "x11:" & dialogOwner.toHex.toLowerAscii.strip(trailing = false, chars = {'0'}))
       appendString(it, title)
       var opts: Iter
       discard iterOpen(it, TypeArray, "{sv}", addr opts)
@@ -96,6 +122,7 @@ proc startDialog*(kind: DialogKind, purpose, title, startPath: string,
   if which("kdialog"):
     cmd = "kdialog"
     args = @["--title", title]
+    if dialogOwner != 0: args.add ["--attach", $dialogOwner]
     var filter = ""
     for (name, exts) in filters:
       filter.add name & " (" & globs(exts) & ")|"
@@ -127,8 +154,9 @@ proc startDialog*(kind: DialogKind, purpose, title, startPath: string,
       stderr.writeLine "No file dialog available: install kdialog or zenity."
       return nil
     return Dialog(purpose: purpose, request: request)
-  result = Dialog(purpose: purpose,
-    process: startProcess(cmd, args = args, options = {poUsePath}))
+  # zenity 4's --attach does nothing: its window is adopted once it shows.
+  result = Dialog(purpose: purpose, adopt: cmd == "zenity" and adoptDialog != nil,
+    process: startProcess(cmd, args = args, env = x11Env(), options = {poUsePath}))
 
 proc poll*(d: Dialog, done: var bool): seq[string] =
   ## Returns the selected paths once the dialog has closed (empty if cancelled).
@@ -145,6 +173,7 @@ proc poll*(d: Dialog, done: var bool): seq[string] =
     done = true
     return
   if d.process.peekExitCode() == -1:
+    if d.adopt and adoptDialog(d.process.processID): d.adopt = false
     return
   done = true
   let output = d.process.outputStream.readAll()

@@ -192,18 +192,21 @@ proc disableVsync*(window: Window) =
   ## is asked for no vsync; force 0 so swaps never block.
   disableVsync(window.xid)
 
-proc sendWmMessage(window: Window, msgType: string, data: openArray[clong]) =
+proc sendWmMessage(w: XID, msgType: string, data: openArray[clong]) =
   let d = glXGetCurrentDisplay()
   if d == nil: return
   var ev: XEventBuf
   ev.msg.kind = ClientMessage
-  ev.msg.window = window.xid
+  ev.msg.window = w
   ev.msg.messageType = XInternAtom(d, msgType.cstring, 0)
   ev.msg.format = 32
   for i, v in data: ev.msg.data[i] = v
   discard XSendEvent(d, XDefaultRootWindow(d), 0,
     SubstructureNotifyMask or SubstructureRedirectMask, ev.addr)
   discard XFlush(d)
+
+proc sendWmMessage(window: Window, msgType: string, data: openArray[clong]) =
+  sendWmMessage(window.xid, msgType, data)
 
 proc startWindowDrag*(window: Window) =
   ## Hands the pointer to the window manager to move the window
@@ -330,6 +333,46 @@ proc setDialogFor*(window, parent: Window, modal = true) =
   var state = XInternAtom(d, "_NET_WM_STATE_MODAL", 0).clong
   discard XChangeProperty(d, window.xid, XInternAtom(d, "_NET_WM_STATE", 0),
     XaAtom, 32, 0, state.addr, 1)
+
+proc windowId*(window: Window): uint64 =
+  ## The X11 window id, for other programs' dialogs to name as their parent.
+  window.xid.uint64
+
+proc windowOfPid(d: XDisplay, pid: int): XID =
+  ## A window the WM manages (_NET_CLIENT_LIST) whose _NET_WM_PID is pid, or 0.
+  let root = XDefaultRootWindow(d)
+  var kind: Atom
+  var format: cint
+  var n, after: culong
+  var data: pointer
+  if XGetWindowProperty(d, root, XInternAtom(d, "_NET_CLIENT_LIST", 0), 0, 4096, 0,
+      0, kind.addr, format.addr, n.addr, after.addr, data.addr) != 0 or data == nil:
+    return
+  let wins = cast[ptr UncheckedArray[culong]](data)  # format 32 comes as longs
+  let pidAtom = XInternAtom(d, "_NET_WM_PID", 0)
+  for i in 0 ..< (if format == 32: n.int else: 0):
+    var p: pointer
+    var pn: culong
+    if XGetWindowProperty(d, wins[i], pidAtom, 0, 1, 0, 0, kind.addr, format.addr,
+        pn.addr, after.addr, p.addr) == 0 and p != nil:
+      let found = pn >= 1 and cast[ptr culong](p)[].int == pid
+      discard XFree(p)
+      if found:
+        result = wins[i]
+        break
+  discard XFree(data)
+
+proc adoptDialog*(window: Window, pid: int): bool =
+  ## Makes the shown window of process pid (another program's dialog) a dialog
+  ## of window, raised and focused: the WM keeps it in front, even of an On
+  ## Top window. False while pid has no window yet.
+  let d = glXGetCurrentDisplay()
+  if d == nil: return true  # nothing to wait for
+  let w = windowOfPid(d, pid)
+  if w == 0: return false
+  discard XSetTransientForHint(d, w, window.xid)
+  sendWmMessage(w, "_NET_ACTIVE_WINDOW", [2.clong, 0, 0])  # 2: honour it
+  true
 
 proc XChangeWindowAttributes(d: XDisplay, w: XID, mask: culong, attrs: ptr XSetWindowAttributes): cint {.importc, cdecl.}
 

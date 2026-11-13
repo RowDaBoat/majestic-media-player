@@ -51,6 +51,8 @@ proc GetForegroundWindow*(): HWND {.stdcall, dynlib: "user32", importc.}
 proc GetWindowThreadProcessId*(hWnd: HWND, pid: ptr int32): int32 {.stdcall, dynlib: "user32", importc.}
 proc AttachThreadInput*(idAttach, idAttachTo: int32, fAttach: BOOL): BOOL {.stdcall, dynlib: "user32", importc.}
 proc GetCurrentThreadId*(): int32 {.stdcall, dynlib: "kernel32", importc.}
+proc EnumThreadWindows*(tid: int32, fn: proc (h: HWND, l: LPARAM): BOOL {.stdcall.},
+  l: LPARAM): BOOL {.stdcall, dynlib: "user32", importc.}
 proc MonitorFromPoint*(pt: POINT, dwFlags: int32): HMONITOR {.stdcall, dynlib: "user32", importc.}
 proc MoveWindow*(hWnd: HWND, x, y, w, h: int32, repaint: BOOL): BOOL {.stdcall, dynlib: "user32", importc.}
 proc AdjustWindowRectEx*(r: ptr RECT, style: LONG, menu: BOOL, exStyle: LONG): BOOL {.stdcall, dynlib: "user32", importc.}

@@ -101,6 +101,7 @@ type
     justLoaded*: bool         ## set on FILE_LOADED, cleared by the app
     eofHandled*: bool
     props*: Table[string, string]  ## MirroredProps as they are now
+    info*: Table[string, string]   ## InfoProps as they are now
     noVideo*: bool            ## Video Track > Always Disable: each file opens
                               ## without its video (a cover still shows)
     fileCover*: bool = true   ## Show Front Cover (file): a picture named after
@@ -195,6 +196,11 @@ const
   EqFreqs* = [31.0, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000]
     ## The equalizer's bands, Hz: a peaking filter an octave wide on each
   MirrorBase = 1000           ## observation ids of MirroredProps
+  InfoProps* = ["media-title", "metadata/by-key/Artist", "metadata/by-key/Album"]
+    ## the file's details, kept in info: read every so often for the system's
+    ## media controls, they'd wait out a busy player (one playing backward
+    ## stops for a keyframe's span of decoding)
+  InfoBase = 2000             ## and theirs
   ExpandReply = 77'u64        ## reply id of expandText
   ShotReply = 80'u64          ## takeShot's
   DumpReply = 1000'u64        ## dumpFrom's, plus its count
@@ -249,6 +255,8 @@ proc observe(h: MpvHandle) =
     discard mpv_observe_property(h, p.uint64, name.cstring, fmt)
   for i, name in MirroredProps:
     discard mpv_observe_property(h, uint64(MirrorBase + i), name.cstring, fmtString)
+  for i, name in InfoProps:
+    discard mpv_observe_property(h, uint64(InfoBase + i), name.cstring, fmtString)
 
 when defined(windows):
   type MemoryStatusEx = object
@@ -269,8 +277,10 @@ proc totalMemory(): float =
     except CatchableError: discard
     0.0
 
-proc newPlayer*(volume: float, muted, osd: bool): Player =
-  result = Player(volume: volume, muted: muted)
+proc newPlayer*(volume: float, muted, osd: bool, pictureOnly = false): Player =
+  ## pictureOnly: a hidden player for frames alone (the keyframe bridge):
+  ## no sound, no scripts (quicker to set up), paused, stepping at speed.
+  result = Player(volume: volume, muted: muted, hidden: pictureOnly)
   let h = mpv_create()
   if h == nil: raise newException(MpvError, "mpv_create failed")
   result.h = h
@@ -329,6 +339,10 @@ proc newPlayer*(volume: float, muted, osd: bool): Player =
   # video's link streams that video alone.
   h.setOpt("ytdl-raw-options", "sub-langs=%" & $YtdlSubLangs.len & "%" &
     YtdlSubLangs & ",no-playlist=")  # %n%: n bytes taken as they are
+  if pictureOnly:
+    for (k, v) in [("load-scripts", "no"), ("aid", "no"), ("osd-level", "0"), ("pause", "yes"),
+                   ("speed", "100"), ("sub-auto", "no"), ("audio-file-auto", "no")]:
+      h.setOpt(k, v)
   check mpv_initialize(h), "mpv_initialize"
   modstream.register(h)  # module streams
   midistream.register(h)  # MIDI files, through FluidSynth
@@ -596,17 +610,34 @@ proc posNow*(p: Player): float =
   let d = min((epochTime() - p.timeAt) * p.speed, p.frameDur)
   if p.backward: p.timePos - d else: p.timePos + d
 
-proc setBackStep(p: Player) =
+proc setBackStep*(p: Player) =
   ## Run out of what it has read playing backward, mpv goes back this far and
   ## reads up to there before playing on (60 s by default): from a link,
-  ## ~4 MB, a few tenths of a second's wait. (A file reads fast enough.)
+  ## ~4 MB, a few tenths of a second's wait. A file reads fast enough, but
+  ## all it reads waits in mpv's packet queue (150 MiB), and 60 s of a file
+  ## over ~20 Mbps (a screen recording) fills it: backward playback stands
+  ## still for good ("Backward playback is likely stuck/broken now"). And
+  ## the sound goes back a few packets at a time, each time reading that far
+  ## again (threadless, in mpv's core: the picture now and then stood still
+  ## mid-span, tmp/rvs). So ~40 MB of a file, by its size over its length
+  ## (the standby has no bitrate measured yet), 15 s at most (keyframes
+  ## further apart take two goes); 10 s while that's unknown.
   var step = 60.0
   if p.path.contains("://"):
     let rate = p.h.getFloat("video-bitrate", 0) + p.h.getFloat("audio-bitrate", 0)  # bits/s
     step = if rate > 0: clamp(32e6 / rate, 5, 60) else: 10.0
+  elif p.path.len > 0:
+    let size = try: getFileSize(p.path).float except CatchableError: 0.0
+    let dur = if p.fullDuration > 0: p.fullDuration else: p.duration
+    step = if size > 0 and dur > 0: clamp(40e6 * dur / size, 5, 15) else: 10.0
   if step != p.backStep:
     p.backStep = step
     p.h.setProp("demuxer-backward-playback-step", step)
+
+proc timeSince*(p: Player): tuple[pos, at, frame: float] =
+  ## The time last told by mpv (the shown frame's), when it came (epochTime)
+  ## and the last step it made playing (a frame's time).
+  (p.timePos, p.timeAt, p.frameDur)
 
 proc setBackward*(p: Player, on: bool) =
   ## Which way playback goes; mpv turns around where it is (a seek).
@@ -997,6 +1028,10 @@ proc pollEvents*(p: Player): bool =
         let e = cast[ptr MpvEventProperty](ev.data)
         p.props[MirroredProps[id - MirrorBase]] =
           if e.data == nil or e.format != fmtString: "" else: $cast[ptr cstring](e.data)[]
+      elif id in InfoBase ..< InfoBase + InfoProps.len:
+        let e = cast[ptr MpvEventProperty](ev.data)
+        p.info[InfoProps[id - InfoBase]] =
+          if e.data == nil or e.format != fmtString: "" else: $cast[ptr cstring](e.data)[]
     of evFileLoaded:
       # Read here rather than in load: the previous file may still show a
       # frame or two until mpv switches over.
@@ -1335,7 +1370,7 @@ proc seek*(p: Player, t: float, exact = true) =
   p.h.commandAsync("seek", formatFloat(max(t, 0), ffDecimal, 3), "absolute",
     if exact: "exact" else: "keyframes")
 
-proc turnAt*(p: Player, back: bool, at: float, fadeIn = NaN, d = 0.02) =
+proc turnAt*(p: Player, back: bool, at: float, fadeIn = NaN, d = 0.02, soft = false) =
   ## Turns around (setBackward) to play on from `at`, sought exactly, its
   ## sound faded in from there (fadeIn and d as setTurnFades) or not. In
   ## one command list: mpv makes its own seek for a turn (to its time, ~60 ms
@@ -1343,14 +1378,18 @@ proc turnAt*(p: Player, back: bool, at: float, fadeIn = NaN, d = 0.02) =
   ## seek asked for after it; it then seeks again, a few tenths of a second
   ## more with a picture, and now and then starting a packet further on (58
   ## ms of FLAC). Waits for mpv to take it (no longer than the other calls
-  ## turns make: audio-pts).
+  ## turns make: audio-pts). soft: hardware decoding goes off in the same
+  ## list (a video going backward): a hardware decoder can't hold a keyframe's
+  ## span of frames ("No decoder surfaces left"), and failing over to software
+  ## on its own stops the picture for a few tenths of a second.
   if not p.loaded or p.pastPart(at): return
   if back: p.setBackStep()
   p.backward = back
   p.setTurnFades(fadeIn = fadeIn, d = d)  # in before the seek makes the filters anew
   p.noteSeek(at)
   inc p.jumps
-  p.h.commandStr("set play-direction " & (if back: "backward" else: "forward") &
+  p.h.commandStr((if soft: "set hwdec no; " else: "") &
+    "set play-direction " & (if back: "backward" else: "forward") &
     "; seek " & formatFloat(max(at, 0), ffDecimal, 6) & " absolute exact")
 
 proc landOn*(p: Player, t: float) =
