@@ -17,7 +17,7 @@
 
 import std/[os, strutils, tables, sets, locks, times, algorithm, json, unicode, math, hashes, sequtils]
 import jsony
-import config, mpv
+import config, mpv, wsaud, m2c
 
 const
   IndexVersion = 1
@@ -40,6 +40,7 @@ type
     size*: int64
     mtime*: int64           ## seconds since 1970
     ctime*: int64           ## when the file was created (its birth time), seconds since 1970; 0: unknown
+    sideTime*: int64        ## when its .m2c (m2c) was written, seconds since 1970; 0: none
     probed*: bool           ## its tags were read (or reading them failed)
     duration*: float        ## seconds
     width*, height*: int    ## the first real video track's; 0 without one
@@ -74,7 +75,7 @@ type
 
   Found = object
     path: string
-    size, mtime, ctime: int64
+    size, mtime, ctime, sideTime: int64
 
   Event = object
     kind: EvKind
@@ -141,7 +142,9 @@ type
     ## A search: tags separated by commas.
     terms: seq[Term]
     formats: seq[string]    ## format: tags (any of them)
-    ins*, excludes*: seq[string]  ## in: / exclude: values, lower case
+    within*, excludes*: seq[string]  ## within: / exclude: values (libraries), lower case
+    folders*: seq[string]   ## in: values (folders, any of them): folderValue, or an
+                            ## absolute path as typed (normPath)
     hidden*: bool           ## hidden: hidden libraries searched too
     empty*: bool            ## nothing that narrows the search
 
@@ -164,7 +167,9 @@ type
     dirty: bool             ## changed since saved
     savedAt: float
     probeFails: HashSet[string]  ## timed out this session: not tried again
+    stale: HashSet[string]  ## queued when its tags changed: that reading's are the old ones
     hay: seq[string]        ## per file, what free text is looked for in, lower case
+    dirs: seq[string]       ## per file, its folders for in: tags (dirsOf)
     hayKey: (int, int, int) ## the gen, dropGen and metaGen it was made at
     feedAt: float           ## when to look through the index for files to read again
     unreadCount: int        ## files whose tags are to be read, as last counted
@@ -305,7 +310,7 @@ proc walk(i: int, job: Job) =
     done.isFile = true
     post Event(kind: evFound, root: job.path, gen: job.gen,
       files: @[Found(path: job.path, size: info.size, mtime: info.lastWriteTime.toUnix,
-                     ctime: birthTime(job.path, info))])
+                     ctime: birthTime(job.path, info), sideTime: sideTime(job.path))])
     post done
     return
   if not job.walk:
@@ -331,6 +336,8 @@ proc walk(i: int, job: Job) =
       post done
       return
     let dir = stack.pop()
+    # A folder with .m2c files (m2c): its files' times too, for their tags.
+    let sides = dirExists(dir / SideDir)
     try:
       for kind, path in walkDir(dir):
         inc count
@@ -354,7 +361,8 @@ proc walk(i: int, job: Job) =
           try:
             let fi = getFileInfo(path)
             batch.add Found(path: path, size: fi.size, mtime: fi.lastWriteTime.toUnix,
-                            ctime: birthTime(path, fi))
+                            ctime: birthTime(path, fi),
+                            sideTime: if sides: sideTime(path) else: 0)
           except OSError: discard
         if batch.len >= BatchSize or (batch.len > 0 and epochTime() - lastPost > 0.25):
           post Event(kind: evFound, root: job.path, gen: job.gen, files: move batch)
@@ -449,6 +457,7 @@ proc probeFile(i: int, h: MpvHandle, path: string): (LibFile, bool) =
         discard mpv_hook_continue(h, id)  # a file given up on before
         continue
       f.duration = h.getFloat("duration")
+      if path.isAudFile and path.audLength > 0: f.duration = path.audLength  # FFmpeg guesses long
       let tracks = h.getNode("track-list")
       var abr = 0.0
       if tracks.kind == JArray:
@@ -462,11 +471,14 @@ proc probeFile(i: int, h: MpvHandle, path: string): (LibFile, bool) =
       let size = h.getInt("file-size", -1)
       let whole = if size > 0 and f.duration > 0: size.float * 8 / f.duration else: 0.0
       f.bitrate = if f.width > 0 or abr <= 0: whole else: abr
-      f.readTags(h.getNode("metadata"))
+      f.readTags(h.getNode("metadata").overlay(readSide(path)))  # and its .m2c's
       discard mpv_hook_continue(h, id)
       return (f, false)
     of evEndFile:
-      if cast[ptr MpvEventEndFile](ev.data).reason == efError: return (f, false)
+      if cast[ptr MpvEventEndFile](ev.data).reason == efError:
+        # mpv can't open it (a MIDI file, here): a .m2c's tags all the same.
+        f.readTags(newJObject().overlay(readSide(path)))
+        return (f, false)
     of evShutdown: return (f, false)
     else: discard
 
@@ -697,9 +709,11 @@ proc addFound(ix: LibIndex, f: Found, gen: int) =
   let i = ix.byPath.getOrDefault(f.path, -1)
   if i < 0:
     ix.byPath[f.path] = ix.files.len
-    var g = LibFile(path: f.path, size: f.size, mtime: f.mtime, ctime: f.ctime, seen: gen)
+    var g = LibFile(path: f.path, size: f.size, mtime: f.mtime, ctime: f.ctime,
+                    sideTime: f.sideTime, seen: gen)
     var old: LibFile
-    if ix.attic.pop(f.path, old) and old.size == f.size and old.mtime == f.mtime:
+    if ix.attic.pop(f.path, old) and old.size == f.size and old.mtime == f.mtime and
+       old.sideTime == f.sideTime:
       g = old
       g.seen = gen
       g.ctime = f.ctime
@@ -708,8 +722,9 @@ proc addFound(ix: LibIndex, f: Found, gen: int) =
   else:
     let e = ix.files[i].addr
     e.seen = gen
-    if e.size != f.size or e.mtime != f.mtime:
-      e[] = LibFile(path: f.path, size: f.size, mtime: f.mtime, ctime: f.ctime, seen: gen)
+    if e.size != f.size or e.mtime != f.mtime or e.sideTime != f.sideTime:
+      e[] = LibFile(path: f.path, size: f.size, mtime: f.mtime, ctime: f.ctime,
+                    sideTime: f.sideTime, seen: gen)
       ix.queued.excl f.path
       ix.dirty = true
     elif e.ctime != f.ctime:  # an index saved before creation times were kept, or a file put back
@@ -761,7 +776,8 @@ proc applyLoaded(ix: LibIndex, files: seq[LibFile]) =
       ix.files.add g
     else:
       let e = ix.files[i].addr
-      if not e.probed and f.probed and e.size == f.size and e.mtime == f.mtime:
+      if not e.probed and f.probed and e.size == f.size and e.mtime == f.mtime and
+         e.sideTime == f.sideTime:
         let seen = e.seen
         e[] = f
         e.seen = seen
@@ -781,6 +797,7 @@ proc rootOf(ix: LibIndex, path: string): string =
 proc applyProbed(ix: LibIndex, e: Event) =
   let f = e.probed
   ix.queued.excl f.path
+  if not ix.stale.missingOrExcl(f.path): return  # from before its tags changed
   if e.timedOut:
     ix.probeFails.incl f.path
     let root = ix.rootOf(f.path)
@@ -794,6 +811,21 @@ proc applyProbed(ix: LibIndex, e: Event) =
   ix.dirty = true
   inc ix.metaGen
   inc ix.readDone
+
+proc reprobe*(ix: LibIndex, path: string, sideTime: int64) =
+  ## path's tags changed (Properties saved them, into it or its .m2c, which
+  ## the caller says when was written): they're read again soon, as they
+  ## are now. Touches no file: the next walk notes the file's own new size
+  ## and time.
+  let i = ix.byPath.getOrDefault(path, -1)
+  if i < 0: return
+  let f = ix.files[i].addr
+  f.probed = false
+  f.sideTime = sideTime
+  if path in ix.queued: ix.stale.incl path  # read again once that reading is in
+  ix.probeFails.excl path
+  ix.feedAt = 0
+  ix.dirty = true
 
 proc wantsProbe(ix: LibIndex, i: int): bool =
   let f = ix.files[i].addr
@@ -1114,13 +1146,24 @@ proc parseCreated(s: string, t: var Term): bool =
     else: t.lo = t.hi             # up to its end
   true
 
+proc folderValue*(s: string): string =
+  ## An in: tag's folder as compared: lower case, its names split at either
+  ## slash, trimmed, joined by "/", commas left out (a tag can't hold one).
+  var parts: seq[string]
+  for p in unicode.toLower(s).replace('\\', '/').split('/'):
+    let n = p.replace(",", "").strip
+    if n.len > 0: parts.add n
+  parts.join("/")
+
 proc parseQuery*(s: string): Query =
   ## Tags are what's between commas; quotes are characters like any other.
-  ## `in:`/`exclude:` pick libraries, `hidden` searches hidden ones too,
+  ## `within:`/`exclude:` pick libraries, `in:` folders (folderValue),
+  ## `hidden` searches hidden libraries too,
   ## `size`/`bitrate`/`dimension` `exactly`/`biggerthan`/`smallerthan:`
   ## compare, `dc:` a creation date (`parseCreated`), `format:` takes a file type, `filename contains:` part of a
   ## name, any other `field:` a tag holding the text; the rest is looked for
-  ## in the name, title, artist, album and folders.
+  ## at the start of a word (hasWordStart) in the name, title, artist, album
+  ## and folders.
   result.empty = true
   for raw in s.split(','):
     let tag = raw.strip
@@ -1138,8 +1181,12 @@ proc parseQuery*(s: string): Query =
     if val.len == 0: continue  # still being typed
     let lval = unicode.toLower(val)
     case key
+    of "within":
+      result.within.add lval
+      continue
     of "in":
-      result.ins.add lval
+      result.folders.add(if val.isAbsolute: val.normPath else: folderValue(val))
+      result.empty = false
       continue
     of "exclude":
       result.excludes.add lval
@@ -1188,7 +1235,7 @@ proc parseQuery*(s: string): Query =
     result.empty = false
 
 proc libraryNamed*(libs: seq[Library], value: string, hidden: bool): seq[int] =
-  ## The libraries an in:/exclude: value names: the one of that name (any
+  ## The libraries a within:/exclude: value names: the one of that name (any
   ## case), else every one whose name begins with it.
   for i, l in libs:
     if unicode.toLower(l.name) == value: return @[i]
@@ -1200,40 +1247,79 @@ proc tagKey(tag: string): string =
   let colon = tag.find(':')
   if colon >= 0: tag[0 ..< colon].squash else: ""
 
-proc withInLibrary*(search, name: string): string =
-  ## The search with its in: tags replaced by in:name (none for "", All),
-  ## its other tags kept in their order; a lone in: tag gets a comma after
-  ## it, so what's typed next is a tag of its own.
-  var tags: seq[string]
+proc searchTags(search: string): seq[string] =
+  ## The search's tags, trimmed, empty ones left out.
   for raw in search.split(','):
     let tag = raw.strip
-    if tag.len > 0 and tag.tagKey != "in": tags.add tag
-  if name.len == 0: return tags.join(", ")
-  if tags.len == 0: return "in:" & name & ", "
-  "in:" & name & ", " & tags.join(", ")
+    if tag.len > 0: result.add tag
+
+proc withScope*(search, lib: string, folder = ""): string =
+  ## The search once a library (lib, "" for All) or one of its folders
+  ## (folder: its in: text, folderTag) is picked in the libraries' column:
+  ## the first within: tag naming lib and the first in: tag naming folder,
+  ## each added in front when there's none (in: after within:). A library
+  ## picked takes the in: tags out, All the within: ones too. The other
+  ## tags keep their order; when no other is left, a comma ends the search,
+  ## so what's typed next is a tag of its own.
+  var tags = searchTags(search)
+  if lib.len == 0 or folder.len == 0: tags.keepItIf(it.tagKey != "in")
+  if lib.len == 0:
+    tags.keepItIf(it.tagKey != "within")
+    return tags.join(", ")
+  var w = -1
+  for i, t in tags:
+    if t.tagKey == "within":
+      w = i
+      break
+  if w >= 0: tags[w] = "within:" & lib
+  else:
+    tags.insert("within:" & lib, 0)
+    w = 0
+  if folder.len > 0:
+    var f = -1
+    for i, t in tags:
+      if t.tagKey == "in":
+        f = i
+        break
+    if f >= 0: tags[f] = "in:" & folder
+    else: tags.insert("in:" & folder, w + 1)
+  result = tags.join(", ")
+  if tags.allIt(it.tagKey in ["within", "in"]): result.add ", "
+
+proc withinFromIn*(search: string, libs: seq[Library]): string =
+  ## A search from before in: named folders: its in: tags naming a library
+  ## (as libraryNamed reads them) made within: tags, the rest as it was.
+  var parts = search.split(',')
+  for p in parts.mitems:
+    let tag = p.strip
+    if tag.tagKey != "in": continue
+    let v = unicode.toLower(tag[tag.find(':') + 1 .. ^1].strip)
+    if v.len > 0 and libraryNamed(libs, v, true).len > 0:
+      p = (if p.len > 0 and p[0] == ' ': " " else: "") & "within:" & tag[tag.find(':') + 1 .. ^1].strip
+  parts.join(",")
 
 proc withoutHidden*(search: string, libs: seq[Library]): string =
-  ## The search without its `hidden` tag and its in: tags naming a hidden
-  ## library, the other tags kept in their order.
+  ## The search without its `hidden` tag and its within: tags naming a
+  ## hidden library, the other tags kept in their order.
   var tags: seq[string]
   for raw in search.split(','):
     let tag = raw.strip
     if tag.len == 0 or tag.squash == "hidden": continue
-    if tag.tagKey == "in":
+    if tag.tagKey == "within":
       let v = unicode.toLower(tag[tag.find(':') + 1 .. ^1].strip)
       if libs.anyIt(it.hidden and unicode.toLower(it.name) == v): continue
     tags.add tag
   tags.join(", ")
 
 proc renamedInSearch*(search, old, name: string): string =
-  ## The search with its in: and exclude: tags naming the library old (any
+  ## The search with its within: and exclude: tags naming the library old (any
   ## case) naming it name instead.
   let lold = unicode.toLower(old.strip)
   var parts = search.split(',')
   for p in parts.mitems:
     let tag = p.strip
     let key = tag.tagKey
-    if key in ["in", "exclude"] and
+    if key in ["within", "exclude"] and
         unicode.toLower(tag[tag.find(':') + 1 .. ^1].strip) == lold:
       p = (if p.len > 0 and p[0] == ' ': " " else: "") & tag[0 .. tag.find(':')] & name
   parts.join(",")
@@ -1268,13 +1354,70 @@ proc hayOf(f: LibFile, ix: LibIndex = nil): string =
   unicode.toLower(f.path.extractFilename & "\n" & f.title & "\n" & f.artist & "\n" &
     f.album & "\n" & ix.foldersOf(f.path))
 
-proc matches*(q: Query, f: LibFile, hay = ""): bool =
-  ## Whether f matches every tag of q; hay: f's hayOf when already made.
+proc dirsOf(f: LibFile, ix: LibIndex = nil): string =
+  ## The folders an in: tag is looked for in: the outermost listed folder
+  ## holding the file and those below it down to the file's, each as
+  ## folderValue makes it, between slashes ("/music/artist/album/").
+  var root = ""
+  if ix != nil:
+    for p, r in ix.roots:
+      if not r.isFile and f.path.under(p) and (root.len == 0 or p.len < root.len): root = p
+  let dir = f.path.parentDir
+  let inner = if root.len == 0 or dir.len <= root.len: "" else: dir[root.len .. ^1]
+  let v = folderValue((if root.len > 0: root.lastPathPart else: dir.lastPathPart) & "/" & inner)
+  "/" & v & "/"
+
+proc inFolders(q: Query, f: LibFile, dirs: string): bool =
+  ## Whether f is in one of q's in: folders: one whose names run on in its
+  ## folders (dirsOf), or an absolute path holding it.
+  for v in q.folders:
+    if v.isAbsolute:
+      if f.path.under(v): return true
+    elif ("/" & v & "/") in dirs: return true
+
+proc spaceless(r: Rune): bool =
+  ## A script written without spaces between words (Chinese, Japanese,
+  ## Thai, Lao, Myanmar, Khmer; Korean too, whose words run long): any
+  ## character may start one.
+  let c = int(r)
+  c in 0x0E00 .. 0x0EFF or c in 0x1000 .. 0x109F or c in 0x1780 .. 0x17FF or
+    c in 0x1100 .. 0x11FF or c in 0x2E80 .. 0x9FFF or c in 0xA960 .. 0xA97F or
+    c in 0xAC00 .. 0xD7FF or c in 0xF900 .. 0xFAFF or c in 0xFF66 .. 0xFFDC or
+    c in 0x20000 .. 0x3FFFF
+
+proc wordKind(r: Rune): int =
+  ## 0 a separator, 1 a letter, 2 a digit: a word starts where it changes
+  ## from 0 or between letters and digits ("quake2", "me1").
+  if r.isAlpha: 1
+  elif int(r) < 128 and char(int(r)) in Digits: 2
+  else: 0
+
+proc hasWordStart*(hay, text: string): bool =
+  ## Whether text is in hay beginning a word: at the start, after a
+  ## separator (space, punctuation, "_"), between letters and digits, or
+  ## anywhere in a script without spaces. So "oni" finds "Oni" and
+  ## "oni_theme", not "Electronic". Both lower case.
+  if text.len == 0: return true
+  let first = text.runeAt(0)
+  var i = hay.find(text)
+  while i >= 0:
+    if i == 0: return true
+    var b = i - 1
+    while b > 0 and (hay[b].uint8 and 0xC0) == 0x80: dec b
+    let before = hay.runeAt(b)
+    let k = before.wordKind
+    if k == 0 or k != first.wordKind or before.spaceless or first.spaceless: return true
+    i = hay.find(text, i + 1)
+
+proc matches*(q: Query, f: LibFile, hay = "", dirs = ""): bool =
+  ## Whether f matches every tag of q; hay, dirs: f's hayOf and dirsOf when
+  ## already made.
   if q.formats.len > 0 and f.path.extOf notin q.formats: return false
+  if q.folders.len > 0 and not q.inFolders(f, if dirs.len > 0: dirs else: f.dirsOf): return false
   for t in q.terms:
     case t.kind
     of tkText:
-      if t.text notin (if hay.len > 0: hay else: f.hayOf): return false
+      if not (if hay.len > 0: hay else: f.hayOf).hasWordStart(t.text): return false
     of tkFilename:
       if t.text notin unicode.toLower(f.path.extractFilename): return false
     of tkPath:
@@ -1364,10 +1507,14 @@ proc filterRows*(ix: LibIndex, rows: var seq[int32], q: Query) =
   if ix.hayKey != key or ix.hay.len != ix.files.len:
     ix.hay.setLen ix.files.len
     for i in 0 ..< ix.files.len: ix.hay[i] = ix.files[i].hayOf(ix)
+    ix.dirs.setLen 0
     ix.hayKey = key
+  if q.folders.len > 0 and ix.dirs.len != ix.files.len:
+    ix.dirs.setLen ix.files.len
+    for i in 0 ..< ix.files.len: ix.dirs[i] = ix.files[i].dirsOf(ix)
   var kept: seq[int32]
   for id in rows:
-    if q.matches(ix.files[id], ix.hay[id]): kept.add id
+    if q.matches(ix.files[id], ix.hay[id], if ix.dirs.len > 0: ix.dirs[id] else: ""): kept.add id
   rows = kept
 
 proc tagValue(f: LibFile, keys: openArray[string]): string =
@@ -1494,6 +1641,35 @@ proc children*(t: FolderTree, folder: string): seq[string] =
   if folder.len > 0: t.kids.getOrDefault(folder)
   elif t.tops.len == 1: t.kids.getOrDefault(t.tops[0])
   else: t.tops
+
+proc folderTag*(t: FolderTree, folder: string): string =
+  ## A folder of the tree as its in: tag writes it: its names from the
+  ## library's listed folder down ("Artist/Album"), that folder's own name
+  ## first when the library lists several; commas left out (a tag can't
+  ## hold one).
+  var top = ""
+  for tp in t.tops:
+    if folder.under(tp):
+      top = tp
+      break
+  if top.len == 0: return folder.lastPathPart.replace(",", "")
+  var names: seq[string]
+  if t.tops.len > 1: names.add top.lastPathPart
+  if folder.len > top.len:
+    for n in folder[top.len .. ^1].split({DirSep, AltSep}):
+      if n.len > 0: names.add n
+  if names.len == 0: names.add top.lastPathPart
+  names.join("/").replace(",", "")
+
+iterator allFolders*(t: FolderTree): string =
+  ## Its folders, depth first in name order (the libraries' column's order).
+  var stack: seq[string]
+  for j in countdown(t.tops.high, 0): stack.add t.tops[j]
+  while stack.len > 0:
+    let f = stack.pop
+    yield f
+    let kids = t.kids.getOrDefault(f)
+    for j in countdown(kids.high, 0): stack.add kids[j]
 
 # --- default libraries --------------------------------------------------------
 

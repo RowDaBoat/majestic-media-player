@@ -10,6 +10,7 @@ type
   OptionsPage* = enum
     opPlayer = "Player"
     opInterface = "Interface"
+    opPlaylists = "Playlists"
     opFormats = "Formats"
     opPaths = "Paths"
     opKeys = "Keys"
@@ -17,6 +18,8 @@ type
     opOnline = "Online"
     opWeb = "Media Cache"
     opAudioFiles = "Audio Files"
+    opCovers = "Covers"
+    opVisualizer = "Visualizer"
     opReplayGain = "ReplayGain"
     opSubtitles = "Subtitles"
     opSubStyle = "Default"
@@ -32,7 +35,7 @@ type
     prNone, prBrowseScreenshots, prBrowseOpen, prShowSettings,
     prBrowseWeb, prOpenWebDir, prClearWeb, prDeleteWeb, prBrowseMkvpropedit, prBrowseYtdlp,
     prBrowseSoundFont,
-    prLibAddFolder, prLibAddFiles, prLibChange, prLibCustom, prLibContext
+    prLibAddFolder, prLibAddFiles, prLibChange, prLibCustom, prLibContext, prWebContext
 
   ItemMove* = enum
     ## Options > Libraries: where a folder or file of the list goes.
@@ -53,7 +56,9 @@ type
   OptionsDialog* = ref object
     page*: OptionsPage
     expanded: set[OptionsPage]  ## tree nodes showing their children
-    scroll: float32             ## page content scroll
+    fit*: array[OptionsPage, tuple[content, room: float32]]  ## each page's height as last
+                                ## drawn and the height it has (pages never scroll: content <= room)
+    overflowed: set[OptionsPage]  ## pages already reported taller than their room
     assoc: seq[AssocItem]
     assocLoaded: bool
     search: string
@@ -73,6 +78,8 @@ type
     web*: WebInfo               ## Media Cache page; the caller refreshes it
     webPicked*: seq[string]     ## Media Cache page: links checked in the list
     webScroll: float32
+    webCtx*: seq[string]        ## Media Cache page: the links its context menu acts on,
+                                ## the one right-clicked first (prWebContext)
     confirmClear: bool          ## Media Cache page: Clear pressed once, asking again
     picker: string              ## Subtitles page: color row whose picker is open
     pickAt: Rect                ## that row's swatch, where the picker hangs
@@ -99,7 +106,7 @@ type
     libRenameText: string
     libRenameNote: string       ## why the typed name can't be used
     libReveal: bool             ## scroll the selected folder or file into view
-    ctxPos*: Vec2               ## where a context menu was asked for (prLibContext)
+    ctxPos*: Vec2               ## where a context menu was asked for (prLibContext, prWebContext)
     pathInfo*: proc (path: string): PathInfo  ## set by the caller
     findScroll: float32         ## the search results' scroll
 
@@ -117,8 +124,9 @@ type
     hits: array[OptionsPage, int]  ## while searching: the rows each page matched
 
 const
-  Tree = [(opPlayer, 0), (opInterface, 1), (opFormats, 1), (opPaths, 1), (opKeys, 1), (opPlayback, 0),
-          (opOnline, 1), (opWeb, 1), (opAudioFiles, 1), (opReplayGain, 1), (opSubtitles, 0),
+  Tree = [(opPlayer, 0), (opInterface, 1), (opPlaylists, 1), (opFormats, 1), (opPaths, 1), (opKeys, 1), (opPlayback, 0),
+          (opOnline, 1), (opWeb, 1), (opAudioFiles, 1), (opCovers, 1),
+          (opVisualizer, 1), (opReplayGain, 1), (opSubtitles, 0),
           (opSubStyle, 1), (opLibraries, 0), (opMisc, 0), (opSystem, 0)]
   Parents = {opPlayer, opPlayback, opSubtitles}
   TreeWidth = 180'f32
@@ -145,7 +153,6 @@ proc opened*(d: OptionsDialog, ui: Ui) =
   d.confirmClear = false
   d.picker = ""
   d.fontOpen = false
-  d.scroll = 0
   d.find = ""
   ui.navId = "o-tree"
   ui.navVisible = false
@@ -157,7 +164,6 @@ proc searching*(d: OptionsDialog): bool =
 proc selectPage*(d: OptionsDialog, ui: Ui, p: OptionsPage) =
   if p == d.page: return
   d.page = p
-  d.scroll = 0
   d.capturing = false
   d.confirmClear = false
   d.fontOpen = false
@@ -186,12 +192,13 @@ proc pageChanged(p: OptionsPage, c, before: Config): bool =
   ## Whether a setting of page p differs from when the window opened.
   template differs(field: untyped): bool = c.field != before.field
   case p
-  of opPlayer: differs(autoFitWindow) or differs(openMode) or differs(rememberPlaylist) or
+  of opPlayer: differs(autoFitWindow) or differs(openMode) or
     differs(rememberTime) or differs(rememberTransform) or differs(rememberWindowPos) or
     differs(rememberWindowSize)
   of opInterface: differs(osdScale) or differs(osdScaleByWindow) or differs(osdTimestamp) or
     differs(showFrames) or differs(showMillis) or differs(showRemaining) or
     differs(titleFullPath) or differs(titleUseMediaTitle) or differs(uiScale)
+  of opPlaylists: differs(rememberPlaylist) or differs(playlistGroups) or differs(playlistGroupPattern)
   of opFormats: false  # associations apply at once
   of opPaths: differs(mkvpropedit) or differs(openDir) or differs(screenshotDir) or
     differs(screenshotNoAsk) or differs(ytdlp)
@@ -204,9 +211,10 @@ proc pageChanged(p: OptionsPage, c, before: Config): bool =
     differs(streamSmallAudio)
   of opWeb: differs(webCount) or differs(webCountOn) or differs(webDir) or
     differs(webKeepHours) or differs(webKeepOn) or differs(webSizeGB) or differs(webSizeOn)
-  of opAudioFiles: differs(coverNames) or differs(shortAudioDelay) or differs(shortAudioMs) or
-    differs(showCover) or differs(showFileCover) or differs(showTrackerChart) or differs(showVisualizer) or differs(soundFont) or
-    differs(avsBeatThreshold) or differs(avsBeatSensitivity)
+  of opAudioFiles: differs(showTrackerChart) or differs(shortAudioDelay) or differs(shortAudioMs) or
+    differs(soundFont)
+  of opCovers: differs(coverNames) or differs(showCover) or differs(showFileCover)
+  of opVisualizer: differs(showVisualizer) or differs(avsBeatThreshold) or differs(avsBeatSensitivity)
   of opReplayGain: differs(replayGain) or differs(replayGainFallback) or
     differs(replayGainNoClip) or differs(replayGainPreamp)
   of opSubtitles: differs(subDelay) or differs(subPaths)
@@ -300,9 +308,7 @@ proc drawTree(d: OptionsDialog, ui: Ui, r: Rect, keys: bool, changed, clashing: 
       elif hit: colText elif dim: colTextDisabled else: colText)
     if hov and ui.pressed():
       ui.consumeClick()
-      if dim:
-        d.find = ""
-        d.scroll = 0
+      if dim: d.find = ""
       ui.navId = "o-tree"
       d.selectPage(ui, p)
     if hov and p in Parents and ui.window.buttonPressed[DoubleClick]: d.toggle()
@@ -485,8 +491,6 @@ proc playerPage(ui: Ui, c: var Config, p: var Pane) =
   ui.checkRow(p, "o-rpos", "Remember window position", c.rememberWindowPos)
   ui.checkRow(p, "o-rsize", "Remember window size", c.rememberWindowSize)
   ui.checkRow(p, "o-rxf", "Remember last pan, rotation and zoom", c.rememberTransform)
-  ui.checkRow(p, "o-rpl", "Remember playlist", c.rememberPlaylist)
-  ui.hint(p, "The Default playlist and the file playing. Playlists of your own are always kept.")
 
 proc interfacePage(ui: Ui, c: var Config, p: var Pane) =
   ui.group(p, "Interface")
@@ -513,6 +517,17 @@ proc interfacePage(ui: Ui, c: var Config, p: var Pane) =
   ui.radioRow(p, "o-tname", "File name only", c.titleFullPath, false)
   ui.radioRow(p, "o-tpath", "Display full path", c.titleFullPath, true)
   ui.checkRow(p, "o-ttitle", "Replace file name with title", c.titleUseMediaTitle)
+
+proc playlistsPage(ui: Ui, c: var Config, p: var Pane) =
+  ui.group(p, "Playlists")
+  ui.checkRow(p, "o-rpl", "Remember playlist", c.rememberPlaylist)
+  ui.hint(p, "The Default playlist and the file playing. Playlists of your own are always kept.")
+  ui.group(p, "Groups")
+  ui.checkRow(p, "o-plgroups", "Show groups", c.playlistGroups)
+  ui.hint(p, "A header over each run of entries whose grouping pattern reads the same.")
+  ui.textRow(p, "o-plgroup", "Grouping pattern", c.playlistGroupPattern, DefaultGroupPattern)
+  ui.hint(p, "Fields like %artist%, %album%, %year%, %title%, %directoryname%; functions like $left.")
+  ui.hint(p, "[...] is left out when a field in it is missing; elsewhere a missing field reads ?.")
 
 proc loadAssoc(d: OptionsDialog) =
   if not d.assocLoaded:
@@ -965,7 +980,7 @@ proc onlinePage(ui: Ui, c: var Config, p: var Pane) =
   ui.hint(p, "Applies to links opened from now on; cached media plays as it was cached.")
   ui.hint(p, "When nothing fits a limit, the smallest version available is fetched instead.")
 
-proc audioFilesPage(d: OptionsDialog, ui: Ui, c: var Config, p: var Pane) =
+proc coversPage(ui: Ui, c: var Config, p: var Pane) =
   ui.group(p, "Front cover")
   ui.checkRow(p, "o-cover", "Show an audio file's front cover", c.showCover)
   ui.hint(p, "Animated GIFs move at their own pace, playing or paused.")
@@ -981,9 +996,8 @@ proc audioFilesPage(d: OptionsDialog, ui: Ui, c: var Config, p: var Pane) =
   ui.hint(p, "Fields and functions: %album%, %artist%, %filename%, %directoryname%, $substr(%filename%,1,4),")
   ui.hint(p, "$left, $right, $lower, $upper, $replace, $if2, [...] (left out without its fields).")
   ui.hint(p, "Letter case doesn't matter; a line without an extension takes any picture's (folder).")
-  ui.group(p, "Tracker chart")
-  ui.checkRow(p, "o-trackerchart", "Show the tracker chart (MOD, XM, IT, MIDI...)", c.showTrackerChart)
-  ui.hint(p, "Each channel's notes, scrolling as they play. Modules need libopenmpt.")
+
+proc visualizerPage(ui: Ui, c: var Config, p: var Pane) =
   ui.group(p, "Visualizer")
   ui.checkRow(p, "o-visualizer", "Show the visualizer for sound without a picture", c.showVisualizer)
   ui.hint(p, "AVS presets, playing to what you hear. Add your own .avs files")
@@ -994,6 +1008,11 @@ proc audioFilesPage(d: OptionsDialog, ui: Ui, c: var Config, p: var Pane) =
   ui.numberRow(p, "o-avssens", "Beat sensitivity (%)", c.avsBeatSensitivity, 10, 0, 300)
   ui.hint(p, "How readily beats come at any loudness: 100 is Winamp's, 200 about twice the beats,")
   ui.hint(p, "300 the most. Presets that pass on every Nth beat (Custom BPM) change more often too.")
+
+proc audioFilesPage(d: OptionsDialog, ui: Ui, c: var Config, p: var Pane) =
+  ui.group(p, "Tracker chart")
+  ui.checkRow(p, "o-trackerchart", "Show the tracker chart (MOD, XM, IT, MIDI...)", c.showTrackerChart)
+  ui.hint(p, "Each channel's notes, scrolling as they play. Modules need libopenmpt.")
   ui.group(p, "MIDI files")
   if ui.folderRow(p, "o-soundfont", "SoundFont", c.soundFont, "None: only one beside the file"):
     d.request = prBrowseSoundFont
@@ -1151,6 +1170,14 @@ proc webPage(d: OptionsDialog, ui: Ui, c: var Config, p: var Pane, bottom: float
     if hov and ui.window.buttonReleased[MouseLeft] and ui.pressId == "o-web" & $n:
       if on: d.webPicked.delete(d.webPicked.find(it.url))
       else: d.webPicked.add it.url
+    if hov and ui.pressed(MouseRight): ui.consumeClick()
+    if hov and ui.released(MouseRight):
+      # The row right-clicked, then the ones checked, in the list's order.
+      d.webCtx = @[it.url]
+      for o in web.items:
+        if o.url in d.webPicked and o.url != it.url: d.webCtx.add o.url
+      d.ctxPos = ui.mouse
+      d.request = prWebContext
   if web.items.len == 0:
     ui.textIn("Nothing cached", inner, colTextDim, FontSmall, h = CenterAlign)
   ui.sk.popClipRect()
@@ -2037,8 +2064,10 @@ proc draw*(d: OptionsDialog, ui: Ui, c: var Config, before: Config, r: Rect): Op
   ui.sk.pushClipRect(pageR)
   let outerClip = ui.hitClip
   ui.hitClip = pageR
-  let scroll = if searching: addr d.findScroll else: addr d.scroll
-  let origin = pageR.y - scroll[]
+  # A page never scrolls: everything on it must fit the window, only the
+  # lists in it (and the search's results) scroll. A page that doesn't fit
+  # is a layout bug: it is reported below, and must be split or tightened.
+  let origin = if searching: pageR.y - d.findScroll else: pageR.y
   var p = Pane(x: pageR.x, y: origin, w: pageR.w - 12)
   let pageStops = ui.tabStops.len
   if searching:
@@ -2049,6 +2078,7 @@ proc draw*(d: OptionsDialog, ui: Ui, c: var Config, before: Config, r: Rect): Op
       case page
       of opPlayer: playerPage(ui, c, p)
       of opInterface: interfacePage(ui, c, p)
+      of opPlaylists: playlistsPage(ui, c, p)
       of opFormats: d.formatsResults(ui, p)
       of opPaths: d.pathsPage(ui, c, p)
       of opKeys: d.keysResults(ui, c, p)
@@ -2056,6 +2086,8 @@ proc draw*(d: OptionsDialog, ui: Ui, c: var Config, before: Config, r: Rect): Op
       of opOnline: onlinePage(ui, c, p)
       of opWeb: d.webPage(ui, c, p, pageR.y + pageR.h)
       of opAudioFiles: d.audioFilesPage(ui, c, p)
+      of opCovers: coversPage(ui, c, p)
+      of opVisualizer: visualizerPage(ui, c, p)
       of opReplayGain: replayGainPage(ui, c, p)
       of opSubtitles: d.subtitlesPage(ui, c, p)
       of opSubStyle: d.subStylePage(ui, c, p)
@@ -2068,6 +2100,7 @@ proc draw*(d: OptionsDialog, ui: Ui, c: var Config, before: Config, r: Rect): Op
     case d.page
     of opPlayer: playerPage(ui, c, p)
     of opInterface: interfacePage(ui, c, p)
+    of opPlaylists: playlistsPage(ui, c, p)
     of opFormats: d.formatsPage(ui, p, pageR.y + pageR.h)
     of opPaths: d.pathsPage(ui, c, p)
     of opKeys: d.keysPage(ui, c, p, pageR.y + pageR.h)
@@ -2075,6 +2108,8 @@ proc draw*(d: OptionsDialog, ui: Ui, c: var Config, before: Config, r: Rect): Op
     of opOnline: onlinePage(ui, c, p)
     of opWeb: d.webPage(ui, c, p, pageR.y + pageR.h)
     of opAudioFiles: d.audioFilesPage(ui, c, p)
+    of opCovers: coversPage(ui, c, p)
+    of opVisualizer: visualizerPage(ui, c, p)
     of opReplayGain: replayGainPage(ui, c, p)
     of opSubtitles: d.subtitlesPage(ui, c, p)
     of opSubStyle: d.subStylePage(ui, c, p)
@@ -2086,21 +2121,27 @@ proc draw*(d: OptionsDialog, ui: Ui, c: var Config, before: Config, r: Rect): Op
   let pageStopsEnd = ui.tabStops.len
   if searching: d.drawTree(ui, treeR, keys, changed, clashPages, p.hits)
 
-  # Long pages scroll when the window is small.
   let contentH = p.y - origin
-  let maxScroll = max(0'f32, contentH - pageR.h)
-  if ui.hover(pageR) and ui.scroll() != 0:
-    scroll[] += ui.scroll() * 3
-    ui.scrollConsumed = true
-  scroll[] = clamp(scroll[], 0, maxScroll)
-  if maxScroll > 0:
-    let th = max(24'f32, pageR.h * pageR.h / contentH)
-    let ty = pageR.y + (pageR.h - th) * (scroll[] / maxScroll)
-    ui.rect(rect(pageR.x + pageR.w - 4, ty, 3, th), colTrack)
+  if searching:
+    # The search's results: a list, which scrolls when long.
+    let maxScroll = max(0'f32, contentH - pageR.h)
+    if ui.hover(pageR) and ui.scroll() != 0:
+      d.findScroll += ui.scroll() * 3
+      ui.scrollConsumed = true
+    d.findScroll = clamp(d.findScroll, 0, maxScroll)
+    if maxScroll > 0:
+      let th = max(24'f32, pageR.h * pageR.h / contentH)
+      let ty = pageR.y + (pageR.h - th) * (d.findScroll / maxScroll)
+      ui.rect(rect(pageR.x + pageR.w - 4, ty, 3, th), colTrack)
+  else:
+    d.fit[d.page] = (contentH, pageR.h)
+    if contentH > pageR.h + 0.5 and d.page notin d.overflowed:
+      d.overflowed.incl d.page
+      stderr.writeLine "Options > ", d.page, " is ", int(contentH - pageR.h),
+        " px taller than the window: its last rows can't be seen"
   if p.jump:                    # a search result was clicked: open its page
     d.find = ""
     d.selectPage(ui, p.jumpTo)
-    d.scroll = 0
 
   ui.rect(rect(r.x + 1, r.y + r.h - 50, r.w - 2, 1), colBorder)
   let by = r.y + r.h - 40
@@ -2120,12 +2161,13 @@ proc draw*(d: OptionsDialog, ui: Ui, c: var Config, before: Config, r: Rect): Op
     ui.focusId = ""
     return
 
-  # Tab / Shift+Tab: tree, page controls, OK, Cancel. Scroll the page so a
-  # newly focused control is visible.
+  # Tab / Shift+Tab: tree, page controls, OK, Cancel. In the search's
+  # results, scroll so a newly focused control is visible.
   # A Tab that was just bound to a command doesn't move the focus too.
   let i = if d.keyTaken or d.picker.len > 0: -1 else: ui.tabNavigate()
-  if i >= pageStops and i < pageStopsEnd:
+  if searching and i >= pageStops and i < pageStopsEnd:
+    let maxScroll = max(0'f32, contentH - pageR.h)
     let sr = ui.tabStops[i].r
-    if sr.y < pageR.y: scroll[] -= pageR.y - sr.y + 4
-    elif sr.y + sr.h > pageR.y + pageR.h: scroll[] += sr.y + sr.h - pageR.y - pageR.h + 4
-    scroll[] = clamp(scroll[], 0, maxScroll)
+    if sr.y < pageR.y: d.findScroll -= pageR.y - sr.y + 4
+    elif sr.y + sr.h > pageR.y + pageR.h: d.findScroll += sr.y + sr.h - pageR.y - pageR.h + 4
+    d.findScroll = clamp(d.findScroll, 0, maxScroll)

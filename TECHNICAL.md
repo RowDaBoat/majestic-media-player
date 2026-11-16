@@ -254,8 +254,8 @@ it held, to commit.
   the selection (the playlist also plays it with Enter); in a column Up/Down/Home/End show another
   playlist or pick another library (`libPick`, as a click does) and Enter goes on to its list. F2 in
   the libraries' column types over the library's name in its row (`startLibRename`/`endLibRename`,
-  focus id `lib-rename`, checked by `validLibraryName` like Options > Libraries; the search's in: and
-  exclude: tags follow); anywhere else in the Library F2 does nothing, not even Rename Playlist. The
+  focus id `lib-rename`, checked by `validLibraryName` like Options > Libraries; the search's within:
+  and exclude: tags follow); anywhere else in the Library F2 does nothing, not even Rename Playlist. The
   holder shows a `colAccentDim` edge round its list or column, drawn after both panels, and a
   `colAccent` outline on the row the arrows move from. `panelsdump` (MMP_SCRIPT) prints the state.
 - Several playlists (`src/plmanager.nim`, tabs drawn by `playlistTabs`): the one shown lives in
@@ -286,6 +286,22 @@ it held, to commit.
   merges one with the shown columns), `toggleColumn` shows a column back at its place, and a header
   drag (`moveColumn`) moves the column in the order too, before the one it now precedes, leaving
   the hidden ones where they are.
+  Playlist groups (the column header's Show groups, `playlistGroups`, shared by every playlist):
+  a header row over each run of consecutive entries whose `playlistGroupPattern` reads the same,
+  as foobar2000 groups them (the same album twice apart gets two headers). The pattern is foobar2000
+  title formatting, written by `formatTitle` in folderpics.nim (the folder pictures' evaluator in
+  display mode: a missing field reads `?`, slashes are kept); the default
+  `%artist% - [%year% - ]%album%` drops the year and its dash when the file has none. The fields come
+  from the probed `MediaInfo` (artist, album, title, year, track, disc) plus the file name fields;
+  each file's text is cached in `plGroupLabels` with the tags it was made from. `buildPlaylistView`
+  lays out `plLines` (entries >= 0, headers `-(g + 1)` into `plGroups`) and `plLineOf` each frame
+  the panel is drawn; a file not probed yet stays in the run above it, so headers don't flicker
+  while the probe catches up. Everything that turned a y into an entry or back goes through
+  `plLineCount`/`plEntryLine`/`plLineEntry`, and drops through `plGapAt`/`plGapLine` (a group's first
+  entry drops above its header), falling back to one row per entry when the view is stale or groups
+  are off. A header click selects its entries (Ctrl adds or drops them, Shift extends), a drag moves
+  them as a row drag does, a double-click plays the first, a right-click selects them for the menu.
+  Grouping pattern... opens Options > Player > Playlists, where an empty pattern means the default.
   Column widths (the playlist's and the Library's): `layoutCells` gives a text column nobody resized
   what the others leave (`fillsIn`), else the last column the slack; a panel too narrow takes the
   excess from every column, each giving the same share of what it has above its narrowest, so the
@@ -296,6 +312,15 @@ it held, to commit.
   takes the slack, and once they'd pass the panel's edge the columns right of the edge all narrow
   evenly (computed from the snapshot, so dragging back within the drag restores them). Saved widths
   wider than the panel thus become what's drawn on the first drag.
+  A double-click on an edge (`fitColumn`, `libFitColumn`, both through `fitWidths`) fits the column
+  to the rows in view keeping its left edge: every column right of it moves along keeping its width
+  (not just the next one trading width with it). The text columns right of it that fill the panel
+  give way; without any, a narrower column leaves its width to the last column, and a wider one
+  narrows the columns pushed past the panel's edge, the last one first, each down to its narrowest.
+  The last column takes its width from the filling text columns, else from the column left of it.
+  The other columns are written as drawn, except text columns left of it that fill the panel,
+  which go on filling it when their share comes out the same (they're written when it doesn't,
+  as when a panel too narrow squeezed them). `tmp/colfit` checks it against `layoutCells`' math.
   The tab menu's "Playlists in a Side Column" (`playlistTabsSide`) draws the playlists as a list left
   of the entries instead (`playlistSide`), with the same clicks, drags and drops; it fills the same
   `tabRects`/`tabPlus`/`tabStrip`, so file drops, row drags and right-clicks treat both alike. The
@@ -304,7 +329,7 @@ it held, to commit.
   panel by its width so the entries keep their room.
   Script commands: `tabdump`, `tabrects`, `tabnew`, `tabshow`, `tabclose`, `tabrestore`, `tabrename`,
   `tabmove`, `tabsend`, `tabctx`, `tabaction label`, `plmark`, `act <command id>`, `next`, `prev`, `eof`, `colctx x y
-  field`, `colaction label`, `coldump`.
+  field`, `colaction label`, `coldump`, `plgroupdump` (the groups and rows drawn).
 - With "Same player for each media file" (the default), a running player listens
   on `$XDG_RUNTIME_DIR/majestic-media-player.sock` and files opened from the
   file manager are handed to it instead of starting a second window. On
@@ -315,6 +340,12 @@ it held, to commit.
   listens again; a player that's unshielded but not listening (another one was
   first) retries every 2 s from the main loop, taking over once that one quits.
 - Options ▸ Formats writes file associations to `~/.config/mimeapps.list`.
+- Options pages never scroll: everything on a page must fit the window (`OptionsSize`, in UI
+  units, so at any UI scale); only lists inside a page (Formats, Keys, Media Cache, Libraries) and
+  the search's results scroll. A page that grows past it is split by topic into another page
+  (Playback > Audio Files gave its covers and visualizer pages of their own: Covers, Visualizer). `draw` records each
+  page's height and room (`fit`) and writes to stderr when one is taller; script command `optfit`
+  lists them all.
   Associations are per MIME type, so extensions that share one (mp4, m4v, f4v)
   are checked together. Unchecking removes the player from the default list,
   and the previous default takes over again. On Windows they go to the
@@ -450,6 +481,21 @@ it held, to commit.
   ticks), so its tempo and time signature only place the chart's beats. Controllers 110-120 are
   AIL's (120 is its branch index, not All Sound Off) and aren't sent; FOR (116) / NEXT (117 >= 64)
   loops repeat, forever ones twice and then a fade, as HMI's. `TIMB` (MT-32 timbres) is unused.
+- Westwood Studios' `.aud` sound (Command & Conquer, Red Alert...; `src/wsaud.nim`). FFmpeg's
+  wsaud demuxer plays it, but guesses its length from the bit rate (chunk headers counted:
+  ~1.5% long; the header's unpacked size is right, `audLength`), and IMA ADPCM (codec 99)
+  carries the decoder's step index from chunk to chunk with nothing in the file to resume from:
+  after a seek FFmpeg starts again at step 0 and the sound plays ~30 dB quieter until a quiet
+  passage happens to bring the two back together. So an IMA file opens as `mmpaud://N`
+  (`prepare`): its bytes read on the app's thread into a slot (the same unchanged file keeps its
+  slot: queueGapless asks every 0.25 s), decoded from the start when mpv opens the stream, on
+  mpv's thread, into a 16-bit WAV held in memory (C heap, as the other streams), nibble for
+  nibble as FFmpeg does (bit-exact against `ffmpeg -f s16le` on Red Alert's 40 songs and a
+  stereo one: each byte two samples of one channel, the channels taking turns). Seeks land on
+  the sample at full loudness; gapless, reverse play and Ping-Pong turns take it like a file.
+  Westwood SND1 (codec 1) starts each chunk afresh, so FFmpeg plays it, opened as an EDL of the
+  header's length. The playlist's and Library's probes and Media Info take the header's length.
+  `nim c -r src/wsaud.nim FILE.aud OUT.raw` decodes a file as the stream holds it.
 - MIDI chart: the tracker chart, fed by `src/midichart.nim` instead of libopenmpt (`TrackerSong`
   with `cellsOf`, `patRows`, `patBeats`, `labels`, `info`; the header tells bars and rows).
   Each bar is a pattern and each 16th note a row (16th triplets when clearly more notes start on
@@ -503,7 +549,9 @@ it held, to commit.
   (`src/tagedit.nim`) writes `REPLAYGAIN_{TRACK,ALBUM}_{GAIN,PEAK}` ("-6.54 dB", "0.988831"),
   or for `.opus` `R128_{TRACK,ALBUM}_GAIN` (Q7.8 relative to -23 LUFS, RFC 7845) with any
   `REPLAYGAIN_*` removed; mpv reads both. Track gains are written as each file is measured,
-  album gains once all are, both on the measuring thread: TagLib rewrites a FLAC (or any file)
+  album gains once all are, both on the measuring thread (a file that keeps no tags gets them
+  in its .m2c, below; MIDI files are measured from FluidSynth's render with the SoundFont they
+  play with, midistream's `renderOpen`, not ffmpeg's libmodplug): TagLib rewrites a FLAC (or any file)
   without padding room for the new fields whole, 0.2-2 s for a 100 MB file, and doing that for
   an album on the main thread froze the window after the last file. `RgJob.poll` only copies
   the thread's results under the lock. The thread is one for every job, started with the first and
@@ -518,9 +566,10 @@ it held, to commit.
   button and the menus show mpv's values, which are the new ones from then on. Matches ffmpeg's
   `ebur128` filter (stereo, 5.1, MP3/FLAC/M4A/Ogg/Opus, and two files joined for album gain).
   Script command `plselectall` selects the whole playlist for testing it.
-- The playlist's Properties (its menu's Properties..., for the selected local files; window in
-  `src/tagdlg.nim`): tags read and written with TagLib's C bindings (`src/tagedit.nim`,
-  libtag_c loaded at run time, as libopenmpt is; without it tags show read-only, from ffprobe).
+- The playlist's Properties (its menu's Properties... or Shift+Enter on the playlist's arrows,
+  for the selected local files, opening on Metadata; window in `src/tagdlg.nim`): tags read and written with TagLib's C bindings (`src/tagedit.nim`,
+  libtag_c loaded at run time, as libopenmpt is; without it tags are read with ffprobe and edits go
+  to a .m2c, below).
   Fields are TagLib's property map, one list for every format (TITLE, ALBUMARTIST, TRACKNUMBER,
   free-form keys such as MOOD), which TagLib maps onto ID3v2 frames, Vorbis comments, MP4 atoms
   and so on; several values show joined by "; ", except in free text (COMMENT, LYRICS...).
@@ -528,12 +577,15 @@ it held, to commit.
   writing, Vorbis/APE files keep TRACKTOTAL/DISCTOTAL (or the TOTALTRACKS spelling they had).
   Two TagLib quirks: a tracker tag has every field even when empty, so a value is set before
   others are appended; and an XM save can report failure after writing, so success is judged
-  by reading the file back. Tracker modules are read-only all the same: saving one, TagLib
+  by reading the file back. Tracker modules are never written all the same: saving one, TagLib
   rewrites its sample and instrument names (where the comment lives) and drops their
-  non-ASCII characters (seen on an IT: "§" lines zeroed). MIDI files show their own text
+  non-ASCII characters (seen on an IT: "§" lines zeroed); their tags go to a .m2c (below). MIDI files show their own text
   events (copyright, track names, lyrics, markers; RIFF MIDI's INFO), not ffprobe's, which
   reads them through libmodplug and makes fields up. The grid compares only the files edits
   go to; a field they don't agree on shows <multiple values> and is left alone unless edited.
+  In the grid, Shift+Enter keeps the value and edits the next field (Add field's name after the
+  last; from the value box too, where Enter is a line break). It sets `editNext` and the edit
+  starts a frame later, so the same Enter can't reach the new field's text box and end it.
   Autofill matches a pattern (`%field%`, `%_%` to skip, `/` per folder) against the file
   names, each field as short as the rest allows; text ending the pattern ends the match, the
   rest of the name left unread ("%title% Original" on "Song Original Mix") (the last eight patterns used are in the
@@ -546,9 +598,61 @@ it held, to commit.
   playlist's cached fields take the written ones (`MediaInfo.retag`: rows and columns change
   at once, no new probe), and the file playing opens again where it is (paused or not, its
   added tracks kept) for mpv to read its new tags; the window title follows on that reopen. The AppImage bundles libtag_c; the Windows
-  build has no TagLib yet, so it shows tags read-only. Script commands: `tags` opens it for
+  build has no TagLib yet, so its edits all go to .m2c files. Script commands: `tags` opens it for
   the selection, `tagtab`, `tagset FIELD value`, `tagpattern`, `tagfill`, `tagnumber`,
   `tagdetail i`, `tagapply`, `tagok`, and `tagdump` (every file's fields and the player's state).
+- Majestic Meta Container (`.m2c`, `src/m2c.nim`): tags for files whose own can't be written
+  (Westwood `.aud`, MIDI, tracker modules even though TagLib reads them, whatever TagLib can't
+  open, and every file without TagLib: `keepsNoTags` in `src/m2c.nim`), in a
+  file in the m2c subfolder of their folder: `<folder>/m2c/<file name>.m2c` for
+  `<folder>/<file name>` (`sidePath`).
+  The extension was picked for being free: `.met` (eMule, OS/2 metafiles), `.mmd` (Mermaid),
+  `.mif` (MapInfo), `.mei` (music scores), `.mmf` (SMAF audio FFmpeg plays), `.m2t` (HDV
+  video) and others were taken; `.m2c`'s only other use is IBM VoiceType's obsolete files.
+  The format, UTF-8 text, one field per line:
+  ```
+  # Majestic Meta Container 1
+  TITLE=Bog
+  ARTIST=Frank Klepacki
+  COMMENT=First line\nSecond line
+  DATE=
+  ```
+  Keys are TagLib's property names, upper case (read in any case); a key again adds a value;
+  `KEY=` with nothing after it clears a field the file holds itself (a module's title); `\\`,
+  `\n`, `\r` are escapes; spaces around keys and values don't count; `#` lines are comments;
+  a BOM and CRLF are fine. Properties (an entry's `side`) shows the file's own fields with the
+  .m2c's over them (`overlay`), and saving writes only what isn't the file's own as it has it,
+  plus the clears (a module's message isn't copied), so a file's own read-only fields can be
+  replaced or added to; totals keep fields of their own
+  (TRACKTOTAL, DISCTOTAL); nothing left removes the .m2c, and the m2c folder once empty. It's
+  written to a dot-file in the m2c folder and renamed over it. Any file's .m2c counts wherever
+  tags are read, created or not by Properties: mpv's (or ffprobe's) tags with it laid over them
+  (`overlay`, values joined by "; ", whatever the file's key case) for the playlist's columns
+  (`Prober`, failed opens included: mpv can't open a MIDI file alone), the Library
+  (`probeFile`, likewise), Media Info, folder pictures' fields, and for the file playing,
+  read once per file (`playingSide`), the window title (Options' media title) and the media
+  controls, and the tracker chart's header (title, a module's tracker name: `draw`'s `side`).
+  Saving one reopens nothing: the title and media controls take it at once, the
+  playlist's columns through `retag`, and the Library reads the file again (`reprobe`: no file
+  touched on the main thread; a reading under way when it changed is dropped, `stale`). The
+  Library notes each .m2c's time (`LibFile.sideTime`, checked only in folders that have an
+  m2c folder), so one edited by hand is read again at the next walk. Script command `m2cdump`
+  prints the tags the playlist, the Library, the window title and the media controls have.
+  ReplayGain lives there too (REPLAYGAIN_{TRACK,ALBUM}_{GAIN,PEAK}, as in tags): the
+  playlist's Analyze and Apply and Remove ReplayGain Values write the .m2c of such a file
+  (`usesSide`, on the measuring thread; the rest of it kept), allowed without TagLib for them
+  (`canWriteGain`). mpv reads only a file's own values, and the streams (mmpaud, mmpmidi,
+  mmpmod) carry none, so the player applies a .m2c's itself: `rgFor` works out the gain mpv
+  would (track or album, pre-amp, held under the peak with Prevent Clipping) and gives it as
+  `replaygain-fallback` with `replaygain=no`, which mpv then applies alone; a .m2c that clears
+  REPLAYGAIN_TRACK_GAIN gets the "without ReplayGain" gain. Every file opens with its options
+  as per-file options (`rgOpts`: load, the gapless queue, reopen), so its first samples, and
+  a gapless change to or from such a file, are at its level; `syncSettings` pushes them
+  again when the file or the settings change (key: settings, path, `sideGain`), onto the
+  standby and loop sound too. The button and menus show the .m2c's values (`currentRg`);
+  saving or removing them reopens nothing. Measured: an .aud played with a .m2c's -4.67 dB
+  is at the level of the same sound as a FLAC with -4.67 dB in its own tags (both 0.6 dB
+  under nominal: the output's gain steps, at volume 40 through PulseAudio, not ReplayGain's).
 
 - Visualizer (sound without a picture, `showVisualizer`): AVS 2.81d (Nullsoft's 2005 BSD release,
   visbot/vis_avs) ported to Nim in `src/avs/`, a software renderer as AVS was: 32-bit 0x00RRGGBB
@@ -602,7 +706,7 @@ it held, to commit.
   A beat is a level (the louder channel's summed |samples|) 1/16 over its recent peaks' and over
   a floor, main.cpp's 576 * 16 (an average of 16/128, -18 dBFS): quiet music, ReplayGain's
   lowered tracks and many modules never reach it, so it's `avsBeatThreshold` percent of that
-  (Options > Audio files > Visualizer, and the Visualizers window's bottom bar, `aaBeat`; 100 by
+  (Options > Playback > Visualizer, and the Visualizers window's bottom bar, `aaBeat`; 100 by
   default; 0: any sound). How far over the peaks is `avsBeatSensitivity` (same places, %):
   `marginFor` makes 100 main.cpp's 1/16, 200 none (about twice the beats on soundtracks
   measured), 300 1/16 under (4 to 13 a second), 0 twice main.cpp's. Both are Winamp's at 100,
@@ -714,9 +818,9 @@ it held, to commit.
 - Covers: mpv finds the picture named after an audio file itself (`cover-art-auto`, with `cover-art-whitelist` emptied). Options' folder pictures are the app's (`folderpics.nim`, `addFolderPicture` in the `on_preloaded` hook, adding the picture found as an album-art track, or taking mpv's when it's the same file): foobar2000-style patterns, one per line, tried top to bottom until one finds a picture, relative to the file's folder (`art/*front*.*`, `../folder.*`, `%album%.*`, `jk_$substr(%filename%,1,4)_5_b.png`, `[...]`). `*`/`?` are wildcards only where the line writes them (a field's value is literal, its slashes become `_`), every segment matches letter case aside, a folder's matches go in name order, and only picture files (`ImageExtensions`) count. A line naming a field the file doesn't have (from mpv's `metadata`, outside `[...]` or a `$if` branch not taken) or an unknown function is skipped, so `%album%.*` never becomes `.*`; a line whose last segment has no `.`, `*` or `?` gets `.*` (the old names, `folder`). The patterns are module state shared by every player (the standby swaps with the main one). `pickCover` chooses among the pictures in the `on_preloaded` hook (`coverTrack`): the one named after it with Show Front Cover (file) (`showFileCover`, `Player.fileCover`), else the front cover inside (picture types read by `coverart.nim`, as mpv takes the first), else the folder picture. With Show Front Cover (file) off, the named one is never shown: if it's the only picture, the file gets `vid=no`, or mpv would take it.
 - Moving covers (animated GIF, APNG, WebP): mpv shows a picture track's first frame only, so it still shows that (the window fits it, and screenshots and video filters see it) while `animpic.nim` decodes the picture and the app draws the frame due over the picture's rect (`drawAnim`), panned, rotated and sized with it. The picture comes from the file beside (track codec `gif`, `apng` or `webp`), a quick cover's own file, or for one inside the file from its ID3v2 or FLAC picture by its place among them, read only when their count matches mpv's tracks. GIFs are `gifanim.nim`'s: pixie's decoder doesn't lay frames over the one before (most GIFs store only what changed) and turns a disposal-2 frame into a blank one. APNG frames are made into PNGs of their own (the file's IHDR at the frame's size, its PLTE/tRNS, the frame's IDAT/fdAT data) for pixie's decoder, then laid on with their blend and dispose ops; 16-bit and interlaced APNGs, which pixie can't read, stay still. FFmpeg can't decode an animated WebP at all (it skips ANMF chunks, so not even the first frame), so those go through libwebp's `WebPAnimDecoder` (`libwebpdemux`, `dlopen`ed: bundled in the AppImage, not shipped on Windows yet, where an animated WebP can't be shown). Frames are decoded as they come due, at the picture's own delays (10 ms or less taken as a tenth, as browsers do), playing or paused, and kept once composed while all of them fit 64 MiB; a bigger one composes each frame again every time around (~2 ms for an 800x800 GIF). The OSD goes to the OSD layer meanwhile (`osdApart`), as mpv's own is in the picture underneath.
 - Quick covers: a picture file dropped on the video frame, or pasted with Ctrl+V (a file on the clipboard, or a picture itself: a browser's Copy Image, read with `wl-paste`, `xclip` or windy on Windows), while the file playing shows no picture of its own (`quickCoverAllowed`: sound alone, a cover, or a video with its track off) is added as an album-art track titled "Quick cover" (`addQuickCover`, a file-local `vid`; the render context is made first, as a file opened without video has none). An animated WebP is added as a PNG of its first frame (in the cache, `quickCoverStill`) and moves through `animpic`. Elsewhere, or on a playing video, a dropped or pasted picture opens as before. Show Quick Cover switches between it and what showed before (`qcPrevVid`), at once: mpv takes a moment to set a picture up again (~0.25 s for a 6000x6000 JPEG), so once the quick cover first shows the app takes it as mpv decoded it (`screenshot-raw video`, asked for in the background with `takeShot`: synchronous it deadlocks, as libmpv's video output takes it through the renderer, our main thread; shrunk to 2048 pixels a side) and draws that (`qcBridge`) from Show until 0.1 s after mpv's video is set up again (`Player.videoConfigs`); a moving one's frames are kept while it's hidden (`animStash`). `pollQuickCover` reads only the track list mpv sent: a property read every frame waits while mpv sets a picture up, and held up the very frames meant to cover that wait. The front cover settings leave it alone (`pickCover` skips a shown one, `coverPictures` never counts it). It goes once another file opens or this one opens again (`pollQuickCover`), unless Save Quick Cover keeps it in `quickcovers.json` (file -> picture, read from where it is): the `on_preloaded` hook then adds it as the file opens (`Player.quickCoverFor`), before mpv shows another picture. Pasted pictures are kept in the config folder's `quickcovers/` (named by their bytes) and deleted once nothing shows or keeps them. Clipboard bytes are read with `startProcess`, not `execCmdEx`, which rejoins lines with "\n" and breaks a PNG's signature. windy's X11 `getClipboardString` waited forever when the owner refused the text (only a picture on the clipboard): `patches/windy.patch` takes a refusal as no text and gives up after 2 s.
-- Reverse playback (the Play button, `playButton`): while `Player.backward` the button shows `playrev` (the play symbol mirrored) in cyan (`colLoop`), and a click turns forward (playing if paused). Its right-click menu (`cmPlay`) has Enable reverse playback (`reversePlayback`, off at every start unless its Always is on): with it on, a click while playing forward turns backward (not in a synchronize group, whose clock only runs forward). Playing backward needs what Ping-Pong does: `backwardReady` opens local files without mpv's demuxer thread and cache (the file playing reopens in place when it's turned on), and `pingPong` keeps `hwdec` off (`softDecode`) while a ping-pong loop is on or playing backward. Links keep the demuxer thread and cache (streaming needs them), and two things let them keep up backward: YouTube sends a request left open to the file's end slowly (~0.25 MB/s, plenty forward, but each step back needs seconds of the stream at once) and a bounded one at full speed, so FFmpeg asks in 10 MiB pieces (`stream-lavf-o` `request_size`, as yt-dlp does: forward, streams buffer faster too); and once it runs out of what it has read, mpv goes back `demuxer-backward-playback-step` (60 s by default) and reads all of it before playing on, which `Player.setBackward` (`setBackStep`) makes ~4 MB of a link (5–60 s, by its bitrate). Before, a link played backward stood still for 5–14 s at each step, or for good. A file reads fast enough, but what's read waits in mpv's packet queue (150 MiB): 60 s of a file over ~20 Mbps (a screen recording) filled it, and backward playback stood still for good ("Backward playback is likely stuck/broken now"), the standby's turn too slow and the player turning itself hanging in mpv's core. The sound also goes back a few packets at a time, each time reading that far again, threadless in mpv's core (the picture now and then stood still mid-span). So a file's step is ~40 MB by its size over its length, 5–15 s (keyframes further apart take two goes), 10 s while its length isn't known; `sendStandby` sets it again once the standby has the file's path (it was set for the one before). Turning a video backward itself (`turnHere`), hardware decoding goes off in the same command list (`Player.turnAt`'s `soft`): a hardware decoder can't hold a span's frames ("No decoder surfaces left") and failing over on its own stopped the picture for a few tenths of a second. A keyframe span's frames wait in `video-reversal-buffer`, raised from 1 GiB to an eighth of the RAM (6 GiB at most; only what a span holds is taken): a 4K60 span is ~3.7 GB, and frames that don't fit are dropped, the picture standing still and then jumping. `pingPong` turns forward only when a loop goes off, so a backward the button set lasts. Reaching the start backward outside a ping-pong loop, `handleEof` turns forward and pauses there. Playing, the button's turns come at once (next entry: from the spot heard; a video's as soon as the standby has its picture there, ~0.2-0.35 s for 1080p with keyframes 8 s apart); the button shows the way playback is about to go (`heading`), and a second click before a video's turn calls it off. Under it, Always (`reversePlaybackAlways`, saved) keeps it on from one session to the next; turning Always on first asks, in a Yes/Cancel window (`showConfirm`, `ovConfirm`, a reusable question window whose text takes blank-line paragraphs and `- ` bullet points, wrapped in full, the window as tall as they need: `confirmLayout`), warning in plain words of more RAM and video memory (each video loaded up to three times: the standby and the keyframe bridge), more CPU and GPU work, and stutter on big files or slow drives (no read-ahead). Yes turns both on; turning Enable reverse playback off turns Always off too, and Always goes off without asking. Script command: `playbtn` (a click); `acmenu play`/`acaction play` for the menu; `cfmdump`/`cfmanswer yes|cancel` for the question window.
+- Reverse playback (the Play button, `playButton`): while `Player.backward` the button shows `playrev` (the play symbol mirrored) in cyan (`colLoop`), and a click turns forward (playing if paused). Its right-click menu (`cmPlay`) has Enable reverse playback (`reversePlayback`, off at every start unless its Always is on): with it on, a click while playing forward turns backward (not in a synchronize group, whose clock only runs forward). Playing backward needs what Ping-Pong does (`backwardReady`). A file's reading (`Player.setDemuxing`, `DemuxMode`): mpv's demuxer thread misses the call to read further back now and then once it has read to a file's end (a turn there stood still 1–2.5 s, for good with mpv's cache on, as for a network or FUSE drive), so whatever plays backward is read in mpv's core (`dmThreadless`, cache off: the standby facing backward, `standbyDemux`; sound alone, which turns around itself at once, opened so by `playIndex` or reopened so when reverse playback is turned on with it open); but read that way nothing is read ahead, and on a slow drive playing forward stood still at each hiccup (tmp/slowfs: a FUSE drive at 40 MB/s with 0.3 s hiccups, 111–564 ms stand-stills), so a video playing forward reads ahead as with reverse playback off (`dmAhead`), the standby playing it backward. When it has to turn itself (the standby not to be had: an A-B loop, a file's very end, Ping-Pong's fallbacks, paused), `turnSelf` opens it again facing backward, read in mpv's core (`reopenHere`'s `back`; during a seek or an opening, once that's done: `selfTurnAfter`). mpv's seekable cache would keep what it read, but a seek into the kept end of a file (its last keyframe's span) never gets going, one stream waiting on the other, which gets no new packet (demux.c's "delaying stream"), a threadless core spinning for good; and `drop-buffers` before such a seek leaves the decoders reading the emptied demuxer before the seek runs, which spins too (tmp/rvs/eofprobe.py, sblat.py). `pingPong` keeps `hwdec` off (`softDecode`) while a ping-pong loop is on or playing backward. Links keep the demuxer thread and cache (streaming needs them), and two things let them keep up backward: YouTube sends a request left open to the file's end slowly (~0.25 MB/s, plenty forward, but each step back needs seconds of the stream at once) and a bounded one at full speed, so FFmpeg asks in 10 MiB pieces (`stream-lavf-o` `request_size`, as yt-dlp does: forward, streams buffer faster too); and once it runs out of what it has read, mpv goes back `demuxer-backward-playback-step` (60 s by default) and reads all of it before playing on, which `Player.setBackward` (`setBackStep`) makes ~4 MB of a link (5–60 s, by its bitrate). Before, a link played backward stood still for 5–14 s at each step, or for good. A file reads fast enough, but what's read waits in mpv's packet queue (150 MiB): 60 s of a file over ~20 Mbps (a screen recording) filled it, and backward playback stood still for good ("Backward playback is likely stuck/broken now"), the standby's turn too slow and the player turning itself hanging in mpv's core. Without a cache, mpv drops every packet before the one it reads, the very ones it wants next backward: each span of the video, and each batch of the sound, reads its step again. mpv's batch of sound is 10 packets, a fifth of a second of AAC or MP3: by far most of those reads (an OBS recording: 125 in 20 s). `Player.backBatches` (applied as tracks are known, `applyBatches`, to a threadless player): ~a second of sound by the codec's packet size, 10–100 packets, for codecs whose every packet is a keyframe (TrueHD's keyframes are its sync frames, ~15 a second: 1024 of them overflowed mpv's queue; mpv takes 1024 at most), 22 reads in 20 s; and a video of keyframes alone (`IntraCodecs`: ProRes, APV, DNxHD, MJPEG...), decoded one frame at a time with the decoder flushed after each, used one of its threads (ProRes 1080p60 at 173 Mbps played backward at 0.88x, APV stood still 0.1 s at each step), so 8 frames at a time (as long as that fits twice in the reversal buffer; 30 stood still 70 ms at each batch, none of it shown before it's all decoded), and the keyframe bridge stays off for it (`Player.intraVideo`). So a file's step is ~40 MB by its size over its length, 2–15 s (keyframes further apart take two goes; mpv can't play the step it went back for before it's read it all, in its core: ProRes, 5 s stood still 0.13-0.2 s), 10 s while its length isn't known; for a video of keyframes alone 0.25–1 s, set again as its tracks are known (read back 8 times a second, ProRes at 2 s stood still ~70 ms each second, at 1 s never); `sendStandby` sets it again once the standby has the file's path (it was set for the one before). Turning a video backward itself (`turnHere`), hardware decoding goes off in the same command list (`Player.turnAt`'s `soft`): a hardware decoder can't hold a span's frames ("No decoder surfaces left") and failing over on its own stopped the picture for a few tenths of a second. A keyframe span's frames wait in `video-reversal-buffer`, raised from 1 GiB to an eighth of the RAM (6 GiB at most; only what a span holds is taken): a 4K60 span is ~3.7 GB, and frames that don't fit are dropped, the picture standing still and then jumping. `pingPong` turns forward only when a loop goes off, so a backward the button set lasts. Reaching the start backward outside a ping-pong loop, `handleEof` turns forward and pauses there. Playing, the button's turns come at once (next entry: from the spot heard; a video's as soon as the standby has its picture there, ~0.2-0.35 s for 1080p with keyframes 8 s apart); the button shows the way playback is about to go (`heading`), and a second click before a video's turn calls it off. Under it, Always (`reversePlaybackAlways`, saved) keeps it on from one session to the next; turning Always on first asks, in a Yes/Cancel window (`showConfirm`, `ovConfirm`, a reusable question window whose text takes blank-line paragraphs and `- ` bullet points, wrapped in full, the window as tall as they need: `confirmLayout`), warning in plain words of more RAM and video memory (each video loaded up to three times: the standby and the keyframe bridge), and more CPU and GPU work. Yes turns both on; turning Enable reverse playback off turns Always off too, and Always goes off without asking. Script command: `playbtn` (a click); `acmenu play`/`acaction play` for the menu; `cfmdump`/`cfmanswer yes|cancel` for the question window.
 - Seamless turns (`turnTick` and the procs before it; `Player.setTurnFades`, `Player.heardPos`): mpv turns around with a seek that drops the sound queued for its output: a 40–65 ms jump with a click, and in a ping-pong loop with video 20–40 ms of silence. The Play button's turns (`turnTo`, with Enable reverse playback on) come at once instead, as a turn that waits for a crossfade can't: mpv has ~0.44 s of the sound filtered ahead of what's heard (0.2 s `audio-buffer`, 0.1 s PulseAudio's buffer and the queues between), out of any fade's reach. Without a picture the playing player turns itself (`turnHere`, `Player.turnAt`): direction and an exact seek to the spot heard (`heardNow`: `audio-pts` as of now) go to mpv in one command list (`set play-direction ...; seek ... absolute exact`), as mpv makes its own seek for a turn the moment the direction changes (to its time, ~60 ms behind what's heard) before taking a seek sent after it, then seeks again (a few tenths of a second more with a picture, and now and then a packet further on). mpv drops the sound it has queued, and threadless, the sound going the other way follows with no gap, within a fraction of a millisecond of the spot heard (FLAC, MP3, AAC; now and then a PipeWire cycle, 21 ms, later as the drop lands; MP3 going forward again starts after its decoder's 10-30 ms warm-up). Being the mirror image of what was heard, the wave carries on unbroken: no fade (a fade-in from silence would only break it, by a simulation on music, `tmp/revsnd/clicksim.py`), except when the sound isn't mirrored exactly (`smeared`: the equalizer, or pitch correction at another speed): it fades in over `TurnHereFade` (10 ms) then. With a picture, the playing player turning itself would stop sound and picture while mpv decodes back from the keyframe before the spot (0.3-0.5 s for 3 s of 1080p H.264), so the standby is kept parked (`parkTick`, `park`, `tnParking`/`tnParked`): the file open, threadless, facing the other way, paused (the player a turn took over from stays as the next one's, as it is). A click sends it (`seekTurn`) to where playback will be once it's there: the sound heard plus its learned seek time (`tnSeekPrep`, up at once when slower, down slowly; ~0.15-0.2 s for that 1080p file) and `TurnSeekMargin`, plus `TurnOpenExtra` when it has the file to open. The spot is put on the start of a frame, on the grid of the one shown (`frameRate`), the standby sent a little inside it: mpv starts the sound with the frame holding the spot, up to a frame's time away. Its sound fades in from wherever it starts (`setTurnFades`' `startIn`: `afade` by sample from the filters' first, made anew by the seek), and once the sound heard gets there (a short sleep closes the last pass), the playing player pauses, its sound breaking off, and the standby plays on (`seekOver`): within ~5-20 ms (an audio cycle). A standby slower than 2.5 s, or one that can't serve, gives the turn to `turnHere`; pausing meanwhile turns it the plain way (silent). Ping-Pong's turns (`pingPongTurn`: at B or A, or `TurnEdge`/`TurnEdgeEnd` inside a file's start and end) go to the standby (`planTurn`). Opened facing the other way (threadless; `hwdec` off backward) a run-up past the turning point, it gets `@turn` in its `af`: an `afade` in centered on the turning point, silent before it (afade takes no negative times, and backward mpv's times are negated: `asetpts` shifts them by `TurnShift` around it). It's set playing that run-up ahead, less its learned start delay (`tnDelays`, by direction, picture and file edge), and `alignTurn` measures how far it is from the playing player's mirror image (the sum of both `audio-pts` stays twice the turning point; within ~0.2 ms of recordings), then moves it to the sample while it's still silent: `atrim=start_sample` when late, `adelay` + `aformat` + `asetpts` when early. (`adelay` takes planar formats only, and filters putting out another format than they get have mpv reopen its output, losing ~0.27 s with `gapless-audio=no`: hence `aformat` back to `Player.turnFormat`; files afade can't take turn the plain way. A speed change can't do it: mpv filters in ~0.1 s bursts, so how much one covers is unknown.) The playing player's fade-out goes into its `af` (`armTurn`) at least `TurnArm` before the turning point, as mpv filters ~0.3 s ahead of what's heard; changing `af` is seamless, and mpv keeps unchanged filters (the equalizer's) running. The crossfade is 5 ms once lined up, 20 ms otherwise or with the equalizer on (IIR filters on reversed sound don't give the mirror image of their forward output, ~1 ms apart: a short crossfade leaves a hole on a steady tone), 80 ms with pitch correction at another speed (scaletempo2 builds its sound from ~20 ms pieces and can skip a shorter fade). At the turning point the standby takes over the picture (`turnOver`); the old player plays on unheard until its fade-out has been heard (`heardPos`: the picture's time runs ahead at higher speeds) and waits paused as the next standby. Every seek clears a player's fades first (`clearTurnFades`), as a seek recreates the filters from `af`. A turn's fade-in leaves `af` once heard (`tnFadeIn`), counted from its seek's restart: before that, the player's time is still the old way's. At a file's end the standby can't be lined up in time (sent backward, mpv starts from the start of the packet holding that point, up to ~0.1 s short, and not from the last 60 ms), so turns there land within a PipeWire cycle behind a 20 ms crossfade. Turns go the plain way when the standby can't serve (a loop's standby or loop sound, step frames, links, a synchronize group, too close to a file's ends) or isn't ready in time; seeking, stopping or opening a file calls a turn off, and pausing makes the Play button's turn at once (silent then). `MMP_TRACE_TURNS=1` prints each turn's steps to stderr.
-- Keyframe bridge (`bridgeFrames` and the procs before it; `rb*` fields): played backward, mpv decodes a keyframe's whole span before showing the last of its frames, and starts on a span only once the span after it has all been shown (`f_decoder_wrapper`'s reversal queue). So at every keyframe the picture stood still while it decoded, then skipped frames to catch up, the sound playing on: ~0.1 s for 1080p60 with keyframes 4 s apart, 0.3-0.35 s for 4K60, ~0.25 s each second for 1080p60 AV1, longer for the first keyframe after a turn or a seek (mpv reads back from there too: ~0.3-0.65 s for 1080p60). Nothing in mpv starts that decoding sooner: its decoder thread (`vd-queue-enable`) leaves backward playback threadless broken (no picture, or an abort). Instead, a player of its own, without sound (`a.rb`, `newPlayer`'s `pictureOnly`: no scripts, paused, speed 100; made in ~3 ms the first time it's wanted), takes the frames just before the keyframe playback goes back to next, ahead of time, as step frames are taken (`takeBridgeFrame`, in the GL pass, the time and the picture both new before one's kept): a keyframe seek (`absolute+keyframes`) from the shown frame's time finds the keyframe (`rbK`), an exact seek goes to `rbNeed` (learned: up at once but at most 1.6 times, down slowly, 0.25-1.5 s; at least `BridgeFirst`, 0.7 s, for the first keyframe after a turn or a seek) before it, a third of a frame off the frames' grid (until it lands, mpv tells the spot asked for as its time), going forward, hardware decoding as set, and `frame-step` takes it on to `BridgeAfter` (3) frames past the keyframe, a texture each frame at the window's video size (within Options > System's memory for loop frames, the ones furthest back let go first), with a few of its pixels (`pictureSig`: a 32x18 nearest blit read back). ~0.1-0.25 s for 1080p, 0.4-0.6 s for 4K; spans shorter than that can't be bridged (`too slow` in the trace). While a video that could play backward plays (`backwardReady`, a local file), the bridge player has it open, paused: setting up its picture (its render context, ~0.1 s in the window's thread) is better done at opening than at the turn; unused `ContextIdle`, its file and render context go. mpv tells a frame's time (`time-pos`) as it hands the frame on, up to two frames before it's drawn (one waits in its output's queue, one for the window), so the playing player's picture is told apart by its pixels: near the keyframe each new picture it draws (`rbPicAt`, and when it was due, `rbPicDue`, from `frameDue`) gets a `pictureSig`, found among the bridge's (`bridgeMatch`: the same frame differs by rounding only, ~0.03 a value between hardware and software AV1 decoding; the next, in a still scene, by ~0.1). No new picture `BridgeLate` (1.25) frames after the last was due, and none waiting, it stands still (`rbStaleAt`): the clock (`bridgeClock`, mpv's clock, which reading waits on nothing: the playing player's core is busy decoding, and any sync call to it would hold up the window) runs on from that picture's time and due time, and the bridge frame due by it is shown (`bridgeDue`, `rbShow`, in `drawVideo`), from the one right after the player's last; that one not found, it's taken as a frame before the time told, and only frames past that time are shown (an older picture after a newer one would be worse than a frame skipped). Past the bridge's earliest, that one's held. The player's own pictures come back (`bridgeCaughtUp`, asked again right after each one's drawn, so the next isn't missed) once one's at or past the frame due (by its pixels, or else two frames before the time told, the most it can be), or as soon as it draws again with nothing of the bridge's due (it didn't stand still after all), or after `BridgeStale` (3 s). Checked on a clip with each frame's number in its top rows (`tmp/rvs/numclip2.mkv`; `tmp/rvs/mkcheck.sh` builds with every picture drawn read back, `MMP_TRACE_TURNS=1 RBCHECK=1`, `tmp/rvs/chk.py` lists steps back, skips and hand-overs): over 60 hand-overs, each picture in order, none skipped or out of order. Ping-Pong A-B loops skip a keyframe before A (playback turns before it). The standby can't take the frames: parked for a turn, its sound makes every step wait ~60 ms, and its sound turned off and on again (`aid`) left the next seek's decoding broken (AV1 hardware decoding "No sequence header available", failing over and setting up Vulkan in the window's GL pass, ~0.35 s). The system media controls' title, artist and album are observed (`Player.info`), not asked for: a sync read waited out a keyframe's decoding in the main loop (0.2-0.3 s for 4K). With `MMP_TRACE_TURNS=1`, each frame shown playing backward is traced (`shown 0|1 TIME`: the player's own, by the time told, or a bridge frame), and the bridge's fills and stand-stills; `tmp/rvs/vis.py` reads that for freezes, skips and steps back (by the times told: the player's own lag their pictures), `tmp/rvs/suite.sh` runs five videos backward; `MMP_NO_BRIDGE=1` shows mpv's stand-stills as they are.
+- Keyframe bridge (`bridgeFrames` and the procs before it; `rb*` fields): played backward, mpv decodes a keyframe's whole span before showing the last of its frames, and starts on a span only once the span after it has all been shown (`f_decoder_wrapper`'s reversal queue). So at every keyframe the picture stood still while it decoded, then skipped frames to catch up, the sound playing on: ~0.1 s for 1080p60 with keyframes 4 s apart, 0.3-0.35 s for 4K60, ~0.25 s each second for 1080p60 AV1, longer for the first keyframe after a turn or a seek (mpv reads back from there too: ~0.3-0.65 s for 1080p60). Nothing in mpv starts that decoding sooner: its decoder thread (`vd-queue-enable`) leaves backward playback threadless broken (no picture, or an abort). Instead, a player of its own, without sound (`a.rb`, `newPlayer`'s `pictureOnly`: no scripts, paused, speed 100; made in ~3 ms the first time it's wanted), takes the frames just before the keyframe playback goes back to next, ahead of time, as step frames are taken (`takeBridgeFrame`, in the GL pass, the time and the picture both new before one's kept): a keyframe seek (`absolute+keyframes`) from the shown frame's time finds the keyframe (`rbK`), another from just before it the one before (`rbBefore`): the span between (`rbSpan`) is what the player decodes there, and the longer it is, the longer it stands still (4K HEVC 10-bit: ~0.1 s a second of span, 1 s for 8.5 s; learned to cover only the stand-stills seen, the bridge fell 0.3-0.5 s short at long spans, the AV1 clip 0.2-0.5 s). An exact seek goes to `rbRate` (stand-still per second of span, learned: up at once but at most 1.6 times, down slowly, 0.01-0.5) times 1.25 the span, plus two frames, before it (0.25-3 s; the span unknown, `rbNeed`, learned as a time; both anew for each file, `rbLearnt`, generous until then: 4K stands still ten times as long as 1080p; at least `BridgeFirst`, 0.7 s, for the first keyframe after a turn or a seek), a third of a frame off the frames' grid (until it lands, mpv tells the spot asked for as its time), going forward, hardware decoding as set, and `frame-step` takes it on to `BridgeAfter` (3) frames past the keyframe, a texture each frame at the window's video size (within Options > System's memory for loop frames, the ones furthest back let go first), with a few of its pixels (`pictureSig`: a 32x18 nearest blit read back). ~0.1-0.25 s for 1080p, 0.4-0.6 s for 4K; spans shorter than that can't be bridged (`too slow` in the trace). While a video that could play backward plays (`backwardReady`, a local file), the bridge player has it open, paused: setting up its picture (its render context, ~0.1 s in the window's thread) is better done at opening than at the turn; unused `ContextIdle`, its file and render context go. mpv tells a frame's time (`time-pos`) as it hands the frame on, up to two frames before it's drawn (one waits in its output's queue, one for the window), so the playing player's picture is told apart by its pixels: near the keyframe each new picture it draws (`rbPicAt`, and when it was due, `rbPicDue`, from `frameDue`) gets a `pictureSig`, found among the bridge's (`bridgeMatch`: the same frame differs by rounding only, ~0.03 a value between hardware and software AV1 decoding; the next, in a still scene, by ~0.1). No new picture `BridgeLate` (1.25) frames after the last was due, and none waiting, it stands still (`rbStaleAt`; not sooner: the player's last picture before standing still is nearly always the frame after the keyframe, but mpv doesn't always stand still there, a short span decoded in time, and taking over as that's drawn showed the keyframe's picture after a newer one of the player's, a step back): the clock (`bridgeClock`, mpv's clock, which reading waits on nothing: the playing player's core is busy decoding, and any sync call to it would hold up the window) runs on from that picture's time and due time, and the bridge frame due by it is shown (`bridgeDue`, `rbShow`, in `drawVideo`), from the one right after the player's last; that one not found, it's taken as a frame before the time told, and only frames past that time are shown (an older picture after a newer one would be worse than a frame skipped). Past the bridge's earliest, that one's held. The player's own pictures come back (`bridgeCaughtUp`, asked again right after each one's drawn, so the next isn't missed) once one's at or past the frame due (by its pixels, or else two frames before the time told, the most it can be), or as soon as it draws again with nothing of the bridge's due (it didn't stand still after all), or after `BridgeStale` (3 s). Checked on a clip with each frame's number in its top rows (`tmp/rvs/numclip2.mkv`; `tmp/rvs/mkcheck.sh` builds with every picture drawn read back, `MMP_TRACE_TURNS=1 RBCHECK=1`, `tmp/rvs/chk.py` lists steps back, skips and hand-overs): over 60 hand-overs, each picture in order, none skipped or out of order. Ping-Pong A-B loops skip a keyframe before A (playback turns before it). The standby can't take the frames: parked for a turn, its sound makes every step wait ~60 ms, and its sound turned off and on again (`aid`) left the next seek's decoding broken (AV1 hardware decoding "No sequence header available", failing over and setting up Vulkan in the window's GL pass, ~0.35 s). The system media controls' title, artist and album are observed (`Player.info`), not asked for: a sync read waited out a keyframe's decoding in the main loop (0.2-0.3 s for 4K). With `MMP_TRACE_TURNS=1`, each frame shown is traced (`shown 0|1 TIME`: the player's own, by the time told, or a bridge frame), and the bridge's fills and stand-stills; `tmp/rvs/back.py` reads that for the Play button's turn (click to the first frame going backward) and the freezes, skips and steps back after it (by the times told: the player's own lag their pictures), `tmp/rvs/suite.sh` runs five videos backward, `tmp/rvs/bigsuite.sh` six big ones (ProRes, APV, an OBS recording, 4K HEVC and HDR films; `BIGDIR` for tmp/slowfs's slow drive); `MMP_NO_BRIDGE=1` shows mpv's stand-stills as they are.
 - Stop / Pause after current (the Stop and Pause buttons' right-click menus, `cmStop`/`cmPause`): `afterCurrent` (session only, one of the two at a time) is read by `afterEof` before anything else. Stop runs `stop` there (no queue, no next entry, no After playback action); Pause lets the usual next entry open and pauses it right after `playIndex` (`pauseOnLoad` pauses it again when it has loaded and sends the synchronize group `pause` instead of `play`; Play clears it), and with Repeat File seeks the file back to 0, paused. While either is on, `applyLoop` leaves `loop-file` off so Repeat File reaches its end, a ping-pong file ends at its forward end, and the gapless queue and a short file's delay stand aside. Each goes off once used unless its "Preserve the above after current" (`stopAfterKeep`/`pauseAfterKeep`, saved) is on. The button shows a dot (`dot6`) at its symbol's top right while on: white, indigo (`colAccent`) when preserved. Script commands: `acmenu`, `acaction`, `acdump`.
 - Gapless audio: `gapless-audio` stays `no` (in gapless mode mpv reports the end with ~0.25 s still queued, which opening the next file would cut off), except when mpv has the next file itself. In the last 15 s of an audio file (an audio extension or a cue track) played straight through, `queueGapless` appends the entry `afterEof` would play (the playlist's next, the first when repeating the playlist, or the folder's next with Play next file in the folder) to mpv's playlist and turns gapless on (`weak`: a change of sample rate or channels still reopens the output, with a short gap); `prefetch-playlist` opens it ahead. Videos, the queue, loops, ping-pong, a short file's delay, Stop or Pause after current and synchronized slaves keep the app's own path. mpv then goes on by itself; `Player.wentOn` takes the new path from the `end-file` event and `adoptGapless` runs `playIndex` without opening the file (`adopting`). `handleEof` stands aside while a file is queued, as `eof-reached` can show for a moment before mpv moves on. Gapless is turned off again only once the new file plays (`settled`): turned off while mpv changes files, the new file's audio setup would drop the sound still queued.
 - Seek bar clicks: a click seeks exactly once, on press, so the picture never visits the keyframe before the spot; dragging seeks to keyframes between marks and exactly on a mark snapped to. `Player.landOn` keeps the time shown (seek bar, status bar, OSD) on an exact seek's target until `landingOn` sees it land: mpv's `time-pos` stays the old one for a while, and a keyframe's after an earlier seek.
@@ -807,8 +911,8 @@ it held, to commit.
   on its arrow or a double-click on it expands or collapses it (`libraryExpanded`, keys
   `"<library>\n<folder>"`, renamed with the library by `renamedInTree`); collapsing a node holding
   the folder picked picks the node. A folder picked lists the library's files in it and below
-  (`libraryRows` keeps those `under` it while the search's `in:` is that library alone); another
-  library (a click, the search's `in:` tag) leaves the folder. Right/Left expand and collapse in the
+  (`libraryRows` keeps those `under` it while the search's `within:` is that library alone and it
+  has one `in:` tag); another library (a click, the search's `within:` tag) leaves the folder. Right/Left expand and collapse in the
   column (again: the first folder, the one holding it). A folder's menu (`lcFolder`) plays its files
   or adds them to the playlist (`libFolderPaths`, sorted as the list), opens the folder or copies
   its path.
@@ -845,8 +949,20 @@ it held, to commit.
   `buildLibraryView` leaves their files out of `libView`, dropping them from the selection (Select
   All and Ctrl+A take the files shown). Play in New Player (Shift+Enter) starts this program with
   `--new-player` and the files, which never hands them to a running player.
-  Search tags are split at commas only (quotes are characters): `in:`/`exclude:` (a name, or every
-  name it begins), `hidden`, `size`/`bitrate`/`dimension` + `exactly`/`biggerthan`/`smallerthan`
+  A press on a selected file starts a drag of the selection (`"librow"`, `libDrag`; the files go in
+  `rowDragPaths` with `rowDragTab` 0, as no playlist's). Let go over the playlist panel
+  (`plPanelRect`, the header and the space below the rows included) they go in at the row boundary
+  under the pointer (`libAddToPlaylist`), the top above the rows, the end below them; its tabs and +
+  take them as rows dragged from another playlist (`dropRows`, held over a tab shows it). Let go over
+  the part of the video frame no panel or bar covers (`videoClearRect`, outlined with "Play N files"
+  while over it), they play as a double-click plays them (`libPlay`).
+  Search tags are split at commas only (quotes are characters): `within:`/`exclude:` (libraries: a
+  name, or every name it begins), `in:` (folders, any of the `in:` tags: `folderValue` makes the
+  value lower case, splits it at either slash and drops commas, and it matches when those names run
+  on in the file's folders, `dirsOf`: the outermost listed folder's own name and those below it down
+  to the file's, `/music/artist/album/`, cached per file beside the free text; so `in:Album`,
+  `in:Artist/Album` and `in:Music/Artist` all work; an absolute path takes what's `under` it),
+  `hidden`, `size`/`bitrate`/`dimension` + `exactly`/`biggerthan`/`smallerthan`
   (`1.5GB` covers what rounds to it; K/M/G are 1024s for sizes, 1000s for bit rates; a dimension is
   `WxH` or one number for the shorter side, `1080p`, `4k`), `dc:` (date created, `parseCreated`: a date
   to the year, month, day, hour, minute or second, digits run together, `20251010`, or split by anything,
@@ -855,15 +971,42 @@ it held, to commit.
   file's birth time, `LibFile.ctime`, read by the walk with `statx` on Linux and from `FileInfo` on
   Windows, the last change standing in where the file system keeps none; an index saved before it has
   0 there until the next walk fills it in), `format:`, `filename contains:`, `path:`,
-  any other `field:` (the tags mpv reports, `artist` also matching album artist), free text in the
+  any other `field:` (the tags mpv reports, `artist` also matching album artist), free text at
+  the start of a word (`hasWordStart`: after a space, punctuation or `_`, or between letters and
+  digits, so `oni` finds `Oni` but not `Electronic`, which buried what was looked for under
+  hundreds of rows; in scripts without spaces, Chinese, Japanese, Korean, Thai and the like,
+  anywhere) in the
   name, title, artist, album and folders (`foldersOf`: those below the outermost listed folder
   holding the file, `Artist/Album`, so a search can span them; the listed folder's own name is
-  left out, as every file in it would match; a file listed alone, its folder's name). The suggestions offer library names after `in:`/`exclude:` and the
-  tag names otherwise. The library listed (`libraryShown`) and the search's `in:` tag go together:
-  a click on a library puts `in:<name>` in place of the search's `in:` tags (All takes them out,
-  `withInLibrary`), and as the search changes the column follows it (`syncLibraryShown`: an `in:`
-  naming a library lists it, none lists All; a library listed without a tag, as older versions
-  saved it, gets one). Renaming a library renames it in the search's tags (`renamedInSearch`).
+  left out, as every file in it would match; a file listed alone, its folder's name). The suggestions offer library names after `within:`/`exclude:`, the
+  folders of the libraries searched after `in:` (`folderTag`, depth first), and the tag names
+  otherwise. The libraries' column and the search's scope tags go together: a click on a library
+  makes the first `within:` tag name it (added in front when there's none) and takes the `in:`
+  tags out; a click on a folder (a breadcrumb too) also makes the first `in:` tag name it (added
+  after `within:`), as `folderTag` writes it: its names from the library's listed folder down,
+  that folder's own name first when the library lists several; All takes both kinds out
+  (`withScope`, other tags kept in their order). As the search changes the column follows it
+  (`syncLibraryShown`): a `within:` naming a library lists it, none lists All; the first `in:` picks
+  the folder of the library listed it names, else the only one whose names end with it (`in:Album 1`
+  for `Artist/Album 1`), the folders holding it expanded (`libRevealFolder`); until the index is
+  read at launch it keeps trying each frame. A library or folder listed without a tag, as older
+  versions saved it, gets one. Searches saved when `in:` named libraries have those tags made
+  `within:` once (`withinFromIn`, `librarySearchWithin`). Renaming a library renames it in the search's tags (`renamedInSearch`).
+  The search field is a `textField` with `chips` (`libSearchChip`: `hidden` and a key with a value
+  are tags, `within:` ones `ckScope`). The text stays the plain comma-separated string; only drawing,
+  hit-testing and caret moves change (`fieldPieces` cuts it into runs drawn as typed and chips).
+  A tag a comma ends is drawn as a chip (unfocused, the last one too), its key dimmer than its
+  value, `within:` ones blue; the comma and the spaces after it aren't drawn and the caret never stops
+  in them (`pastChipTag`: Left lands at the tag's end, Right past them). With the caret in a tag
+  (clicked, or moved there by the keys) or the selection starting inside it, the chip opens: an
+  outline around the text being edited. Focusing the field (a click off any chip, Tab, Ctrl+F)
+  selects only the free text (`freeText`: the last run of parts that aren't tags), so typing
+  keeps the tags; a click on a chip goes straight into it. While focused, a single click places
+  the caret, a double-click selects everything after the first `within:` tag (`afterScope`; all of it
+  without one), a triple-click everything. Backspace right after a chip selects it, a second one
+  deletes it; Delete at the end of a tag does nothing, as it would take the comma no one sees.
+  `panelsdump` prints the field's selection (`sel=anchor..caret`). Test kit: `tmp/chips/t1.sh`
+  (real clicks and keys in a nested KWin, dumps every 0.25 s, a screenshot a second).
   Test kits: `tmp/lib/libtest.nim` (scanning, search, rescans, saved index),
   `tmp/lib/hangtest.nim` with `tmp/lib/hang/hangfs` (a FUSE folder whose calls never return; kill
   it by PID to release the test), `tmp/lib/bigtest.nim` (20 000 files), `tmp/libt/run.sh` (GUI), `tmp/libtree/run.sh` (nested folders, the tree).
@@ -884,11 +1027,13 @@ it held, to commit.
 | `src/trackerchart.nim` | The tracker chart drawn in the video frame |
 | `src/modstream.nim` | A module played through libopenmpt as a WAV stream mpv reads, for pitch shift and unstretched samples |
 | `src/midistream.nim`, `src/fluidsynth.nim` | MIDI files played through FluidSynth as a WAV stream mpv reads; the SoundFont lookup |
+| `src/wsaud.nim` | Westwood .aud: IMA ADPCM decoded from the start into a WAV stream mpv reads (seeks at full loudness), true lengths |
 | `src/rgscan.nim` | ReplayGain measured (ffmpeg decoding, BS.1770 loudness on a thread) and written to the selected files' tags |
 | `src/tagedit.nim` | Tags read and written through TagLib's C bindings (loaded at run time) |
 | `src/cue.nim` | Cue sheets: parsed, their audio file found, tracks as playlist entries played through EDL |
 | `src/plmanager.nim` | The playlists' data: tabs, undo steps, playlists.json and its merge between players |
 | `src/tagdlg.nim` | The playlist's Properties window: the tag grid, Autofill, Details |
+| `src/m2c.nim` | Majestic Meta Container (.m2c): tags, ReplayGain included, for files that can't keep any, in an m2c subfolder; read, written and laid over the file's own |
 | `src/library.nim` | The libraries' index: paths walked and tags read on worker threads, the saved index, search tags, sorting |
 | `src/libtypes.nim` | Options > Libraries > Custom...: a library's file types |
 | `src/midisong.nim` | MIDI and HMI files as timed messages (HMI through SOS's sequencer), and the chart's rows |

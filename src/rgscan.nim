@@ -11,10 +11,18 @@
 ##
 ## Tags: REPLAYGAIN_{TRACK,ALBUM}_{GAIN,PEAK} ("-6.54 dB", "0.988831"), what
 ## mpv reads; Opus files get R128_{TRACK,ALBUM}_GAIN instead (Q7.8 relative
-## to -23 LUFS, RFC 7845), which mpv reads as well.
+## to -23 LUFS, RFC 7845), which mpv reads as well. A file whose format keeps
+## no tags (Westwood .aud, MIDI, tracker modules...) gets the REPLAYGAIN_
+## ones in its .m2c (m2c), which the player applies itself.
+##
+## MIDI files are measured as they play, not through ffmpeg (which would
+## play them with libmodplug's instruments): rendered by FluidSynth with the
+## SoundFont they play with (midistream's renderOpen), the same samples mpv
+## gets. Their values hold for that SoundFont.
 
-import std/[os, osproc, streams, strutils, math, locks, tables]
-import tagedit
+import std/[os, osproc, streams, strutils, math, locks, tables, sequtils]
+import tagedit, m2c, midistream
+from config import MidiExtensions
 
 const
   RgReference* = -18.0     ## LUFS a gain takes the file to
@@ -64,6 +72,7 @@ type
     mode: RgMode
     paths: seq[string]
     durations: seq[float]
+    fonts: seq[string]        ## a MIDI file's SoundFont (as it plays), else ""
 
 # One worker for every job, started with the first and never ended. Nim's
 # allocator hands a block freed on another thread back to the heap of the
@@ -151,52 +160,49 @@ proc progress(index: int, frac: float) =
 proc cancelled(): bool =
   withLock sh.lock: result = sh.cancel
 
-proc measure(path: string, duration: float, index: int): Measure {.gcsafe.} =
-  result.path = path
-  let args = @["-v", "fatal", "-nostdin", "-i", path, "-map", "0:a:0", "-vn", "-sn", "-dn",
-               "-c:a", "pcm_f32le", "-f", "wav", "-"]
-  var p: Process
-  try: p = startProcess("ffmpeg", args = args, options = {poUsePath})
-  except OSError:
-    result.error = "ffmpeg can't be run"
-    return
+type
+  Source = object
+    ## Where a file's sound comes from, as a float WAV: ffmpeg's output, or
+    ## a MIDI file's render.
+    o: Stream                 ## ffmpeg's stdout, when not a render
+    render: pointer           ## midistream's, for a MIDI file
+
+proc read(s: Source, dst: pointer, n: int): int {.gcsafe.} =
   {.cast(gcsafe).}:
-    withLock sh.lock: sh.ffmpeg = p
-  defer:
-    {.cast(gcsafe).}:
-      withLock sh.lock: sh.ffmpeg = nil
-    p.close()
-  let o = p.outputStream
-  # Header: RIFF, then chunks up to "data"; ffmpeg's pipe WAV has fmt first.
-  var head: array[12, byte]
-  if o.readData(head[0].addr, 12) != 12 or fourcc(head, 0) != "RIFF":
-    discard p.waitForExit()
-    let err = p.errorStream.readAll.strip
-    result.error = if "matches no streams" in err: "no audio"
-                   elif err.len > 0: err.splitLines[^1]
-                   else: "ffmpeg can't decode it"
-    return
+    result = if s.render != nil: renderRead(s.render, dst, n) else: s.o.readData(dst, n)
+
+proc readFull(s: Source, dst: pointer, n: int): int =
+  ## n bytes unless the sound ends first (a pipe hands them in pieces).
+  while result < n:
+    let got = s.read(cast[ptr UncheckedArray[byte]](dst)[result].addr, n - result)
+    if got <= 0: break
+    result += got
+
+proc measureWav(result: var Measure, src: Source, duration: float, index: int) =
+  ## Measures the WAV src gives (32-bit float, any rate and channels), its
+  ## "RIFF....WAVE" read already: the chunks up to "data" (fmt first), then
+  ## the samples.
   var rate = 0
   var chans = 0
   var mask = 0'u32
   while true:
     var ch: array[8, byte]
-    if o.readData(ch[0].addr, 8) != 8:
-      result.error = "ffmpeg's output ended early"
+    if src.readFull(ch[0].addr, 8) != 8:
+      result.error = "the decoded sound ended early"
       return
     let id = fourcc(ch, 0)
     let size = readU32(ch, 4).int
     if id == "data": break
     var body = newSeq[byte](size + (size and 1))
-    if body.len > 0 and o.readData(body[0].addr, body.len) != body.len:
-      result.error = "ffmpeg's output ended early"
+    if body.len > 0 and src.readFull(body[0].addr, body.len) != body.len:
+      result.error = "the decoded sound ended early"
       return
     if id == "fmt " and size >= 16:
       chans = readU16(body, 2)
       rate = readU32(body, 4).int
       if size >= 24 and readU16(body, 0) == 0xFFFE: mask = readU32(body, 20)
   if rate <= 0 or chans <= 0:
-    result.error = "ffmpeg gave no audio format"
+    result.error = "no audio format in the decoded sound"
     return
   let (st1, st2) = kWeighting(rate.float)
   var s1 = newSeq[BiquadState](chans)
@@ -215,7 +221,7 @@ proc measure(path: string, duration: float, index: int): Measure {.gcsafe.} =
   var nextReport = 0
   while true:
     let want = buf.len * 4 - leftover
-    let got = o.readData(cast[ptr UncheckedArray[byte]](buf[0].addr)[leftover].addr, want)
+    let got = src.read(cast[ptr UncheckedArray[byte]](buf[0].addr)[leftover].addr, want)
     if got <= 0: break
     let bytes = leftover + got
     let n = bytes div (4 * chans)
@@ -247,10 +253,63 @@ proc measure(path: string, duration: float, index: int): Measure {.gcsafe.} =
         if cancelled():
           result.error = "cancelled"
           return
-  discard p.waitForExit()
   result.loudness = gated(result.blocks)
   if result.loudness.isNaN:
     result.error = if frames == 0: "no audio decoded" else: "silent or under 0.4 s"
+
+proc isMidiFile(path: string): bool =
+  path.splitFile.ext.toLowerAscii.strip(chars = {'.'}) in MidiExtensions
+
+proc measure(path: string, duration: float, index: int, font: string): Measure {.gcsafe.} =
+  result.path = path
+  if path.isMidiFile:
+    # As it plays: rendered by FluidSynth with its SoundFont.
+    if font.len == 0:
+      result.error = "no SoundFont to play it with"
+      return
+    var r: pointer
+    {.cast(gcsafe).}: r = renderOpen(path, font)
+    if r == nil:
+      result.error = "FluidSynth can't play it"
+      return
+    defer:
+      {.cast(gcsafe).}: renderClose(r)
+    let src = Source(render: r)
+    var head: array[12, byte]
+    if src.readFull(head[0].addr, 12) != 12 or fourcc(head, 0) != "RIFF":
+      result.error = "FluidSynth can't play it"
+      return
+    var total = duration
+    {.cast(gcsafe).}:
+      if total <= 0: total = float(renderSize(r) - 44) / 8 / 48000
+    {.cast(gcsafe).}: result.measureWav(src, total, index)
+    return
+  let args = @["-v", "fatal", "-nostdin", "-i", path, "-map", "0:a:0", "-vn", "-sn", "-dn",
+               "-c:a", "pcm_f32le", "-f", "wav", "-"]
+  var p: Process
+  try: p = startProcess("ffmpeg", args = args, options = {poUsePath})
+  except OSError:
+    result.error = "ffmpeg can't be run"
+    return
+  {.cast(gcsafe).}:
+    withLock sh.lock: sh.ffmpeg = p
+  defer:
+    {.cast(gcsafe).}:
+      withLock sh.lock: sh.ffmpeg = nil
+    p.close()
+  let src = Source(o: p.outputStream)
+  # Header: RIFF, then chunks up to "data"; ffmpeg's pipe WAV has fmt first.
+  var head: array[12, byte]
+  if src.readFull(head[0].addr, 12) != 12 or fourcc(head, 0) != "RIFF":
+    discard p.waitForExit()
+    let err = p.errorStream.readAll.strip
+    result.error = if "matches no streams" in err: "no audio"
+                   elif err.len > 0: err.splitLines[^1]
+                   else: "ffmpeg can't decode it"
+    return
+  {.cast(gcsafe).}: result.measureWav(src, duration, index)
+  discard p.waitForExit()
+
 
 # --- tags -------------------------------------------------------------------
 
@@ -261,8 +320,20 @@ proc q78(g: float): string = $int(round(clamp(g, -128.0, 127.99) * 256))
 proc isOpus(path: string): bool = path.splitFile.ext.toLowerAscii == ".opus"
 
 proc writeGain(path: string, track: Measure, album: ptr tuple[loudness, peak: float]): string =
-  ## Writes track's (and album's) values into path's tags; "" or why not.
+  ## Writes track's (and album's) values into path's tags, or its .m2c; ""
+  ## or why not.
   let r = readTags(path)
+  if path.usesSide(r.ok):
+    # Its .m2c, the rest of it kept: REPLAYGAIN_ fields, whatever the format.
+    var s = readSide(path)
+    var fields = s.tags
+    fields["REPLAYGAIN_TRACK_GAIN"] = @[fmtGain(RgReference - track.loudness)]
+    fields["REPLAYGAIN_TRACK_PEAK"] = @[fmtPeak(track.peak)]
+    if album != nil:
+      fields["REPLAYGAIN_ALBUM_GAIN"] = @[fmtGain(RgReference - album.loudness)]
+      fields["REPLAYGAIN_ALBUM_PEAK"] = @[fmtPeak(album.peak)]
+    s.cleared.keepItIf(it notin fields)
+    return writeSide(path, fields, s.cleared)
   if not r.ok: return "its tags can't be read"
   var tags = r.tags
   let tg = RgReference - track.loudness
@@ -283,8 +354,18 @@ proc writeGain(path: string, track: Measure, album: ptr tuple[loudness, peak: fl
   if w.dropped.len > 0: return "this format can't hold " & w.dropped.join(", ")
 
 proc removeGain*(path: string): string =
-  ## Takes every ReplayGain field out of path's tags; "" or why not.
+  ## Takes every ReplayGain field out of path's tags, or its .m2c; "" or
+  ## why not.
   let r = readTags(path)
+  if path.usesSide(r.ok):
+    let s = readSide(path)
+    var fields = s.tags
+    var cleared = s.cleared
+    for k in RgKeys:
+      fields.del k
+      cleared.keepItIf(it != k)
+    if fields == s.tags and cleared == s.cleared: return ""
+    return writeSide(path, fields, cleared)
   if not r.ok: return "its tags can't be read"
   var tags = r.tags
   for k in RgKeys: tags.del k
@@ -312,7 +393,7 @@ proc work(arg: WorkArg) =
     for i, path in arg.paths:
       if cancelled(): break
       progress(i, 0)
-      let m = measure(path, arg.durations[i], i)
+      let m = measure(path, arg.durations[i], i, arg.fonts[i])
       withLock sh.lock:
         sh.results.add m
         if m.error.len > 0 and m.error != "cancelled":
@@ -358,11 +439,18 @@ proc canWriteTags*(): bool =
   ## TagLib is there to write with.
   tagedit.available()
 
+proc canWriteGain*(path: string): bool =
+  ## path can be given ReplayGain values: into its tags with TagLib, else
+  ## into its .m2c (a file on disk).
+  tagedit.available() or path.usesSide(false)
+
 proc running*(j: RgJob): bool = j != nil and not j.done
 
-proc start*(paths: seq[string], durations: seq[float], mode: RgMode): RgJob =
+proc start*(paths: seq[string], durations: seq[float], mode: RgMode,
+            fonts: seq[string] = @[]): RgJob =
   ## Measures paths on a thread and tags them as poll finds them measured.
-  ## durations (0 where unknown) only make the progress smoother.
+  ## durations (0 where unknown) only make the progress smoother; fonts are
+  ## MIDI files' SoundFonts (soundFontFor), "" for the rest.
   if not inited:
     initLock sh.lock
     initCond sh.cond
@@ -370,6 +458,9 @@ proc start*(paths: seq[string], durations: seq[float], mode: RgMode): RgJob =
     createThread(worker, workLoop)
     inited = true
   discard tagedit.load()   # its library's globals, set before the thread uses them
+  discard midistream.available()  # FluidSynth's, likewise
+  var fonts = fonts
+  fonts.setLen paths.len
   withLock sh.lock:
     while not sh.finished: wait(sh.cond, sh.lock)   # the last job's tail, if any
     sh.results = @[]
@@ -381,7 +472,7 @@ proc start*(paths: seq[string], durations: seq[float], mode: RgMode): RgJob =
     sh.writing = false
     sh.finished = false
     sh.cancel = false
-    sh.job = WorkArg(mode: mode, paths: paths, durations: durations)
+    sh.job = WorkArg(mode: mode, paths: paths, durations: durations, fonts: fonts)
     sh.pending = true
     signal(sh.cond)
   result = RgJob(mode: mode, paths: paths)

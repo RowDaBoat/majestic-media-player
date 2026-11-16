@@ -2,9 +2,9 @@
 ## column per channel, scrolling up through the row that plays, which stays
 ## in a band across the middle. Each column glows with its channel's level.
 
-import std/[strformat, strutils, math]
+import std/[strformat, strutils, math, tables, os]
 import silky, vmath, bumpy, chroma
-import theme, ui, tracker
+import theme, ui, tracker, m2c
 
 type
   TrackerChart* = ref object
@@ -150,7 +150,14 @@ proc drawCell(ui: Ui, cell: Cell, pos: Vec2, cw: float32, font: string, k: float
       ui.text(cell.text[i ..< j], vec2(pos.x + i.float32 * cw, pos.y), fade(h.hlColor, k), font)
     i = j
 
-proc draw*(c: TrackerChart, ui: Ui, area: Rect, t: float) =
+proc field(side: SideTags, key, own: string): string =
+  ## A header field as the file's .m2c (m2c) has it: its value replaces the
+  ## song's own, its `KEY=` hides it.
+  let vs = side.tags.getOrDefault(key)
+  if vs.len > 0: vs.join("; ") elif key in side.cleared: "" else: own
+
+proc draw*(c: TrackerChart, ui: Ui, area: Rect, t: float, side = SideTags()) =
+  ## side: the song's .m2c, laid over its title (and a module's tracker).
   let s = c.song
   if s == nil or s.marks.len == 0 or s.channels == 0: return
   let mi = s.markAt(t)
@@ -175,7 +182,10 @@ proc draw*(c: TrackerChart, ui: Ui, area: Rect, t: float) =
   let showHeader = area.h >= 180 and area.w >= 320
   if showHeader:
     let pat = if order in 0 ..< s.orderPatterns.len: s.orderPatterns[order] else: -1
-    let title = if s.title.len > 0: s.title else: "Untitled"
+    var title = side.field("TITLE", s.title)
+    if title.len == 0:
+      # Hidden by the .m2c: the file's name, as the window title has it.
+      title = if "TITLE" in side.cleared: s.path.extractFilename else: "Untitled"
     let place = if s.placeBars:
         &"Bar {order + 1:03} / {s.orderPatterns.len:03}    Row {row:02} / {s.rows(pat) - 1:02}"
       else:
@@ -184,8 +194,9 @@ proc draw*(c: TrackerChart, ui: Ui, area: Rect, t: float) =
     let placeW = ui.textSize(place, FontMonoSmall).x
     let titleW = area.w - 2 * Margin - placeW - 24
     ui.text(ui.ellipsize(title, titleW, FontTitle), vec2(area.x + Margin, area.y + 6), colText, FontTitle)
+    let tracker = side.field("TRACKERNAME", s.tracker)
     let info = if s.info.len > 0: s.info
-               else: (if s.tracker.len > 0: s.tracker & "  ·  " else: "") & &"{s.channels} channels"
+               else: (if tracker.len > 0: tracker & "  ·  " else: "") & &"{s.channels} channels"
     ui.text(ui.ellipsize(info, titleW, FontSmall), vec2(area.x + Margin, area.y + 29), colTextDim, FontSmall)
     ui.text(place, vec2(area.x + area.w - Margin - placeW, area.y + 13), colTextDim, FontMonoSmall)
     top += HeaderH

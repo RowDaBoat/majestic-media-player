@@ -47,6 +47,22 @@ type
   EditEvent* = enum
     eeChanged, eeFocused, eeCommitted
 
+  ChipKind* = enum
+    ## What a text field with chips makes of a comma-separated part of its text.
+    ckText    ## free text, drawn as typed
+    ckTag     ## a tag: drawn as a chip once a comma ends it
+    ckScope   ## a tag a double-click selects after (the Library search's in:)
+
+  FieldPiece = object
+    ## A run of a chip field's text as drawn: as typed, or one tag as a chip.
+    a, b: int        ## the bytes it covers; a chip's run goes on past its comma
+                     ## and the spaces after it, which aren't drawn
+    t: int           ## a chip: where its tag ends
+    chip: bool
+    kind: ChipKind
+    x, w: float32    ## where it's drawn from the text's start and how wide (a
+                     ## chip's gap after it included)
+
 proc readFramebuffer*(size: IVec2): Image =
   result = newImage(size.x, size.y)
   glReadPixels(0, 0, size.x, size.y, GL_RGBA, GL_UNSIGNED_BYTE, result.data[0].addr)
@@ -630,33 +646,144 @@ proc wordDrag*(cls: openArray[int], fromItem, toItem: int): tuple[anchor, caret:
   let w1 = wordAround(cls, toItem)
   if w1.a >= w0.a: (w0.a, max(w0.b, w1.b)) else: (w0.b, w1.a)
 
+const
+  TagChipPad = 5'f32  ## room left and right of a chip's text
+  TagChipGap = 4'f32  ## after a chip, standing for its comma
+
+type ChipRule* = proc (tag: string): ChipKind {.closure.}
+
+iterator tagParts(text: string): tuple[s, t, q: int] =
+  ## The comma-separated parts of text: where each one's text starts and
+  ## ends (spaces around it left out), and where its comma is (text.len
+  ## for the last part).
+  var p = 0
+  while true:
+    var q = p
+    while q < text.len and text[q] != ',': inc q
+    var s = p
+    while s < q and text[s] == ' ': inc s
+    var t = q
+    while t > s and text[t - 1] == ' ': dec t
+    yield (s, t, q)
+    if q >= text.len: break
+    p = q + 1
+
+proc partEnd(text: string, q: int): int =
+  ## Past the comma at q and the spaces after it.
+  result = min(q + 1, text.len)
+  while result < text.len and text[result] == ' ': inc result
+
+proc fieldPieces(ui: Ui, text: string, chips: ChipRule, lastToo: bool): seq[FieldPiece] =
+  ## text cut into the runs drawn as typed and the tags drawn as chips: the
+  ## ones a comma ends (lastToo: the last one as well).
+  var plain = 0  # where the run drawn as typed began
+  var x = 0'f32
+  for (s, t, q) in tagParts(text):
+    if t == s or (q >= text.len and not lastToo): continue
+    let kind = chips(text[s ..< t])
+    if kind == ckText: continue
+    if s > plain:
+      let w = ui.textSize(text[plain ..< s]).x
+      result.add FieldPiece(a: plain, b: s, t: s, x: x, w: w)
+      x += w
+    let b = partEnd(text, q)
+    let w = ui.textSize(text[s ..< t]).x + 2 * TagChipPad + TagChipGap
+    result.add FieldPiece(a: s, b: b, t: t, chip: true, kind: kind, x: x, w: w)
+    x += w
+    plain = b
+  if plain < text.len or result.len == 0:
+    result.add FieldPiece(a: plain, b: text.len, t: plain, x: x,
+                          w: ui.textSize(text[plain ..< text.len]).x)
+
+proc pieceX(ui: Ui, text: string, ps: seq[FieldPiece], i: int): float32 =
+  ## Where the caret at byte i is drawn, from the text's start. Past a
+  ## chip's tag (its comma and spaces) it's after the chip's gap.
+  for k, p in ps:
+    if i < p.b or k == ps.high:
+      if not p.chip: return p.x + ui.textSize(text[p.a ..< clamp(i, p.a, p.b)]).x
+      if i <= p.t: return p.x + TagChipPad + ui.textSize(text[p.a ..< max(i, p.a)]).x
+      return p.x + p.w
+
+proc pieceHit(ui: Ui, text: string, ps: seq[FieldPiece], x: float32): tuple[i: int, chip: bool] =
+  ## The character boundary nearest to x (from the text's start), and
+  ## whether x is over a chip. The gap after a chip is past it.
+  proc nearest(s: string, x: float32): int =
+    while result < s.len:
+      let j = nextRune(s, result)
+      if x < (ui.textSize(s[0 ..< result]).x + ui.textSize(s[0 ..< j]).x) / 2: break
+      result = j
+  for k, p in ps:
+    if x < p.x + p.w or k == ps.high:
+      if not p.chip: return (p.a + nearest(text[p.a ..< p.b], x - p.x), false)
+      if x >= p.x + p.w - TagChipGap: return (p.b, false)
+      return (p.a + nearest(text[p.a ..< p.t], x - p.x - TagChipPad), x >= p.x)
+
+proc pastChipTag(ps: seq[FieldPiece], i: int, forward: bool): int =
+  ## i, or when it's between a chip's tag and what follows (in its hidden
+  ## comma and spaces), the chip's end (forward: what follows).
+  for p in ps:
+    if p.chip and i > p.t and i < p.b: return (if forward: p.b else: p.t)
+  i
+
+proc freeText(text: string, chips: ChipRule): tuple[a, b: int] =
+  ## The last run of parts that aren't tags, its outer spaces left out;
+  ## (text.len, text.len) when every part is a tag.
+  result = (text.len, text.len)
+  var run = false
+  for (s, t, q) in tagParts(text):
+    if t == s: continue
+    if chips(text[s ..< t]) == ckText:
+      if run: result.b = t else: result = (s, t)
+      run = true
+    else: run = false
+
+proc afterScope(text: string, chips: ChipRule): int =
+  ## Past the first ckScope tag and its comma; 0 without one.
+  for (s, t, q) in tagParts(text):
+    if t > s and chips(text[s ..< t]) == ckScope: return partEnd(text, q)
+
 proc textField*(ui: Ui, id: string, r: Rect, text: var string,
-                placeholder = "", framed = true, lead = 0'f32): set[EditEvent] =
+                placeholder = "", framed = true, lead = 0'f32,
+                chips: ChipRule = nil): set[EditEvent] =
   ## Single-line text input. Focusing it (click or Tab) selects all of its
   ## text; Enter, Tab, Escape or a click elsewhere ends editing (eeCommitted).
   ## Dragging or Shift+click/arrows select, a double-click selects a word and
   ## a triple-click everything; Ctrl+arrows move by words, Ctrl+A/C/X/V work
   ## on the selection. Without framed the caller draws its ground; lead
   ## leaves room left of the text (for an icon).
+  ##
+  ## With chips, the comma-separated parts it names tags are drawn as chips
+  ## once a comma ends them (unfocused, the last one too), the comma and
+  ## the spaces after it left out. The caret goes into a chip (a click on
+  ## it, the arrow keys), which opens it for editing. Focusing selects only
+  ## the free text (a click on a chip puts the caret there instead), a
+  ## double-click everything after the first ckScope tag, a triple-click
+  ## everything; Backspace after a chip selects it, Delete at its end does
+  ## nothing (its comma isn't seen).
   let w = ui.window
   let hov = ui.hover(r)
   let pad = 7'f32 + lead
+  template pieces(): seq[FieldPiece] = ui.fieldPieces(text, chips, ui.focusId != id)
   proc hitIndex(text: string, x: float32, nearest = true): int =
     ## Character boundary nearest to window x, or with nearest off, where
     ## the character under x starts.
-    let x = x - r.x - pad + ui.fieldScroll
+    let x = x - r.x - pad + (if ui.focusId == id: ui.fieldScroll else: 0)
+    if chips != nil: return ui.pieceHit(text, pieces, x).i
     while result < text.len:
       let j = nextRune(text, result)
       let edge = if nearest: (ui.textSize(text[0 ..< result]).x + ui.textSize(text[0 ..< j]).x) / 2
                  else: ui.textSize(text[0 ..< j]).x
       if x < edge: break
       result = j
+  proc selectOnFocus(text: string) =
+    ## Focusing selects all of the text; with chips, the free text alone.
+    ui.fieldScroll = 0
+    if chips == nil: (ui.selAnchor, ui.caret) = (0, text.len)
+    else: (ui.selAnchor, ui.caret) = freeText(text, chips)
   discard ui.tabStop(id, r, edit = true)
   if ui.focusId == id and ui.focusFresh:
     ui.focusFresh = false
-    ui.fieldScroll = 0
-    ui.selAnchor = 0
-    ui.caret = text.len
+    selectOnFocus(text)
     result.incl eeFocused
   if ui.focusId == id and w.buttonPressed[MouseLeft] and not hov:
     ui.focusId = ""
@@ -665,15 +792,22 @@ proc textField*(ui: Ui, id: string, r: Rect, text: var string,
     ui.consumeClick()
     ui.navId = id
     ui.activeId = id
+    let onChip = chips != nil and
+      ui.pieceHit(text, pieces, ui.mouse.x - r.x - pad +
+                  (if ui.focusId == id: ui.fieldScroll else: 0)).chip
     ui.dragFrom = hitIndex(text, ui.mouse.x)
     ui.dragX = ui.mouse.x
     let clicks = ui.countClick(id)
     if ui.focusId != id:
       ui.focusId = id
-      ui.fieldScroll = 0
-      ui.selAnchor = 0
-      ui.caret = text.len
+      if onChip:
+        # Straight into the tag clicked.
+        ui.fieldScroll = 0
+        (ui.selAnchor, ui.caret) = (ui.dragFrom, ui.dragFrom)
+      else: selectOnFocus(text)
       result.incl eeFocused
+    elif clicks == 2 and chips != nil:
+      (ui.selAnchor, ui.caret) = (afterScope(text, chips), text.len)
     elif clicks == 2:
       (ui.selAnchor, ui.caret) = wordAround(text.classes, hitIndex(text, ui.mouse.x, false))
     elif clicks >= 3:
@@ -683,7 +817,7 @@ proc textField*(ui: Ui, id: string, r: Rect, text: var string,
       if not w.shiftDown: ui.selAnchor = ui.dragFrom
       ui.caret = ui.dragFrom
   let focused = ui.focusId == id
-  if focused and ui.activeId == id and ui.down() and ui.clickCount == 2:
+  if focused and ui.activeId == id and ui.down() and ui.clickCount == 2 and chips == nil:
     (ui.selAnchor, ui.caret) = wordDrag(text.classes,
       hitIndex(text, ui.dragX, false), hitIndex(text, ui.mouse.x, false))
   elif focused and ui.activeId == id and ui.down() and ui.clickCount == 1 and
@@ -694,6 +828,11 @@ proc textField*(ui: Ui, id: string, r: Rect, text: var string,
   if focused:
     ui.caret = clamp(ui.caret, 0, text.len)
     ui.selAnchor = clamp(ui.selAnchor, 0, text.len)
+    if chips != nil:
+      # Never in a chip's unseen comma: past it.
+      let ps = pieces
+      ui.caret = ps.pastChipTag(ui.caret, true)
+      ui.selAnchor = ps.pastChipTag(ui.selAnchor, true)
     let ctrl = w.buttonDown[KeyLeftControl] or w.buttonDown[KeyRightControl]
     let shift = w.shiftDown
     # The selection is read where it's used, never once per frame: keys
@@ -726,7 +865,18 @@ proc textField*(ui: Ui, id: string, r: Rect, text: var string,
       ui.caret += ins.len
       ui.selAnchor = ui.caret
       result.incl eeChanged
-    if (w.buttonPressed[KeyBackspace] or w.buttonPressed[KeyDelete]) and
+    # Right after a chip, Backspace selects it (again: deletes it); at the
+    # end of its tag, Delete would take its unseen comma.
+    var chipBefore, chipEnd = false
+    if chips != nil and ui.caret == ui.selAnchor and not ctrl:
+      for p in pieces:
+        if p.chip and p.t < p.b:
+          if p.b == ui.caret and w.buttonPressed[KeyBackspace]:
+            (ui.selAnchor, ui.caret) = (p.a, p.b)
+            chipBefore = true
+          if p.t == ui.caret: chipEnd = true
+    if chipBefore: discard
+    elif (w.buttonPressed[KeyBackspace] or w.buttonPressed[KeyDelete]) and
        ui.caret != ui.selAnchor:
       deleteSelection(text)
       result.incl eeChanged
@@ -736,7 +886,7 @@ proc textField*(ui: Ui, id: string, r: Rect, text: var string,
       ui.caret = a
       ui.selAnchor = a
       result.incl eeChanged
-    elif w.buttonPressed[KeyDelete] and ui.caret < text.len:
+    elif w.buttonPressed[KeyDelete] and ui.caret < text.len and not chipEnd:
       text.delete(ui.caret ..< nextRune(text, ui.caret))
       result.incl eeChanged
     # Arrows, Home and End move the caret, Ctrl+arrows by words; with Shift
@@ -750,6 +900,9 @@ proc textField*(ui: Ui, id: string, r: Rect, text: var string,
     if w.buttonPressed[KeyRight]:
       move = if ctrl: wordRight(text.classes, ui.caret)
              elif shift or lo == hi: nextRune(text, ui.caret) else: hi
+    if chips != nil and move >= 0:
+      # Over a chip's unseen comma and spaces in one step.
+      move = pieces.pastChipTag(move, w.buttonPressed[KeyRight])
     if w.buttonPressed[KeyHome]: move = 0
     if w.buttonPressed[KeyEnd]: move = text.len
     if move >= 0:
@@ -764,7 +917,55 @@ proc textField*(ui: Ui, id: string, r: Rect, text: var string,
     ui.border(r, if focused: colAccent elif hov: colTextDim else: colBorder)
   let inner = rect(r.x + pad, r.y, r.w - pad - 7, r.h)
   ui.sk.pushClipRect(inner)
-  if focused:
+  if chips != nil and text.len > 0:
+    let ps = pieces
+    var cx = 0'f32
+    if focused:
+      cx = ui.pieceX(text, ps, ui.caret)
+      if cx - ui.fieldScroll > inner.w - 2: ui.fieldScroll = cx - inner.w + 2
+      if cx - ui.fieldScroll < 0: ui.fieldScroll = cx
+    let ox = inner.x - (if focused: ui.fieldScroll else: 0)
+    let (lo, hi) = if focused: (min(ui.selAnchor, ui.caret), max(ui.selAnchor, ui.caret))
+                   else: (0, 0)
+    proc isOpen(p: FieldPiece): bool =
+      ## The caret's in its tag (or the selection starts in it): edited as text.
+      focused and ((ui.caret >= p.a and ui.caret <= p.t) or
+                   (ui.selAnchor > p.a and ui.selAnchor < p.t))
+    proc box(p: FieldPiece): Rect = rect(ox + p.x, r.y + 3, p.w - TagChipGap, r.h - 6)
+    # Open chips are outlined under the selection; the others are filled
+    # over it, a selected one in the selection's color.
+    for p in ps:
+      if p.chip and p.isOpen:
+        let b = p.box
+        ui.roundRect(b, colAccent, 4)
+        ui.roundRect(rect(b.x + 1, b.y + 1, b.w - 2, b.h - 2), colBackground, 3)
+    if lo < hi:
+      let (x0, x1) = (ui.pieceX(text, ps, lo), ui.pieceX(text, ps, hi))
+      ui.rect(rect(ox + x0, r.y + 4, x1 - x0, r.h - 8), colAccentDim)
+    for p in ps:
+      if not p.chip:
+        ui.textIn(text[p.a ..< p.b], rect(ox + p.x, r.y, 4000, r.h), colText)
+        continue
+      let tag = text[p.a ..< p.t]
+      let tx = ox + p.x + TagChipPad
+      if p.isOpen:
+        ui.textIn(tag, rect(tx, r.y, 4000, r.h), colText)
+        continue
+      let b = p.box
+      let picked = lo < hi and lo <= p.a and hi >= p.t
+      let lit = hov and ui.hover(b)
+      ui.roundRect(b, if picked: colSearchSel
+                      elif p.kind == ckScope: (if lit: colScopeChipHover else: colScopeChip)
+                      elif lit: colTagChipHover else: colTagChip, 4)
+      # The key dimmer than its value.
+      let colon = tag.find(':')
+      if colon < 0: ui.textIn(tag, rect(tx, r.y, 4000, r.h), colText)
+      else:
+        let key = tag[0 .. colon]
+        ui.textIn(key, rect(tx, r.y, 4000, r.h), if picked: colText else: colTextDim)
+        ui.textIn(tag[colon + 1 .. ^1], rect(tx + ui.textSize(key).x, r.y, 4000, r.h), colText)
+    if focused: ui.rect(rect(ox + cx, r.y + 5, 1, r.h - 10), colAccent)
+  elif focused:
     let cx = ui.textSize(text[0 ..< ui.caret]).x
     if cx - ui.fieldScroll > inner.w - 2: ui.fieldScroll = cx - inner.w + 2
     if cx - ui.fieldScroll < 0: ui.fieldScroll = cx

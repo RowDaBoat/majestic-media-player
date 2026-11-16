@@ -278,6 +278,39 @@ proc closeCb(cookie: pointer) {.cdecl.} =
   freeFlat(s.song)
   streamFree(s)
 
+proc streamOf(song: Flat): ptr MidiStream =
+  ## A stream rendering song from its start (which it takes, and frees with
+  ## the stream); nil when FluidSynth or the SoundFont fails.
+  var song = song
+  let settings = api.newSettings()
+  if settings == nil:
+    freeFlat(song)
+    return nil
+  discard api.setnum(settings, "synth.sample-rate", Rate.cdouble)
+  discard api.setnum(settings, "synth.gain", Gain)
+  discard api.setint(settings, "synth.lock-memory", 0)
+  discard api.setint(settings, "synth.threadsafe-api", 0)
+  let synth = api.newSynth(settings)
+  if synth == nil or api.sfload(synth, cast[cstring](song.font[0].addr), 1) < 0:
+    if synth != nil: api.deleteSynth(synth)
+    api.deleteSettings(settings)
+    freeFlat(song)
+    return nil
+  let s = streamCreate(MidiStream)
+  if s == nil:
+    api.deleteSynth(synth)
+    api.deleteSettings(settings)
+    freeFlat(song)
+    return nil
+  s.song = song
+  s.settings = settings
+  s.synth = synth
+  let dataBytes = min(song.frames * FrameBytes, (high(uint32).int64 - 36) div FrameBytes * FrameBytes)
+  s.total = HeaderBytes + dataBytes
+  s.writeHeader(dataBytes.uint32)
+  s.next = HeaderBytes
+  s
+
 proc openCb(userData: pointer, uri: cstring, info: ptr MpvStreamCbInfo): cint {.cdecl.} =
   const Skip = Protocol.len + 3
   var id = 0
@@ -290,33 +323,8 @@ proc openCb(userData: pointer, uri: cstring, info: ptr MpvStreamCbInfo): cint {.
     let sl = slots[id mod Slots].addr
     if sl.id == id and sl.song.msgs != nil: song = copyFlat(sl.song)
   if song.msgs == nil: return MpvErrorLoadingFailed
-  let settings = api.newSettings()
-  if settings == nil:
-    freeFlat(song)
-    return MpvErrorLoadingFailed
-  discard api.setnum(settings, "synth.sample-rate", Rate.cdouble)
-  discard api.setnum(settings, "synth.gain", Gain)
-  discard api.setint(settings, "synth.lock-memory", 0)
-  discard api.setint(settings, "synth.threadsafe-api", 0)
-  let synth = api.newSynth(settings)
-  if synth == nil or api.sfload(synth, cast[cstring](song.font[0].addr), 1) < 0:
-    if synth != nil: api.deleteSynth(synth)
-    api.deleteSettings(settings)
-    freeFlat(song)
-    return MpvErrorLoadingFailed
-  let s = streamCreate(MidiStream)
-  if s == nil:
-    api.deleteSynth(synth)
-    api.deleteSettings(settings)
-    freeFlat(song)
-    return MpvErrorLoadingFailed
-  s.song = song
-  s.settings = settings
-  s.synth = synth
-  let dataBytes = min(song.frames * FrameBytes, (high(uint32).int64 - 36) div FrameBytes * FrameBytes)
-  s.total = HeaderBytes + dataBytes
-  s.writeHeader(dataBytes.uint32)
-  s.next = HeaderBytes
+  let s = streamOf(song)
+  if s == nil: return MpvErrorLoadingFailed
   info.cookie = s
   info.readFn = readCb
   info.seekFn = seekCb
@@ -324,6 +332,33 @@ proc openCb(userData: pointer, uri: cstring, info: ptr MpvStreamCbInfo): cint {.
   info.closeFn = closeCb
   info.cancelFn = nil
   0
+
+# The ReplayGain analysis (rgscan) measures a MIDI file as it plays: the
+# same WAV stream, read here from its start (a thread of its own; no slot
+# taken, so the song playing keeps its own).
+
+proc renderOpen*(path, font: string): pointer =
+  ## The MIDI file at path, rendered with the SoundFont `font` as mpv would
+  ## play it, to read with `renderRead`; nil when it can't be (no
+  ## FluidSynth, an unreadable file or SoundFont).
+  if font.len == 0 or not fluidsynth.load(): return nil
+  let song = openMidi(path)
+  if song == nil: return nil
+  let f = flatten(song, font)
+  if f.msgs == nil: return nil
+  streamOf(f)
+
+proc renderSize*(r: pointer): int64 =
+  ## The stream's bytes, its WAV header included.
+  cast[ptr MidiStream](r).total
+
+proc renderRead*(r: pointer, dst: pointer, n: int): int =
+  ## Up to n of the stream's next bytes into dst (a WAV: 48 kHz float
+  ## stereo); 0 at its end.
+  readCb(r, cast[ptr UncheckedArray[byte]](dst), n.uint64).int
+
+proc renderClose*(r: pointer) =
+  if r != nil: closeCb(r)
 
 proc register*(h: MpvHandle) =
   ## Lets the player open prepared MIDI streams.

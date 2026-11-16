@@ -42,6 +42,10 @@ let
   colCardRef* = c("#ffc857", 0.24)
   colCardRect* = c("#2ec4b6", 0.30)
   colCardPath* = c("#4ea8de", 0.30)
+  colTagChip* = c("#9d8cff", 0.28)       ## a tag in the Library search, drawn as a chip
+  colTagChipHover* = c("#9d8cff", 0.42)
+  colScopeChip* = c("#4ea8de", 0.30)     ## its within: tags (the libraries searched)
+  colScopeChipHover* = c("#4ea8de", 0.45)
   colRect* = c("#2ec4b6")       ## rectangle drawn over the video
   colOutline* = c("#9aa0ab", 0.5)  ## compact mode's window edge
   colShadow* = c("#000000", 0.45)

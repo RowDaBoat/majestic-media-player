@@ -3,6 +3,9 @@
 import std/[os, strutils, tables, sequtils, math, algorithm, times]
 import jsony, crunchy/sha256
 
+const DefaultGroupPattern* = "%artist% - [%year% - ]%album%"
+  ## the playlist's groups: the year only when the file has one
+
 type
   FrameMode* = enum
     fmHalf, fmFull, fmDouble, fmStretch, fmFit
@@ -84,6 +87,8 @@ type
     playlistShowDimensions*: bool = false
     playlistCursorFollows*: bool = true    # the selection moves to the entry that plays
     playlistShowMillis*: bool = false      # the Duration column as HH:MM:SS.mmm
+    playlistGroups*: bool = false          # a header over each run of entries whose playlistGroupPattern reads the same
+    playlistGroupPattern*: string = DefaultGroupPattern  # foobar2000 title formatting (folderpics.formatTitle)
     showRunLog*: bool = false
     seededPresets*: seq[string]    # preset command lines already offered once
     runLogHeight*: float = 200     # pixels, changed by dragging its bottom edge
@@ -105,6 +110,7 @@ type
     libraryCollapsed*: seq[string]  # the folder groups shown collapsed, by their headers' labels
     librarySortDescending*: bool = false
     librarySearch*: string = ""
+    librarySearchWithin*: bool = false  # its in: tags naming libraries were made within: (once, as in: names folders since)
     showOsd*: bool = true
     frameMode*: FrameMode = fmFit
     aspectOverride*: string = ""   # "" = original, else "4:3", "16:9", ...
@@ -946,7 +952,8 @@ const VideoExtensions* = [
 
 const AudioExtensions* = [
   "mp3", "flac", "ogg", "opus", "m4a", "aac", "wav", "wma", "alac", "ape",
-  "wv", "mka", "aiff", "dts", "ac3"]
+  "wv", "mka", "aiff", "dts", "ac3",
+  "aud"]  # Westwood's game sound (wsaud)
 
 const TrackerExtensions* = [
   ## Music modules, played by FFmpeg's libopenmpt demuxer: libopenmpt's own

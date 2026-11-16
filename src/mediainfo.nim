@@ -3,7 +3,7 @@
 ## missing or the file isn't a local one.
 
 import std/[os, osproc, json, strutils, strformat, math, tables]
-import mpv
+import mpv, wsaud, m2c
 
 type
   InfoSection* = object
@@ -564,7 +564,7 @@ proc generalSection(fmt: JsonNode, streams: seq[JsonNode], path: string): InfoSe
     s.add "Codec ID", brand & (if compat.len > 0: &" ({compat.join(\"/\")})" else: "")
   let size = fmt.num("size")
   if size > 0: s.add "File size", fmtBytes(size)
-  let dur = fmt.num("duration")
+  let dur = if path.isAudFile and path.audLength > 0: path.audLength else: fmt.num("duration")
   if dur > 0: s.add "Duration", fmtDuration(dur)
   let br = fmt.num("bit_rate")
   if br > 0: s.add "Overall bit rate", fmtBitrate(br)
@@ -585,8 +585,9 @@ proc generalSection(fmt: JsonNode, streams: seq[JsonNode], path: string): InfoSe
       else: k
     summary.add &"{n} {name}" & (if n == 1 or name == "text": "" else: "s")
   s.add "Streams", summary.join(", ")
-  # Known tags first under MediaInfo's names, then whatever else is there.
-  let tags = fmt{"tags"}
+  # Known tags first under MediaInfo's names, then whatever else is there
+  # (its .m2c's over the file's own).
+  let tags = fmt{"tags"}.overlay(readSide(path))
   if tags != nil and tags.kind == JObject:
     for k, v in tags:
       let lk = k.toLowerAscii
@@ -651,11 +652,13 @@ proc mpvSections(h: MpvHandle, path: string): seq[InfoSection] =
   else: g.add "Format", format
   let size = h.getInt("file-size", -1)
   if size > 0: g.add "File size", fmtBytes(size.float)
-  let dur = h.getFloat("duration")
+  let dur = if path.isAudFile and path.audLength > 0: path.audLength else: h.getFloat("duration")
   if dur > 0: g.add "Duration", fmtDuration(dur)
   if size > 0 and dur > 0: g.add "Overall bit rate", fmtBitrate(size.float * 8 / dur)
-  g.add "Title", h.getStr("media-title")
-  let meta = h.getNode("metadata")
+  let side = readSide(path)
+  g.add "Title", (if side.tags.getOrDefault("TITLE").len > 0: side.tags["TITLE"].join("; ")
+                  else: h.getStr("media-title"))
+  let meta = h.getNode("metadata").overlay(side)
   if meta.kind == JObject:
     for k, v in meta:
       let lk = k.toLowerAscii

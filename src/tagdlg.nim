@@ -1,8 +1,9 @@
 ## Playlist > Properties: the selected files' tags in a grid, one field per
 ## row (Name | Value), edited in place like a spreadsheet's cells: typing
-## over a cell replaces its value, Enter or Tab keeps it and goes down. The
-## value box under the grid shows (and edits) the whole selected value,
-## line breaks included. With several files, a field they don't agree on
+## over a cell replaces its value, Enter or Tab keeps it and goes down,
+## Shift+Enter goes down and edits the next field (Add field's name after
+## the last). The value box under the grid shows (and edits) the whole
+## selected value, line breaks included: Enter starts a new line there. With several files, a field they don't agree on
 ## shows <multiple values> and is left alone unless edited.
 ##
 ## Autofill fills fields from the file names, by a pattern such as
@@ -10,10 +11,15 @@
 ## Details shows what else a file holds, read-only: ffprobe's report, a
 ## tracker module's message and sample names, a MIDI file's texts.
 ## Nothing is written until OK or Apply (`saveFile`, called by the app).
+##
+## A file whose format can't keep tags (Westwood .aud, MIDI, tracker
+## modules, what TagLib can't write) keeps them in a Majestic Meta
+## Container in the m2c subfolder of its folder (m2c): shown over its own,
+## saved there. So does a file that has one already.
 
 import std/[strutils, sequtils, tables, algorithm, os, strformat, math]
 import silky, vmath, bumpy, pixie
-import ui, theme, tagedit, mediainfo, tracker
+import ui, theme, tagedit, mediainfo, tracker, m2c
 from config import MidiExtensions, TrackerExtensions
 
 type
@@ -21,7 +27,9 @@ type
 
   TagEntry* = object
     path*: string
-    editable*: bool           ## TagLib opened it: its tags can be written
+    editable*: bool           ## its tags can be written: by TagLib, or to its .m2c
+    side*: bool               ## they go to its .m2c (m2c), not into the file
+    base: Tags                ## a .m2c's file's own fields, as read (totals apart)
     orig*, tags*: Tags        ## as read and as edited, totals apart from numbers
     combine: bool             ## the format keeps "number/total" in one field
     trackTotalKey, discTotalKey: string  ## the total fields' names in the file
@@ -49,6 +57,7 @@ type
     edit, editStart: string   ## its text, and what it was when editing began
     editBar: bool             ## edited in the value box, not in its cell
     naming: bool              ## the Add field row takes a name
+    editNext: bool            ## Shift+Enter: edit the selected row next frame
     newName: string
     added: seq[string]        ## fields added, kept as rows while empty
     reveal: bool              ## scroll the selected row into view
@@ -102,7 +111,8 @@ proc isStandard(key: string): bool = Standard.anyIt(it[1] == key)
 proc normalize(e: var TagEntry, t: Tags): Tags =
   ## Track and disc totals in fields of their own, whichever way the file keeps them.
   result = t
-  e.combine = e.path.splitFile.ext.toLowerAscii notin SeparateTotals
+  # A .m2c keeps totals in fields of their own.
+  e.combine = not e.side and e.path.splitFile.ext.toLowerAscii notin SeparateTotals
   e.trackTotalKey = "TRACKTOTAL"
   e.discTotalKey = "DISCTOTAL"
   for (num, total, alias) in [("TRACKNUMBER", "TRACKTOTAL", "TOTALTRACKS"),
@@ -110,7 +120,8 @@ proc normalize(e: var TagEntry, t: Tags): Tags =
     if alias in result and total notin result:
       result[total] = result[alias]
       result.del alias
-      if num == "TRACKNUMBER": e.trackTotalKey = alias else: e.discTotalKey = alias
+      if e.side: discard  # a .m2c writes them by their usual names
+      elif num == "TRACKNUMBER": e.trackTotalKey = alias else: e.discTotalKey = alias
     let n = result.getOrDefault(num)
     if n.len > 0 and '/' in n[0]:
       let parts = n[0].split('/', 1)
@@ -141,11 +152,9 @@ proc isTracker*(path: string): bool = path.extOf in TrackerExtensions
 proc isMidi(path: string): bool = path.extOf in MidiExtensions
 
 proc readEntry(path: string): TagEntry =
-  ## Tracker modules are read with TagLib but never written: saving one, it
-  ## rewrites the samples' and instruments' names (where trackers' authors
-  ## leave their messages), losing their non-ASCII characters.
   result.path = path
   var t: Tags
+  var taglibOk = false
   if path.isMidi:
     # Its text events; ffprobe would read it as a module, with made-up fields.
     const fields = {"Title": "TITLE", "Artist": "ARTIST", "Copyright": "COPYRIGHT",
@@ -158,11 +167,17 @@ proc readEntry(path: string): TagEntry =
   else:
     let r = readTags(path)
     if r.ok:
-      result.editable = not path.isTracker
+      taglibOk = true
       t = r.tags
     else:
       for (k, v) in fileTags(path):
         t.mgetOrPut(ProbeNames.getOrDefault(k, k), @[]).add v
+  let side = readSide(path)
+  result.side = side.exists or path.keepsNoTags(taglibOk)  # (usesSide, the .m2c read already)
+  result.editable = result.side or taglibOk
+  if result.side:
+    result.base = result.normalize(t)
+    t = result.base.overlay(side)
   result.tags = result.normalize(t)
   result.orig = result.tags
 
@@ -174,6 +189,22 @@ proc saveFile*(d: TagDialog, i: int): tuple[ok: bool, msg: string] =
   ## Writes file i's edited fields, and reads them back as now kept.
   let e = d.files[i].addr
   if not e[].changed: return (true, "")
+  if e.side:
+    # The .m2c: the fields that aren't the file's own as it has them, and
+    # those of its own removed (its own stay its own: a module's message
+    # isn't copied).
+    var fields: Tags
+    var cleared: seq[string]
+    for k, vs in e[].denormalize:
+      if vs.anyIt(it.len > 0) and vs != e.base.getOrDefault(k): fields[k] = vs
+    for k, vs in e.base:
+      if vs.anyIt(it.len > 0) and e.tags.getOrDefault(k).allIt(it.len == 0): cleared.add k
+    let err = writeSide(e.path, fields, cleared)
+    if err.len > 0: return (false, err)
+    var fresh = readEntry(e.path)
+    (fresh.details, fresh.detailsRead) = (e.details, e.detailsRead)  # the file is as it was
+    e[] = fresh
+    return (true, "")
   let r = writeTags(e.path, e[].denormalize)
   if not r.ok: return (false, r.error)
   let back = readTags(e.path)
@@ -538,6 +569,17 @@ proc drawMetadata(d: TagDialog, ui: Ui, r: Rect) =
   let rows = d.gridRows
   if not rows.anyIt(it.kind != rkHeader and it.key == d.sel): d.sel = "TITLE"
   let canEdit = d.editableCount > 0
+  # Shift+Enter moved down last frame: edit that row now, a frame later so
+  # the same Enter doesn't reach its text field too (and end it at once).
+  if d.editNext:
+    d.editNext = false
+    if canEdit and d.editKey.len == 0 and not d.naming:
+      if d.sel == AddKey:
+        d.naming = true
+        d.newName = ""
+        ui.focusId = "tg-new"
+        ui.focusFresh = true
+      else: d.startEdit(ui, d.sel)
   let barH = 92'f32
   let grid = rect(r.x, r.y, r.w, r.h - barH - 8)
   ui.gridHead(rect(grid.x, grid.y, grid.w, RowH), @[("Name", grid.x), ("Value", grid.x + NameW)])
@@ -611,9 +653,12 @@ proc drawMetadata(d: TagDialog, ui: Ui, r: Rect) =
       if eeCommitted in res:
         let esc = w.buttonPressed[KeyEscape]
         d.commitEdit(keep = not esc)
-        if not esc and (w.buttonPressed[KeyEnter] or w.buttonPressed[NumpadEnter] or
-                        w.buttonPressed[KeyTab]):
-          d.moveSel(rows, if w.shiftDown: -1 else: 1)
+        if not esc:
+          if w.buttonPressed[KeyEnter] or w.buttonPressed[NumpadEnter]:
+            d.moveSel(rows, 1)
+            d.editNext = w.shiftDown  # Shift+Enter: and edit it
+          elif w.buttonPressed[KeyTab]:
+            d.moveSel(rows, if w.shiftDown: -1 else: 1)
     else:
       let (text, mixed) = d.cell(row.key)
       let tr = rect(valR.x + 8, y, valR.w - 16 - (if row.standard: 0'f32 else: 24), RowH)
@@ -651,6 +696,9 @@ proc drawMetadata(d: TagDialog, ui: Ui, r: Rect) =
     elif w.buttonPressed[KeyHome] and ctrl: d.moveSel(rows, -rows.len)
     elif w.buttonPressed[KeyEnd] and ctrl: d.moveSel(rows, rows.len)
     elif w.buttonPressed[KeyTab]: d.moveSel(rows, if w.shiftDown: -1 else: 1)
+    elif canEdit and w.shiftDown and (w.buttonPressed[KeyEnter] or w.buttonPressed[NumpadEnter]):
+      d.moveSel(rows, 1)
+      d.editNext = true
     elif d.sel == AddKey:
       if w.buttonPressed[KeyEnter] or w.buttonPressed[NumpadEnter] or w.buttonPressed[KeyF2]:
         d.naming = true
@@ -673,6 +721,13 @@ proc drawMetadata(d: TagDialog, ui: Ui, r: Rect) =
       if not mixed: setClipboardString(text)
 
   # The value box: the whole of the selected value, edited with line breaks.
+  # Enter starts a new line there; Shift+Enter keeps it and edits the next.
+  if ui.focusId == "tg-bar" and w.shiftDown and
+     (w.buttonPressed[KeyEnter] or w.buttonPressed[NumpadEnter]):
+    d.commitEdit()
+    ui.focusId = ""
+    d.moveSel(rows, 1)
+    d.editNext = true
   let barR = rect(r.x, grid.y + grid.h + 8, r.w, barH)
   let row = rows.filterIt(it.key == d.sel)
   let label = if row.len > 0 and row[0].kind == rkField: row[0].label else: ""
@@ -987,25 +1042,29 @@ proc draw*(d: TagDialog, ui: Ui, r: Rect): TagAction =
   # What's selected, and whether it can be written.
   let n = d.files.len
   let ro = n - d.editableCount
-  let mods = d.files.countIt(it.path.isTracker)
+  let sides = d.files.countIt(it.side)
   let title = if n == 1: d.files[0].path.extractFilename else: &"{n} files"
   ui.textIn(ui.ellipsize(title, r.w - 32, FontTitle), rect(r.x + 16, r.y + 10, r.w - 32, 28), colText, FontTitle)
+  # What can't be written into a file goes to its .m2c (none is read-only).
+  let lib = if tagedit.available(): "" else: "TagLib (libtag_c) wasn't found: "
   let note =
-    if not tagedit.available(): "Editing tags needs TagLib (libtag_c), which wasn't found: tags are shown read-only."
-    elif mods > 0 and mods == ro:
-      "Tracker modules are shown read-only: saving them would garble their samples' names." &
-        (if ro < n: " Edits leave them as they are." else: "")
-    elif ro == n and n == 1: "TagLib can't write this kind of file: its tags are shown read-only."
-    elif ro == n: "TagLib can't write these kinds of files: their tags are shown read-only."
-    elif ro > 0:
-      var kinds: seq[string]
-      if mods > 0: kinds.add "tracker modules"
-      let midis = d.files.countIt(it.path.isMidi)
-      if midis > 0: kinds.add "MIDI files"
-      if ro > mods + midis: kinds.add "files TagLib can't write"
-      $ro & " of the files are read-only (" & kinds.join(", ") & "): edits leave them as they are."
+    if ro > 0: &"{ro} of the files can't be edited."
+    elif lib.len > 0 and n == 1:
+      lib & "tags are kept in the " & SideDir & " subfolder, in " &
+        SideDir & "/" & d.files[0].path.extractFilename & SideExt & "."
+    elif lib.len > 0: lib & "tags are kept in the " & SideDir & " subfolder, in " &
+      SideDir & "/<file name>" & SideExt & "."
+    elif sides == 1 and n == 1:
+      "This kind of file can't keep tags: they're kept in the " & SideDir & " subfolder, in " &
+        SideDir & "/" & d.files[0].path.extractFilename & SideExt & "."
+    elif sides == n: "These kinds of files can't keep tags: theirs are kept in the " & SideDir &
+      " subfolder, in " & SideDir & "/<file name>" & SideExt & "."
+    elif sides > 0: &"{sides} of the files can't keep tags: theirs are kept in the " & SideDir &
+      " subfolder, in " & SideDir & "/<file name>" & SideExt & "."
     else: ""
-  if note.len > 0: ui.textIn(note, rect(r.x + 16, r.y + 38, r.w - 32, 18), colWarning, FontSmall)
+  if note.len > 0:
+    ui.textIn(ui.ellipsize(note, r.w - 32, FontSmall), rect(r.x + 16, r.y + 38, r.w - 32, 18),
+      if ro > 0: colWarning else: colTextDim, FontSmall)
   # Tabs.
   var tx = r.x + 16
   let ty = r.y + 62
@@ -1018,6 +1077,7 @@ proc draw*(d: TagDialog, ui: Ui, r: Rect): TagAction =
       ui.consumeClick()
       d.commitEdit()
       d.naming = false
+      d.editNext = false
       ui.focusId = ""
       d.tab = t
       d.listOpen = false

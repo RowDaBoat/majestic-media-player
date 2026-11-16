@@ -3,17 +3,44 @@
 ## and a lightweight instance that renders seek-bar thumbnails.
 
 import std/[algorithm, atomics, json, math, osproc, sequtils, strutils, os, tables, times]
-import mpv, videogl, spherical, gpumem, coverart, modstream, midistream, cue, folderpics
+import mpv, videogl, spherical, gpumem, coverart, modstream, midistream, cue, folderpics, wsaud, m2c
 from config import AudioExtensions
 from ytdlp import YtdlSubLangs, linkSphere, hlsSphere
 
 type
+  DemuxMode* = enum
+    ## How mpv reads a file (Player.setDemuxing). Played backward, mpv reads
+    ## a stretch further back each time it runs out (setBackStep). In its
+    ## demuxer thread, that thread misses the call now and then: once it has
+    ## read to the file's end (playback stands still a second or two, for
+    ## good with mpv's cache). Read in mpv's core instead (threadless),
+    ## nothing is read ahead: on a slow drive, playing forward stands still at
+    ## each hiccup (tmp/rvs/eofprobe.py, tmp/slowfs).
+    dmAhead       ## mpv's demuxer thread reads ahead, with its cache as mpv
+                  ## picks (on for a network or FUSE drive): a file played
+                  ## forward, as with reverse playback off
+    dmThreadless  ## read in mpv's core as needed: played backward, or sound
+                  ## alone, which turns around itself at once
+
   ReplayGain* = object
     ## An audio track's ReplayGain values, as mpv read them from its tags.
     ## Without album values mpv gives the track's for them.
     known*: bool              ## the file has them
     trackGain*, albumGain*: float  ## dB
     trackPeak*, albumPeak*: float  ## linear, 1 = full scale; 0 when unknown
+
+  SideGain* = object
+    ## A file's ReplayGain as its .m2c (m2c) has it, which mpv can't read.
+    rg*: ReplayGain           ## known: the .m2c has values
+    hidden*: bool             ## it clears REPLAYGAIN_TRACK_GAIN: the file's own don't count
+
+  RgSettings* = object
+    ## ReplayGain as Options has it, given by the app (syncSettings): files
+    ## open with mpv's options for them (rgOpts).
+    known*: bool              ## given at least once
+    mode*: int                ## 0 off, 1 track gain, 2 album gain
+    preamp*, fallback*: float ## dB: added to values; for files without
+    noClip*: bool             ## lowered so the peak stays at full scale
 
   Track* = object
     id*: int
@@ -65,11 +92,7 @@ type
     timeJumps: int            ## jumps when the last time was taken
     eofReached*: bool
     backward*: bool           ## playing in reverse (ping-pong loops)
-    threadless*: bool         ## opened without mpv's demuxer thread: turns
-                              ## around to backward at once (mpv's thread
-                              ## sleeps a second, or for good at the end of
-                              ## a file, before reading further back), and
-                              ## without its cache (setDemuxing)
+    demux*: DemuxMode         ## how mpv reads the file opened (setDemuxing)
     backStep: float = 60      ## demuxer-backward-playback-step as set (setBackward)
     volume*: float
     muted*: bool
@@ -102,6 +125,7 @@ type
     eofHandled*: bool
     props*: Table[string, string]  ## MirroredProps as they are now
     info*: Table[string, string]   ## InfoProps as they are now
+    rgs*: RgSettings          ## ReplayGain's settings: files open with them (rgOpts)
     noVideo*: bool            ## Video Track > Always Disable: each file opens
                               ## without its video (a cover still shows)
     fileCover*: bool = true   ## Show Front Cover (file): a picture named after
@@ -277,6 +301,77 @@ proc totalMemory(): float =
     except CatchableError: discard
     0.0
 
+const IntraCodecs = ["prores", "apv", "dnxhd", "mjpeg", "jpeg2000", "cfhd", "ffv1",
+  "utvideo", "huffyuv", "ffvhuff", "magicyuv", "rawvideo", "v210", "v410", "r210",
+  "png", "dvvideo", "hap", "ljpeg", "jpegls", "lagarith", "dxv", "qoi", "tiff",
+  "dpx", "exr", "notchlc", "hqx", "hq_hqa", "cllc", "mjpegb", "avrp", "ayuv", "y41p",
+  "yuv4", "v308", "v408", "bitpacked", "sgirle", "vc1image"]
+  ## Video codecs whose every frame is a keyframe (FFmpeg's intra-only ones
+  ## found in files): editing and camera formats, lossless and raw video.
+  ## (backBatches)
+
+proc reversalBytes(): float =
+  ## mpv's video-reversal-buffer, as newPlayer sets it.
+  let gib = 1024.0 * 1024 * 1024
+  clamp(totalMemory() / 8, gib, 6 * gib)
+
+proc intraVideo*(p: Player): bool =
+  ## The video playing has keyframes alone (IntraCodecs): no span of
+  ## frames for mpv to decode before showing one, playing backward.
+  p.tracks.anyIt(it.kind == "video" and it.selected and not it.albumArt and
+                 it.codec in IntraCodecs)
+
+proc backBatches*(p: Player): tuple[video, audio: int] =
+  ## How many keyframes' spans of the video, and packets of sound, mpv
+  ## decodes at a time playing backward (video- and audio-backward-batch):
+  ## run out, it reads its stretch of the file again (setBackStep).
+  ## A video of keyframes alone, one frame at a time with the decoder
+  ## flushed after each, uses one of its threads: ProRes 1080p60 played
+  ## backward at 0.88x, APV stood still 0.1 s at each stretch; with 8, none
+  ## (tmp/rvs/probe.py). Not many more: mpv shows none of a batch before
+  ## it's decoded it all (ProRes, 30: stood still 70 ms each time). 8, as
+  ## long as that fits twice in mpv's reversal buffer. Anything else: 1, a
+  ## keyframe and the frames that follow it, up to seconds of them.
+  ## Sound: mpv's 10 packets are a fifth of a second of AAC or MP3: by far
+  ## most of the stretches read again (an OBS recording: 125 in 20 s; 22
+  ## with a second of sound at a time). So ~a second by the codec's packet
+  ## size, 10 to 100 packets.
+  result = (1, 10)
+  for t in p.tracks:
+    if not t.selected: continue
+    if t.kind == "video" and not t.albumArt and t.codec in IntraCodecs:
+      let frame = max(t.width * t.height, 1920 * 1080).float * 6  # bytes, 4:4:4 at 16 bits
+      let fit = int(reversalBytes() / (2 * frame))
+      result.video = clamp(fit, 1, 8)
+    elif t.kind == "audio":
+      # Packets of a frame each, every one a keyframe (mpv's batch counts
+      # those): by its samples. Others (TrueHD and MLP, whose keyframes are
+      # their sync frames, ~15 a second: 1024 of them, a minute of sound,
+      # overflowed mpv's packet queue) keep mpv's 10.
+      let samples = case t.codec
+        of "aac": 1024.0
+        of "mp3", "mp2", "mp1": 1152.0
+        of "opus": 960.0
+        of "vorbis": 1024.0
+        of "flac", "alac": 4096.0
+        of "ac3", "eac3": 1536.0
+        of "dts": 512.0
+        else: 0.0
+      if samples > 0:
+        let rate = if t.sampleRate > 0: t.sampleRate.float else: 48000.0
+        result.audio = clamp(int(round(rate / samples)), 10, 100)
+
+proc setBackStep*(p: Player)
+
+proc applyBatches(p: Player) =
+  ## backBatches, for a player read in mpv's core (only that one plays
+  ## backward); mpv takes them as it next reads. A video of keyframes alone
+  ## also steps back less far (setBackStep).
+  let (v, a) = if p.demux == dmThreadless: p.backBatches else: (1, 10)
+  p.h.setProp("video-backward-batch", $v)
+  p.h.setProp("audio-backward-batch", $a)
+  if p.demux == dmThreadless and p.intraVideo and not p.path.contains("://"): p.setBackStep()
+
 proc newPlayer*(volume: float, muted, osd: bool, pictureOnly = false): Player =
   ## pictureOnly: a hidden player for frames alone (the keyframe bridge):
   ## no sound, no scripts (quicker to set up), paused, stepping at speed.
@@ -309,8 +404,7 @@ proc newPlayer*(volume: float, muted, osd: bool, pictureOnly = false): Player =
   # don't fit (the picture stands still, then jumps): 1 GiB by default, a
   # 5 s span of 1080p60, but a quarter of one in 4K60 (3.7 GB). Only what a
   # span holds is taken, so up to an eighth of the RAM, 6 GiB at most.
-  let gib = 1024.0 * 1024 * 1024
-  h.setOpt("video-reversal-buffer", $int64(clamp(totalMemory() / 8, gib, 6 * gib)))
+  h.setOpt("video-reversal-buffer", $int64(reversalBytes()))
   # mpv's pipewire output drops the end of a file that doesn't fill PipeWire's
   # last block (up to ~20 ms, clear on a short sound that ends loud); pulse,
   # served by PipeWire all the same, plays it all.
@@ -346,6 +440,7 @@ proc newPlayer*(volume: float, muted, osd: bool, pictureOnly = false): Player =
   check mpv_initialize(h), "mpv_initialize"
   modstream.register(h)  # module streams
   midistream.register(h)  # MIDI files, through FluidSynth
+  wsaud.register(h)  # Westwood .aud, decoded from its start
   # mpv's log goes to stderr only when MMP_DEBUG is set; load failures surface
   # in the status bar regardless. Errors come in anyway, for yt-dlp's
   # (hookError).
@@ -577,6 +672,65 @@ proc applied*(rg: ReplayGain, album: bool, preamp: float, noClip: bool): float =
   let peak = if album: rg.albumPeak else: rg.trackPeak
   if noClip and peak > 0: result = min(result, -20 * log10(peak))
 
+proc gainValue(vs: seq[string]): float =
+  ## "-6.54 dB" -> -6.54; NaN when there's none.
+  if vs.len == 0: return NaN
+  try: parseFloat(vs[0].strip.split(' ')[0].strip(leading = true, trailing = false, chars = {'+'}))
+  except ValueError: NaN
+
+proc sideGain*(side: SideTags): SideGain =
+  ## The ReplayGain values in a .m2c (REPLAYGAIN_{TRACK,ALBUM}_{GAIN,PEAK}),
+  ## as mpv reads them from tags: a track gain or nothing; without album
+  ## values, the track's.
+  let tg = side.tags.getOrDefault("REPLAYGAIN_TRACK_GAIN").gainValue
+  if tg.isNaN:
+    result.hidden = "REPLAYGAIN_TRACK_GAIN" in side.cleared
+    return
+  let tp = side.tags.getOrDefault("REPLAYGAIN_TRACK_PEAK").gainValue
+  let ag = side.tags.getOrDefault("REPLAYGAIN_ALBUM_GAIN").gainValue
+  let ap = side.tags.getOrDefault("REPLAYGAIN_ALBUM_PEAK").gainValue
+  result.rg = ReplayGain(known: true, trackGain: tg, trackPeak: (if tp.isNaN: 0.0 else: tp))
+  (result.rg.albumGain, result.rg.albumPeak) =
+    if ag.isNaN: (tg, result.rg.trackPeak) else: (ag, if ap.isNaN: 0.0 else: ap)
+
+proc rgFor*(s: RgSettings, g: SideGain): tuple[mode: string, preamp: float, clip: bool, fallback: float] =
+  ## mpv's ReplayGain options for a file: its own values, which mpv reads;
+  ## or its .m2c's, which mpv can't: those worked out here (`applied`) and
+  ## given as the fallback gain with mpv's ReplayGain off, which mpv then
+  ## applies alone (and with it on, only to files without values). Off,
+  ## the fallback is 0: mpv applies it all the same.
+  let on = s.mode in 1 .. 2
+  if g.rg.known:
+    ("no", s.preamp, not s.noClip,
+     if on: g.rg.applied(s.mode == 2, s.preamp, s.noClip) else: 0.0)
+  elif g.hidden:
+    ("no", s.preamp, not s.noClip, if on: s.fallback else: 0.0)
+  else:
+    (["no", "track", "album"][clamp(s.mode, 0, 2)], s.preamp, not s.noClip,
+     if on: s.fallback else: 0.0)
+
+proc applyRg*(p: Player, s: RgSettings, g: SideGain) =
+  ## The settings onto this player now, for its file's gain g.
+  p.rgs = s
+  let r = s.rgFor(g)
+  p.h.setProp("replaygain", r.mode)
+  p.h.setProp("replaygain-preamp", r.preamp)
+  p.h.setProp("replaygain-clip", r.clip)
+  p.h.setProp("replaygain-fallback", r.fallback)
+
+proc rgOpts(s: RgSettings, path: string): string =
+  ## rgFor's options for the file at path, as per-file options: mpv has them
+  ## before its sound starts (a .m2c's gain from the first sample, a gapless
+  ## change between such files and others at the right level).
+  if not s.known or path.len == 0: return ""
+  let r = s.rgFor(sideGain(readSide(path)))
+  "replaygain=" & r.mode & ",replaygain-preamp=" & formatFloat(r.preamp, ffDecimal, 6) &
+    ",replaygain-clip=" & (if r.clip: "yes" else: "no") &
+    ",replaygain-fallback=" & formatFloat(r.fallback, ffDecimal, 6)
+
+proc joinOpts(a, b: string): string =
+  if a.len == 0: b elif b.len == 0: a else: a & "," & b
+
 proc parseTracks(p: Player, j: JsonNode) =
   p.tracks.setLen 0
   if j.kind != JArray: return
@@ -593,6 +747,7 @@ proc parseTracks(p: Player, j: JsonNode) =
       fps: t{"demux-fps"}.getFloat,
       default: t{"default"}.getBool, forced: t{"forced"}.getBool,
       rg: replayGainOf(t))
+  p.applyBatches()
 
 proc parseChapters(p: Player, j: JsonNode) =
   p.chapters.setLen 0
@@ -616,12 +771,18 @@ proc setBackStep*(p: Player) =
   ## ~4 MB, a few tenths of a second's wait. A file reads fast enough, but
   ## all it reads waits in mpv's packet queue (150 MiB), and 60 s of a file
   ## over ~20 Mbps (a screen recording) fills it: backward playback stands
-  ## still for good ("Backward playback is likely stuck/broken now"). And
-  ## the sound goes back a few packets at a time, each time reading that far
-  ## again (threadless, in mpv's core: the picture now and then stood still
-  ## mid-span, tmp/rvs). So ~40 MB of a file, by its size over its length
-  ## (the standby has no bitrate measured yet), 15 s at most (keyframes
-  ## further apart take two goes); 10 s while that's unknown.
+  ## still for good ("Backward playback is likely stuck/broken now"). So
+  ## ~40 MB of a file, by its size over its length (the standby has no
+  ## bitrate measured yet), 15 s at most (keyframes further apart take two
+  ## goes); 10 s while that's unknown; 2 s at least: mpv can't play the
+  ## stretch it went back for before it's read it all, in its core (ProRes
+  ## at 173 Mbps: 5 s, 108 MB, stood still 0.13-0.2 s; 2 s, none). mpv
+  ## keeps none of it once played (it would with its seekable cache, but a
+  ## seek into the kept end of a file, its last keyframe's span, then never
+  ## gets going: one stream waits on the other, which gets no new packet,
+  ## mpv 0.41 demux.c "delaying stream", and a threadless core spins for
+  ## good, tmp/rvs/sblat.py, eofprobe.py): each keyframe's span, and each
+  ## batch of sound (backBatches), reads its stretch again.
   var step = 60.0
   if p.path.contains("://"):
     let rate = p.h.getFloat("video-bitrate", 0) + p.h.getFloat("audio-bitrate", 0)  # bits/s
@@ -629,7 +790,13 @@ proc setBackStep*(p: Player) =
   elif p.path.len > 0:
     let size = try: getFileSize(p.path).float except CatchableError: 0.0
     let dur = if p.fullDuration > 0: p.fullDuration else: p.duration
-    step = if size > 0 and dur > 0: clamp(40e6 * dur / size, 5, 15) else: 10.0
+    step = if size > 0 and dur > 0: clamp(40e6 * dur / size, 2, 15) else: 10.0
+    # A video of keyframes alone needs no step longer than its batch and its
+    # sound's (backBatches): a second at most, a quarter at least (ProRes at
+    # 173 Mbps read back 8 times a second: 2 s stood still ~70 ms each
+    # second, 1 s never).
+    if p.intraVideo:
+      step = if size > 0 and dur > 0: clamp(40e6 * dur / size, 0.25, 1) else: 1.0
   if step != p.backStep:
     p.backStep = step
     p.h.setProp("demuxer-backward-playback-step", step)
@@ -704,9 +871,10 @@ proc handleProp(p: Player, id: Prop, ev: ptr MpvEventProperty) =
   of pCacheState:
     p.buffered.setLen 0
     p.cacheAhead = -1
-    # A module or MIDI stream is rendered as it's read, not downloaded.
+    # A module or MIDI stream is rendered as it's read, an .aud one held in
+    # memory: nothing downloaded.
     if d != nil and ev.format == fmtNode and not p.source.startsWith("mmpmod://") and
-       not p.source.startsWith("mmpmidi://"):
+       not p.source.startsWith("mmpmidi://") and not p.source.startsWith("mmpaud://"):
       let j = cast[ptr MpvNode](d)[].toJson
       for r in j{"seekable-ranges"}.getElems:
         p.buffered.add (r{"start"}.getFloat, r{"end"}.getFloat)
@@ -901,7 +1069,7 @@ proc addFolderPicture(p: Player) =
     if not p.h.getFlag(t & "albumart"): return  # a video
     if p.h.getFlag(t & "external"): have.add p.h.getStr(t & "external-filename")
   var tags: Table[string, string]
-  let meta = p.h.getNode("metadata")
+  let meta = p.h.getNode("metadata").overlay(readSide(p.path))  # and its .m2c's
   if meta.kind == JObject:
     for k, v in meta: tags[k] = v.getStr
   let f = findFolderPicture(coverPatterns, p.path, tags)
@@ -966,7 +1134,7 @@ proc queueNext*(p: Player, path: string, start = 0.0, opts = "", source = "") =
   ## Gapless playback: has mpv go on to path by itself at the end of this
   ## file, its audio straight after this one's; "" for nothing (the app opens
   ## what comes next). Asked again with the same, nothing happens.
-  var o = opts
+  var o = opts.joinOpts(p.rgs.rgOpts(path))
   if start > 0:
     o = "start=" & formatFloat(start, ffDecimal, 3) & (if o.len > 0: "," & o else: "")
   let file = if source.len > 0: source else: path
@@ -1026,7 +1194,8 @@ proc pollEvents*(p: Player): bool =
         p.handleProp(Prop(id), cast[ptr MpvEventProperty](ev.data))
       elif id in MirrorBase ..< MirrorBase + MirroredProps.len:
         let e = cast[ptr MpvEventProperty](ev.data)
-        p.props[MirroredProps[id - MirrorBase]] =
+        let name = MirroredProps[id - MirrorBase]
+        p.props[name] =
           if e.data == nil or e.format != fmtString: "" else: $cast[ptr cstring](e.data)[]
       elif id in InfoBase ..< InfoBase + InfoProps.len:
         let e = cast[ptr MpvEventProperty](ev.data)
@@ -1110,14 +1279,16 @@ proc pollEvents*(p: Player): bool =
       if logAll: stderr.write "[mpv/", $m.prefix, "] ", $m.text
     else: discard
 
-proc setDemuxing*(p: Player, threadless: bool) =
-  ## mpv's demuxer options for the next file opened. Threadless also goes
-  ## without the cache: mpv turns it on by itself for a file on a network or
-  ## FUSE disk (an NTFS drive), and turning around to backward at the end of
-  ## a cached file spins mpv's core forever, the player frozen with it.
-  p.threadless = threadless
-  p.h.setProp("demuxer-thread", if threadless: "no" else: "yes")
-  p.h.setProp("cache", if threadless: "no" else: "auto")
+proc setDemuxing*(p: Player, mode: DemuxMode) =
+  ## mpv's demuxer options for the next file opened (DemuxMode). Threadless
+  ## also goes without the cache: mpv turns it on by itself for a file on a
+  ## network or FUSE disk (an NTFS drive), and turning around to backward at
+  ## the end of a cached file spins mpv's core forever, the player frozen
+  ## with it. How much it decodes at a time backward goes by the file's
+  ## tracks, once known (backBatches).
+  p.demux = mode
+  p.h.setProp("demuxer-thread", if mode == dmAhead: "yes" else: "no")
+  p.h.setProp("cache", if mode == dmAhead: "auto" else: "no")
 
 proc isAnimatedPng(path: string): bool =
   ## A PNG on disk with an animation (acTL before its picture data): APNG.
@@ -1149,7 +1320,7 @@ proc withDecoderOpts*(opts, path: string): string =
   let own = decoderOpts(path)
   if own.len == 0: opts elif opts.len == 0: own else: opts & "," & own
 
-proc load*(p: Player, path: string, start = 0.0, threadless = false, opts = "",
+proc load*(p: Player, path: string, start = 0.0, demux = dmAhead, opts = "",
            source = "", partStart = 0.0, partEnd = 0.0, fullDuration = 0.0,
            sphere = SphereInfo()) =
   ## Opens path (or `source` in its place), starting at `start` seconds when
@@ -1157,9 +1328,9 @@ proc load*(p: Player, path: string, start = 0.0, threadless = false, opts = "",
   ## saved part (source) holds partStart to partEnd of the link's fullDuration
   ## and lies on `sphere`.
   p.stopMeshRead()
-  let opts = withDecoderOpts(opts, if source.len > 0: source else: path)
+  let opts = withDecoderOpts(opts, if source.len > 0: source else: path).joinOpts(p.rgs.rgOpts(path))
   p.savedSphere = sphere
-  p.setDemuxing(threadless)
+  p.setDemuxing(demux)
   p.path = path
   p.source = source
   p.loadRestarts = p.restarts
@@ -1207,10 +1378,10 @@ proc hookFormat*(p: Player): string =
   try: parseJson(r{"stdout"}.getStr){"format_id"}.getStr
   except CatchableError: ""
 
-proc reopen*(p: Player, threadless: bool) =
+proc reopen*(p: Player, demux: DemuxMode) =
   ## Opens the file again where it is, paused or playing as it was, for
   ## options mpv reads only on opening one. Its added tracks are gone then.
-  p.setDemuxing(threadless)
+  p.setDemuxing(demux)
   p.clearTurnFades()
   p.releaseLink()
   p.resetNext()
@@ -1220,7 +1391,7 @@ proc reopen*(p: Player, threadless: bool) =
   inc p.jumps
   let file = if p.source.len > 0: p.source else: p.path
   p.h.commandAsync("loadfile", file, "replace", "-1",
-    withDecoderOpts("start=" & formatFloat(p.timePos, ffDecimal, 6), file))
+    withDecoderOpts("start=" & formatFloat(p.timePos, ffDecimal, 6), file).joinOpts(p.rgs.rgOpts(p.path)))
 
 proc externalFiles*(p: Player): seq[string] =
   ## The added tracks' files as mpv has them now (p.tracks may lag behind).
@@ -1821,6 +1992,7 @@ proc poll*(pr: Prober, wait = 0.0): bool =
       # Skip a late event from a file an earlier probe abandoned.
       if pr.h.getStr("path") != pr.url: continue
       pr.info.duration = pr.h.getFloat("duration")
+      if pr.pending.isAudFile and pr.pending.audLength > 0: pr.info.duration = pr.pending.audLength
       let tracks = pr.h.getNode("track-list")
       if tracks.kind == JArray:
         for t in tracks:
@@ -1833,7 +2005,11 @@ proc poll*(pr: Prober, wait = 0.0): bool =
           if t{"type"}.getStr == "audio":
             pr.info.rg = replayGainOf(t)
             break
-      pr.info.readTags(pr.h.getNode("metadata"))
+      # Its .m2c's tags over the file's, and ReplayGain values.
+      let side = readSide(pr.pending)
+      pr.info.readTags(pr.h.getNode("metadata").overlay(side))
+      let g = sideGain(side)
+      if g.rg.known or g.hidden: pr.info.rg = g.rg
       let (s, i) = pr.pending.cueTrack
       if i >= 0:
         # The audio file's tags are the album's: the track's are the sheet's.
@@ -1845,7 +2021,12 @@ proc poll*(pr: Prober, wait = 0.0): bool =
         if s.disc > 0: pr.info.disc = s.disc
       break
     of evEndFile:
-      if cast[ptr MpvEventEndFile](ev.data).reason == efError: break
+      if cast[ptr MpvEventEndFile](ev.data).reason == efError:
+        # mpv can't open it (a MIDI file, here): a .m2c's tags all the same.
+        let side = readSide(pr.pending)
+        pr.info.readTags(newJObject().overlay(side))
+        pr.info.rg = sideGain(side).rg
+        break
     of evShutdown: break
     else: discard
   pr.pending = ""

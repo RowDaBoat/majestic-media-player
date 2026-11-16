@@ -11,6 +11,9 @@
 ##
 ## A line naming a field the file doesn't have (outside [...]) is skipped.
 ## A field's own *, ? and / are taken literally: only the line's are wildcards.
+##
+## formatTitle writes text to show with the same language (the playlist's
+## group headers).
 
 import std/[os, strutils, tables, unicode, algorithm]
 from config import ImageExtensions
@@ -25,6 +28,8 @@ type
     s: string
     i: int
     field: proc (name: string): tuple[value: string, found: bool]
+    display: bool     ## text to show (formatTitle): a missing field is "?",
+                      ## slashes kept
 
 proc lit(s: string): seq[PChar] =
   for c in s: result.add (c, false)
@@ -52,6 +57,8 @@ proc parseField(p: var Parser): Value =
   let name = p.s[start ..< p.i]
   if p.i < p.s.len: inc p.i
   let (v, found) = p.field(name)
+  if p.display:
+    return Value(text: lit(if found: v else: "?"), truth: found, missing: not found)
   # A value's slashes would reach into folders: a file name can't hold one.
   Value(text: lit(v.multiReplace(("/", "_"), ("\\", "_"))), truth: found, missing: not found)
 
@@ -171,6 +178,14 @@ proc evaluate*(pattern: string,
     result.text.add c.c
     result.wild.add c.wild
   result.ok = true
+
+proc formatTitle*(pattern: string,
+                  field: proc (name: string): tuple[value: string, found: bool]): string =
+  ## The pattern as text to show, foobar2000's title formatting: a field the
+  ## file doesn't have reads "?" ([...] around it leaves it out), * and ? are
+  ## plain characters.
+  var p = Parser(s: pattern, field: field, display: true)
+  p.parseSeq({}).plain
 
 # --- matching -------------------------------------------------------------------
 
