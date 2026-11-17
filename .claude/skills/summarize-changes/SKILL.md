@@ -19,6 +19,8 @@ git status --short && git log --oneline -3 && git diff --stat -- . ':!.claude'
 - If changes summarized earlier in the conversation now appear in a commit, say so in one line
   (give the commit hash).
 - Untracked files outside `.claude/` count as changes: read them and include them.
+- If nothing is unstaged but changes are staged (`git status` shows them in the first column),
+  summarize the staged ones instead: use `git diff --cached` below, and say so in one line.
 
 ## 2. Read the full diff
 
@@ -36,15 +38,15 @@ order. No title line goes above a list: each one ends with its `=== End of ... =
 by a blank line between lists:
 
 ```
-Make frame stepping instant by keeping the frames around a paused position in textures.
+Make frame stepping instant.
 Bump the version to 0.20.0.
 === End of Changes ===
 
-Add YouTube seek bar previews from storyboards, with a toggle in the seek bar's context menu.
+Add YouTube seek bar previews, with a toggle in the seek bar's menu.
 Add Ctrl+D to duplicate playlist entries.
 === End of New ===
 
-Fix the end of audio files being cut off (gapless-audio=no, ao=pulse).
+Fix the end of audio files being cut off.
 Stop listed YouTube playlists from adding their videos again after a restart.
 === End of Fixes ===
 ```
@@ -55,7 +57,15 @@ Stop listed YouTube playlists from adding their videos again after a restart.
 - **Fixes**: anything that was broken and now isn't, whichever verb describes it best.
 - Sort each list from major to minor: what users will notice most goes first; internals, docs and
   the version go last.
-- One line per item, brief and informative, ending in a period.
+- One line per item, ending in a period, **at most 80 characters**. Count them; a line that
+  wraps is too long.
+- Say what changed for the user, not how: leave out mechanisms, lists of edge cases, examples
+  and parenthesized details. "Add a file list to the Run window: drag to reorder, add, drop,
+  sort and remove." is right; a line listing every button, key and default is not.
+- When a feature still doesn't fit in one short line, split it into a few short items, each a
+  distinct thing users can do or notice (a second command, a feature's starting state, an
+  option elsewhere), none repeating another. Splitting this way doesn't break the
+  no-redundancy rules below; describing the same thing twice still does.
 - Every item must begin with a verb in the imperative: Fix, Add, Make, Show, Separate, Clarify...
 - Describe user-visible behavior (menus, shortcuts, buttons, OSD messages, saved files) in plain
   terms. Name a proc, file or setting only when there is no better way to say it.

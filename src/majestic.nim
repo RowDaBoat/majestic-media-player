@@ -14492,6 +14492,24 @@ proc playlistSide(a: App, x, y, w, h: float32, blocked: bool) =
         a.inTab(ti): a.dropRows(-1)
       ui.activeId = ""  # not dropped on the rows too
 
+proc selectionLine(n: int, total: float, unknown: bool, what: string): string =
+  ## A panel's bottom line about its selection: how many, and how long they
+  ## last together, with a + while some of their lengths aren't known yet.
+  if n == 0: return "Nothing selected"
+  result = countLabel(n, what) & " selected"
+  if total > 0: result.add ", " & fmtTime(total, dur = total) & (if unknown: "+" else: "")
+
+proc plSelectionLine(a: App): string =
+  ## The playlist's bottom line: its selected entries, each copy of a file
+  ## counted, their lengths as the Duration column shows them.
+  var (n, total, unknown) = (0, 0.0, false)
+  for i in a.plSelection:
+    inc n
+    a.mediaInfo.withValue(a.playlist[i], m):
+      total += max(0.0, m.duration)
+    do: unknown = true  # not probed yet
+  selectionLine(n, total, unknown, "item")
+
 proc playlistPanel(a: App, r: Rect) =
   let ui = a.ui
   a.plOverEdge = false
@@ -14544,7 +14562,16 @@ proc playlistPanel(a: App, r: Rect) =
       colTextDim, FontSmall, h = CenterAlign)
     return
 
+  # The bottom line, across the panel: the selection. Drawn last, once this
+  # frame's clicks and keys have changed it.
+  let status = rect(r.x + 1, r.y + r.h - LibraryStatusH, r.w - 1, LibraryStatusH)
+  proc drawStatus() =
+    ui.rect(status, colPanel)  # the body's shade, darker than the header
+    ui.rect(rect(status.x, status.y, status.w, 1), colBorder)
+    ui.textIn(ui.ellipsize(a.plSelectionLine, status.w - 16, FontSmall),
+      rect(status.x + 8, status.y, status.w - 16, status.h), colTextDim, FontSmall)
   var top = 30'f32
+  let bodyH = r.h - LibraryStatusH  # the panel above the bottom line
   # The entries' column: the whole panel under the tabs, or right of the
   # playlists' side column, whose right edge drags to resize it.
   var (cx, cw) = (r.x + 1, r.w - 1)
@@ -14552,7 +14579,7 @@ proc playlistPanel(a: App, r: Rect) =
   if a.cfg.playlistTabsSide:
     let most = max(PlaylistSideMinW, cw - PlaylistSideRest)
     var sw = clamp(round(a.cfg.playlistSideWidth).float32, PlaylistSideMinW, most)
-    let sideGrip = rect(cx + sw - 2, r.y + top, 5, r.h - top)
+    let sideGrip = rect(cx + sw - 2, r.y + top, 5, bodyH - top)
     sideEdge = ui.hover(sideGrip) and not ui.hover(grip)
     if sideEdge and ui.pressed():
       ui.activeId = "plside"
@@ -14563,8 +14590,8 @@ proc playlistPanel(a: App, r: Rect) =
       a.cfg.playlistSideWidth = clamp(w0 + ui.mouse.x - x0, PlaylistSideMinW, most)
       sw = round(a.cfg.playlistSideWidth).float32
       if ui.released(): a.cfg.save()
-    a.playlistSide(cx, r.y + top, sw, r.h - top, sideEdge or ui.hover(grip))
-    ui.rect(rect(cx + sw, r.y + top, 1, r.h - top), colBorder)
+    a.playlistSide(cx, r.y + top, sw, bodyH - top, sideEdge or ui.hover(grip))
+    ui.rect(rect(cx + sw, r.y + top, 1, bodyH - top), colBorder)
     cx += sw + 1
     cw -= sw + 1
   else:
@@ -14609,7 +14636,7 @@ proc playlistPanel(a: App, r: Rect) =
   # Column headers: a click sorts by the column, a drag moves it. A drag of its
   # right edge resizes it, a double-click there fits it to the rows in view.
   let colHdr = rect(cx, r.y + top, cw, PlaylistHeaderH)
-  let list = rect(cx, colHdr.y + colHdr.h, cw, r.h - top - colHdr.h)
+  let list = rect(cx, colHdr.y + colHdr.h, cw, max(0'f32, bodyH - top - colHdr.h))
   let rowH = PlaylistRowH
   a.buildPlaylistView()
   let maxScroll = max(0'f32, a.plLineCount.float32 * rowH - list.h)
@@ -14677,7 +14704,7 @@ proc playlistPanel(a: App, r: Rect) =
       if ui.hover(cr): a.ctxColumn = f
     a.ctxMenu = cmPlaylistColumns
     a.menus.openContext(ui.mouse)
-  elif ui.hover(r) and not ui.hover(a.tabStrip) and ui.released(MouseRight):
+  elif ui.hover(r) and not ui.hover(a.tabStrip) and not ui.hover(status) and ui.released(MouseRight):
     # Right-click selects the row under the pointer (none below the last one).
     # A row already in the selection keeps the selection for the menu.
     # A group's header: its entries.
@@ -14698,6 +14725,7 @@ proc playlistPanel(a: App, r: Rect) =
     if ui.activeId == "plrow" and a.plRowFrom.moved and a.shownId != a.rowDragTab:
       ui.border(list, colAccent)
       if ui.released() and ui.hover(list): a.dropRows(0)
+    drawStatus()
     return
   if ui.activeId == "plscroll":  # the drag wins over playback moving on
     a.plReveal = false
@@ -14839,6 +14867,7 @@ proc playlistPanel(a: App, r: Rect) =
   let shown = a.plVisible(first, last)
   a.probeNext(shown)
   a.infoNext(shown)
+  drawStatus()
 
 
 # --- the Library panel --------------------------------------------------------
@@ -15092,6 +15121,19 @@ proc libraryStatus(a: App): tuple[text: string, color: ColorRGBX, progress: floa
   result.text = countLabel(a.libRows.len, "file")
   if total > 0: result.text.add ", " & fmtTime(total, dur = total)
   result.color = colTextDim
+
+proc libSelectionLine(a: App): string =
+  ## The bottom line's left side: the selected files, their lengths as the
+  ## Duration column shows them.
+  let ix = a.library
+  var (n, total, unknown) = (0, 0.0, false)
+  for p in a.libSel:
+    let id = ix.find(p)
+    if id < 0: continue  # gone from the index since
+    inc n
+    if ix.files[id].probed: total += max(0.0, ix.files[id].duration)
+    else: unknown = true
+  selectionLine(n, total, unknown, "file")
 
 proc libCellText(a: App, f: LibFile, field: PlaylistField): string =
   ## A library row's text in a column, from the index alone (never the disk).
@@ -15714,7 +15756,7 @@ proc libraryPanel(a: App, r: Rect, under: bool) =
     let overPl = dragging and ui.mouse.inside(a.plPanelRect) and not ui.mouse.inside(a.tabStrip)
     let overVideo = dragging and not overPl and ui.mouse.inside(a.videoClearRect)
     var gap = a.playlist.len
-    if overPl and pl.w > 0:
+    if overPl and pl.w > 0 and ui.mouse.y < pl.y + pl.h:  # under the rows (its bottom line): the end
       gap = a.plGapAt(ui.mouse.y - pl.y + a.plScroll)
     if overPl or overVideo:
       ui.sk.pushLayer(PopupsLayer)
@@ -15785,7 +15827,19 @@ proc libraryPanel(a: App, r: Rect, under: bool) =
       a.libBarDrawn = t
     else:
       ui.rect(rect(bar.x, bar.y, bw * clamp(progress, 0, 1), bar.h), colAccent)
-  ui.textIn(ui.ellipsize(text, textW, FontSmall), rect(st.x + 8, st.y, textW, st.h), col, FontSmall)
+  # The selection on the left, what's listed (or the scan) on the right; short
+  # of room, each keeps half, or what the other leaves of it.
+  textW = max(0'f32, textW)
+  let sel = a.libSelectionLine
+  let gap = 16'f32
+  let (selW, textW0) = (ui.textSize(sel, FontSmall).x, ui.textSize(text, FontSmall).x)
+  var (sw, tw) = (selW, textW0)
+  if selW + gap + textW0 > textW:
+    sw = max(0'f32, min(selW, max((textW - gap) / 2, textW - gap - textW0)))
+    tw = max(0'f32, textW - gap - sw)
+  ui.textIn(ui.ellipsize(sel, sw, FontSmall), rect(st.x + 8, st.y, sw, st.h), colTextDim, FontSmall)
+  ui.textIn(ui.ellipsize(text, tw, FontSmall), rect(st.x + 8 + textW - tw, st.y, tw, st.h), col,
+    FontSmall, h = RightAlign)
 
 
 proc runLogPanel(a: App, r: Rect) =
@@ -15982,6 +16036,8 @@ proc dropFiles(a: App, dropped: seq[string]) =
   if list.w > 0 and a.dropAt.inside(list):
     let at = a.plGapAt(a.dropAt.y - list.y + a.plScroll)
     a.addToPlaylist(paths, at)
+  elif list.w > 0 and a.dropAt.inside(a.plPanelRect) and a.dropAt.y >= list.y + list.h:
+    a.addToPlaylist(paths)  # on the bottom line, under the rows: the end
   elif paths.len == 1 and paths[0].isImageFile and not paths[0].contains("://") and
        fileExists(paths[0]) and a.dropAt.inside(a.videoRect) and a.quickCoverAllowed:
     a.setQuickCover(paths[0].absolutePath)  # on a file showing no picture: its cover

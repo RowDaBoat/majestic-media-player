@@ -274,6 +274,14 @@ it held, to commit.
   and exclude: tags follow); anywhere else in the Library F2 does nothing, not even Rename Playlist. The
   holder shows a `colAccentDim` edge round its list or column, drawn after both panels, and a
   `colAccent` outline on the row the arrows move from. `panelsdump` (MMP_SCRIPT) prints the state.
+- The playlist panel's bottom line (`drawStatus` in `playlistPanel`), across the panel under the
+  rows and the side column, the body's `colPanel` (not the header's `colPanelRaised`), as tall as
+  the Library's (`LibraryStatusH`): the selected entries and their total length (`plSelectionLine`,
+  `selectionLine`: "N items selected, 12:34", each copy of a file counted, the lengths the Duration
+  column shows, `+` while some entries aren't probed yet; "Nothing selected"). It's drawn after the
+  rows, so a click's or a key's new selection shows the same frame. A file dropped on it
+  (`dropFiles`) and Library rows let go over it go at the end of the playlist; a right-click on it
+  opens no menu (the rows' would pick a row scrolled out of view under it).
 - Several playlists (`src/plmanager.nim`, tabs drawn by `playlistTabs`): the one shown lives in
   `App.playlist` and the `pl*` fields as before, so the editing, columns, search and Properties code
   is unchanged; the others wait in `App.tabs`, the shown one's slot there stale. `stashTab`/`unstashTab`
@@ -900,8 +908,11 @@ it held, to commit.
   search only filters the sorted libraries (each file's lower-case search text is cached). At exit the
   windows are unmapped before the process ends: a thread stuck in a share keeps a process alive until
   the share answers, and its windows would stay up, frozen.
-  The panel's bottom line has a bar on the right while a scan or the tag reading is under way
-  (`libraryStatus`'s progress). A walk is measured against the files the index had under the folder
+  The panel's bottom line shows the selection on the left, as the playlist's does (`libSelectionLine`:
+  "N files selected" and their total length, `+` while some files' tags aren't read yet), and on the
+  right, right-aligned, the files listed and their length or the scan's state (`libraryStatus`);
+  short of room each keeps half, or more where the other needs less. It has a bar on the right while
+  a scan or the tag reading is under way (`libraryStatus`'s progress). A walk is measured against the files the index had under the folder
   as it began (`RootInfo.expected`, the last walk's or the saved index's; `scanProgress` sums the
   folders walked since the scan began, `runFrom`); with none known (a folder never walked, the saved
   index still loading) the bar slides back and forth, redrawn at 30 fps (`libBarSliding`). Tag
