@@ -849,7 +849,13 @@ proc save*(e: Equalizers) =
 type
   CardKind* = enum
     ckValue = "value"             ## content is the text itself
-    ckReference = "reference"     ## content is a key: "file", "timestamp" or "external"
+    ckReference = "reference"     ## content is a key: "file", "timestamp", "external" or "files"
+
+  ListForm* = enum
+    ## How a file list card (reference "files") reaches the command line.
+    lfArgs = "args"               ## a bash array: "${name[@]}", a word per file
+    lfConcat = "ffconcat"         ## the path of an ffmpeg concat list (ffconcat) file
+    lfLines = "lines"             ## the path of a text file, a path per line
 
   RectDim* = enum
     ## Which number of a rectangle a value card holds.
@@ -865,7 +871,9 @@ type
     rect*: int                    ## value cards: the rectangle drawn on run (1, 2, ...),
     dim*: RectDim                 ## and which of its numbers; 0 for text
     path*: bool                   ## value cards: a file path, browsed for with a save dialog on run,
-    reveal*: bool                 ## and its folder opened once the command succeeds
+    reveal*: bool                 ## and its folder opened once the command succeeds,
+    play*: bool                   ## and it played in a new player once the command succeeds
+    list*: ListForm               ## file list cards: how the files are passed
 
   CommandLine* = object
     title*: string
@@ -899,6 +907,9 @@ type
                                   ## or "loopB" chosen,
     time*: float                  ## else the time of the bookmark or chapter chosen
     crossed*: bool                ## rectangle cards: a drawn rectangle leaves it alone
+    play*: bool                   ## path cards: the result played in a new player,
+    playDefault*: bool            ## while the card's own setting was this
+    hasPlay*: bool                ## (false in values kept before there was a choice)
 
   RunValues* = Table[string, Table[string, RunValue]]  ## title -> card name -> value
 
@@ -949,6 +960,7 @@ proc rememberValues*(c: CommandLine, values: Table[string, RunValue]) =
     if p.card and p.name in values:
       var v = values[p.name]
       v.default = p.content
+      v.playDefault = p.play
       mine[p.name] = v
   all[c.title] = mine
   all.save()

@@ -8,10 +8,13 @@
 ## values be changed. Value cards can be numbers of a rectangle (its width,
 ## height, x or y) that the Run window lets be drawn over the video, or a
 ## file path it lets be browsed for with a save dialog; a path card can have
-## its folder opened once the command succeeds.
+## its folder opened, or the file played in a new player, once the command
+## succeeds. A file list card holds files chosen on run, in an order the Run
+## window lets be changed: a bash array, or the path of a list file.
 
-import std/[strutils, sequtils, os, math, tables]
+import std/[strutils, sequtils, os, math, tables, algorithm]
 import silky, vmath, bumpy, pixie
+from player import naturalCmp
 import ui, theme, config
 
 type
@@ -86,6 +89,24 @@ proc isRect*(p: CmdPart): bool = p.card and p.kind == ckValue and p.rect > 0
 
 proc isPath*(p: CmdPart): bool = p.card and p.kind == ckValue and p.path
 
+proc isList*(p: CmdPart): bool =
+  ## A file list card: files chosen on run, in order.
+  p.card and p.kind == ckReference and p.content == "files"
+
+proc listItems*(value: string): seq[string] =
+  ## The files of a file list card's pick (one per line).
+  value.split('\n').filterIt(it.len > 0)
+
+proc listFileText*(files: seq[string], form: ListForm): string =
+  ## What a file list card's list file holds: ffmpeg's concat demuxer
+  ## script (paths in single quotes, a quote written '\''), or a path per
+  ## line.
+  if form == lfConcat:
+    result = "ffconcat version 1.0\n"
+    for f in files: result.add "file '" & f.replace("'", "'\\''") & "'\n"
+  else:
+    for f in files: result.add f & "\n"
+
 proc digitsOnly*(s: string): string =
   for c in s:
     if c in Digits: result.add c
@@ -111,10 +132,11 @@ proc externalCards*(parts: seq[CmdPart]): seq[string] =
     if p.isExternal and p.name notin result: result.add p.name
 
 proc runCards*(parts: seq[CmdPart]): seq[CmdPart] =
-  ## The cards the Run window asks about (values and timestamps), each name
-  ## once, in order.
+  ## The cards the Run window asks about (values, timestamps and file
+  ## lists), each name once, in order.
   for p in parts:
-    if p.card and (p.kind == ckValue or p.isTimestamp) and not result.anyIt(it.name == p.name):
+    if p.card and (p.kind == ckValue or p.isTimestamp or p.isList) and
+       not result.anyIt(it.name == p.name):
       result.add p
 
 proc resolve*(p: CmdPart, path: string, picks: Table[string, string]): tuple[value, err: string] =
@@ -136,6 +158,9 @@ proc resolve*(p: CmdPart, path: string, picks: Table[string, string]): tuple[val
     elif p.isExternal:
       if p.name in picks: result.value = picks[p.name]
       else: result.err = "No file chosen for " & p.name
+    elif p.isList:
+      if picks.getOrDefault(p.name).len > 0: result.value = picks[p.name]
+      else: result.err = "No files chosen for " & p.name
     else:
       result.err = "Card " & p.name & " doesn't refer to anything"
 
@@ -144,7 +169,10 @@ proc compose*(parts: seq[CmdPart], path: string, picks: Table[string, string],
   ## A bash script: one assignment per card, then the command line with each
   ## card expanded as "${name}" (quoted to fit the quotes typed around it).
   ## With timeFix, a bash function, timestamps are assigned what it makes of
-  ## them (times of a clip of the media file).
+  ## them (times of a clip of the media file). A file list card passed as
+  ## arguments is an array, expanded as "${name[@]}": a word per file; picks
+  ## holds its files a line each. Passed as a list file, picks holds that
+  ## file's path instead.
   var assigned: seq[string]
   var body = ""
   var inSingle, inDouble, escaped = false
@@ -160,12 +188,14 @@ proc compose*(parts: seq[CmdPart], path: string, picks: Table[string, string],
     escaped = false
     let (value, err) = p.resolve(path, picks)
     if err.len > 0: return ("", err)
+    let array = p.isList and p.list == lfArgs
     if p.name notin assigned:
       assigned.add p.name
       result.script.add p.name & "=" &
-        (if timeFix.len > 0 and p.isTimestamp: "$(" & timeFix & " " & quoteShellPosix(value) & ") || exit"
+        (if array: "(" & value.listItems.mapIt(quoteShellPosix(it)).join(" ") & ")"
+         elif timeFix.len > 0 and p.isTimestamp: "$(" & timeFix & " " & quoteShellPosix(value) & ") || exit"
          else: quoteShellPosix(value)) & "\n"
-    let v = "${" & p.name & "}"
+    let v = "${" & p.name & (if array: "[@]}" else: "}")
     body.add(if inSingle: "'\"" & v & "\"'" elif inDouble: v else: "\"" & v & "\"")
   result.script.add body
 
@@ -176,6 +206,7 @@ proc preview(toks: seq[CmdPart], path: string): string =
     if not t.card: result.add t.text
     elif t.isTimestamp: result.add "[" & t.name & ": timestamp]"
     elif t.isExternal: result.add "[" & t.name & ": external file]"
+    elif t.isList: result.add "[" & t.name & ": files]"
     else:
       let (value, err) = t.resolve(path, initTable[string, string]())
       result.add(if err.len > 0: "[" & t.name & "?]" else: quoteShellPosix(value))
@@ -218,7 +249,8 @@ proc validate(d: CmdDialog): string =
     for u in d.toks[0 ..< i]:
       if u.card and u.name == t.name and (u.kind != t.kind or u.content != t.content or
                                           u.rect != t.rect or u.dim != t.dim or
-                                          u.path != t.path or u.reveal != t.reveal):
+                                          u.path != t.path or u.reveal != t.reveal or
+                                          u.play != t.play or u.list != t.list):
         return "Two different cards are named " & t.name & "."
 
 proc insertTok(d: CmdDialog, t: CmdPart, at: int) =
@@ -233,7 +265,7 @@ proc deleteTok(d: CmdDialog, at: int) =
 proc isSpace(t: CmdPart): bool = not t.card and t.text == " "
 
 proc addCard*(d: CmdDialog, name: string, kind = ckValue, content = "", rect = 0,
-              dim = rdNone, path = false, reveal = false) =
+              dim = rdNone, path = false, reveal = false, play = false, list = lfArgs) =
   ## Inserts a card at the caret, spaced from its neighbours, and selects it;
   ## the caret goes after the space that follows it.
   var at = clamp(d.caret, 0, d.toks.len)
@@ -241,7 +273,7 @@ proc addCard*(d: CmdDialog, name: string, kind = ckValue, content = "", rect = 0
     d.insertTok(CmdPart(text: " "), at)
     inc at
   d.insertTok(CmdPart(card: true, name: name, kind: kind, content: content, rect: rect,
-    dim: dim, path: path, reveal: reveal), at)
+    dim: dim, path: path, reveal: reveal, play: play, list: list), at)
   # Typing carries on after a space.
   if at + 1 == d.toks.len or not d.toks[at + 1].isSpace:
     d.insertTok(CmdPart(text: " "), at + 1)
@@ -250,6 +282,21 @@ proc addCard*(d: CmdDialog, name: string, kind = ckValue, content = "", rect = 0
   d.caretEol = false
   d.anchor = d.caret
   d.error = ""
+
+proc addText*(d: CmdDialog, text: string) =
+  ## Inserts text at the caret, as typed (debug scripting).
+  for ch in text.chars:
+    d.insertTok(CmdPart(text: ch), d.caret)
+    inc d.caret
+  d.anchor = d.caret
+  d.caretEol = false
+
+proc selectCard*(d: CmdDialog, name: string) =
+  ## Shows the properties of the first card called name (debug scripting).
+  for k, t in d.toks:
+    if t.card and t.name == name:
+      d.selected = k
+      return
 
 proc freeName(d: CmdDialog, base: string): string =
   ## base, else base2, base3, ... whichever no card is named yet.
@@ -651,6 +698,7 @@ proc properties(d: CmdDialog, ui: Ui, r: Rect, path: string) =
      d.toks[s].kind != ckValue:
     d.toks[s].kind = ckValue
     d.toks[s].content = ""
+    d.toks[s].list = lfArgs
     d.refScroll = 0
   if ui.radioButton("cl-refer", vec2(r.x + labelW + 90, y), "Reference",
                     d.toks[s].kind == ckReference) and d.toks[s].kind != ckReference:
@@ -660,19 +708,41 @@ proc properties(d: CmdDialog, ui: Ui, r: Rect, path: string) =
     d.toks[s].dim = rdNone
     d.toks[s].path = false
     d.toks[s].reveal = false
+    d.toks[s].play = false
     d.refScroll = 0
   y += 34
   ui.textIn("Content", rect(r.x, y, labelW, 26), colText)
   let fw = r.w - labelW
   if d.toks[s].kind == ckReference:
-    # What a card can refer to: the media file's path, or a timestamp or
-    # external file picked when the command runs.
+    # What a card can refer to: the media file's path, or a timestamp,
+    # external file or list of files picked when the command runs.
     let rows = [
       (key: "file", label: "Current media file", detail: (if path.len > 0: "" else: "none open")),
       (key: "timestamp", label: "Timestamp", detail: "chosen on run"),
-      (key: "external", label: "External file", detail: "chosen on run")]
-    discard d.choiceList(ui, "cl-ref", rect(r.x + labelW, y, fw, RowH * 3 + 2), rows,
-      d.toks[s].content, path)
+      (key: "external", label: "External file", detail: "chosen on run"),
+      (key: "files", label: "Files", detail: "chosen on run, in order")]
+    if d.choiceList(ui, "cl-ref", rect(r.x + labelW, y, fw, RowH * rows.len.float32 + 2), rows,
+                    d.toks[s].content, path):
+      d.toks[s].list = lfArgs
+    if not d.toks[s].isList: return
+    # How the files reach the command: words, or a file listing them.
+    y += RowH * rows.len.float32 + 10
+    ui.textIn("Pass as", rect(r.x, y, labelW, 22), colText)
+    for (form, label) in [(lfArgs, "Arguments, a word per file"),
+                          (lfConcat, "ffmpeg concat list file"),
+                          (lfLines, "Text file, a path per line")]:
+      if ui.radioButton("cl-list" & $form, vec2(r.x + labelW, y), label, d.toks[s].list == form):
+        d.toks[s].list = form
+      y += 24
+    let n = d.toks[s].name
+    let note = case d.toks[s].list
+      of lfArgs: @["Runs as \"${" & n & "[@]}\": for f in", "\"${" & n & "[@]}\"; do ...; done"]
+      of lfConcat: @["For ffmpeg -f concat -safe 0 -i; the", "file is deleted once the run ends."]
+      of lfLines: @["The file is deleted once the run", "ends."]
+    for line in note:
+      ui.textIn(ui.ellipsize(line, fw, FontSmall), rect(r.x + labelW, y + 2, fw, 18), colTextDim,
+        FontSmall)
+      y += 18
     return
   let contents = [(key: "text", label: "Text", detail: ""),
                   (key: "rect", label: "Rectangle", detail: "drawn on run"),
@@ -693,10 +763,14 @@ proc properties(d: CmdDialog, ui: Ui, r: Rect, path: string) =
       colTextDim, FontSmall)
     ui.textIn("~ is home; else from the media's folder.", rect(r.x + labelW, y + 46, fw, 18),
       colTextDim, FontSmall)
-    discard ui.checkbox("cl-reveal", vec2(r.x + labelW, y + 70), "Open containing folder",
+    ui.textIn("Once the command succeeds:", rect(r.x + labelW, y + 72, fw, 18), colTextDim,
+      FontSmall)
+    discard ui.checkbox("cl-reveal", vec2(r.x + labelW, y + 92), "Open containing folder",
       d.toks[s].reveal)
-    ui.textIn("once the command succeeds.", rect(r.x + labelW + 24, y + 92, fw - 24, 18),
-      colTextDim, FontSmall)
+    discard ui.checkbox("cl-play", vec2(r.x + labelW, y + 116), "Open in a new player",
+      d.toks[s].play)
+    ui.tip(rect(r.x + labelW, y + 116, fw, 22),
+      "Opens the file in a player of its own; the Run window can change it for a run")
     return
   if not d.toks[s].isRect:
     discard ui.textField("cl-content", rect(r.x + labelW, y, fw, 26), d.toks[s].content, "text")
@@ -879,7 +953,7 @@ proc draw*(d: CmdDialog, ui: Ui, r: Rect, path: string): CmdAction =
 
 type
   PickAction* = enum
-    paNone, paRun, paCancel, paDraw, paBrowse
+    paNone, paRun, paCancel, paDraw, paBrowse, paAddFiles
 
   TimeChoice* = object
     ## An entry of a timestamp row's list: a time, a separator, or a note
@@ -891,12 +965,16 @@ type
     chapter*: bool            ## a chapter, not a bookmark
     sep*, note*: bool
 
+  ListedFile* = tuple[known: bool, duration: float, width, height: int]
+    ## What a file list shows of a file: its length and picture size (0 for
+    ## none), known once probed.
+
   PickDialog* = ref object
-    ## Shown when a command line with value or timestamp cards runs: one row
-    ## per card, its name and a dropdown of times (the start, the current
-    ## time, the end, the A-B loop marks, the media file's bookmarks and
-    ## chapters) or a field
-    ## holding the card's value.
+    ## Shown when a command line with value, timestamp or file list cards
+    ## runs: one row per card, its name and a dropdown of times (the start,
+    ## the current time, the end, the A-B loop marks, the media file's
+    ## bookmarks and chapters), a field holding the card's value, or a list
+    ## of files to put in order.
     cmd*: CommandLine
     rows*: seq[CmdPart]       ## the cards asked about
     picks*: seq[int]          ## timestamp rows: the index of the time chosen
@@ -904,11 +982,25 @@ type
                               ## in the list as bookmarks come and go
     texts*: seq[string]       ## value rows: the value to run with
     crossed*: seq[bool]       ## rectangle rows: a drawn rectangle leaves them alone
+    plays*: seq[bool]         ## path rows: the file played in a new player once done
+    files*: seq[seq[string]]  ## file list rows: the files, in order
+    marked*: seq[seq[bool]]   ## and which of them are selected
+    cursor*: seq[int]         ## and the one the arrow keys go from, else -1
+    anchor: seq[int]          ## where a Shift+click selection starts
+    fileScroll: seq[float32]  ## pixels
     drawing*: int             ## rectangle being drawn over the video, else 0
     drawRequest*: int         ## with paDraw: the rectangle to draw
     browseRow*: int           ## with paBrowse: the path row to browse for
+    addRow*: int              ## with paAddFiles: the file list row to add to
     openRow*: int             ## row whose dropdown is open, else -1
     listScroll: float32       ## the open list, in pixels
+    dragRow: int              ## file list row pressed on, else -1
+    dragFrom: Vec2
+    dragging: bool            ## its selected files being dragged elsewhere
+    dropAt: int               ## and the place they would go (a file index)
+    pressedOn: int            ## a selected file pressed on: selected alone on
+                              ## release, unless dragged; else -1
+    error*: string            ## why Run was refused
     runRequested*: bool       ## debug scripting: press Run next frame
 
 const
@@ -916,6 +1008,11 @@ const
   PickRowH = 36'f32
   PickLabelW = 150'f32
   NoteH = 40'f32              ## the list's two-line note
+  FilesShown = 8              ## file list rows in view
+  FileRowH = 24'f32
+  FileBoxH = FilesShown.float32 * FileRowH + 2
+  FileBarH = 28'f32           ## a file list's buttons, under it
+  PlayRowH = 26'f32           ## a path row's "Open in a new player" checkbox
 
 proc timeChoices*(pos, duration, loopA, loopB: float,
     marks, chapters: seq[Bookmark]): seq[TimeChoice] =
@@ -975,23 +1072,32 @@ proc choose*(d: PickDialog, i: int, choices: seq[TimeChoice], k: int) =
   d.picks[i] = k
   d.chosen[i] = choices[k]
 
-proc newPickDialog*(): PickDialog = PickDialog(openRow: -1)
+proc newPickDialog*(): PickDialog = PickDialog(openRow: -1, dragRow: -1, pressedOn: -1)
 
 proc start*(d: PickDialog, c: CommandLine, choices: seq[TimeChoice],
-    last = initTable[string, RunValue]()) =
+    last = initTable[string, RunValue](), seed: seq[string] = @[], seedFirst = false) =
   ## Prepares the window for c. Cards start at what they were last run with
   ## (last): a value, the start, current time, end or a loop mark, or the
   ## bookmark or chapter at the same time (the same file). Otherwise values
   ## start at the card's own, the first timestamp card at the first bookmark
   ## (else the current time) and each later one at the entry after the
   ## previous card's, so a command using bookmarks in order needs no changes
-  ## for a file marked in order.
+  ## for a file marked in order. File lists start with seed when seedFirst
+  ## (files picked in the playlist) or when the files they last ran with
+  ## are gone, else with those.
   d.cmd = c
   d.rows = c.parts.runCards
-  d.picks = newSeq[int](d.rows.len)
-  d.chosen = newSeq[TimeChoice](d.rows.len)
-  d.texts = newSeq[string](d.rows.len)
-  d.crossed = newSeq[bool](d.rows.len)
+  let n = d.rows.len
+  d.picks = newSeq[int](n)
+  d.chosen = newSeq[TimeChoice](n)
+  d.texts = newSeq[string](n)
+  d.crossed = newSeq[bool](n)
+  d.plays = newSeq[bool](n)
+  d.files = newSeq[seq[string]](n)
+  d.marked = newSeq[seq[bool]](n)
+  d.cursor = newSeqWith(n, -1)
+  d.anchor = newSeqWith(n, -1)
+  d.fileScroll = newSeq[float32](n)
   d.drawing = 0
   var prev = -1  # the previous timestamp card's pick
   for i, row in d.rows:
@@ -1012,16 +1118,43 @@ proc start*(d: PickDialog, c: CommandLine, choices: seq[TimeChoice],
             break
       d.chosen[i] = choices[d.picks[i]]
       prev = d.picks[i]
+    elif row.isList:
+      let kept = if row.name in last: last[row.name].value.listItems.filterIt(it.fileExists)
+                 else: @[]
+      d.files[i] = if seedFirst or kept.len == 0: seed else: kept
+      d.marked[i] = newSeq[bool](d.files[i].len)
     else:
       d.texts[i] = if row.name in last: last[row.name].value else: row.content
       d.crossed[i] = row.isRect and row.name in last and last[row.name].crossed
+      # The card's own setting, unless the last run changed it since it was
+      # last set in the Commands window.
+      d.plays[i] = row.play
+      if row.isPath and row.name in last and last[row.name].hasPlay and
+         last[row.name].playDefault == row.play:
+        d.plays[i] = last[row.name].play
   d.openRow = -1
   d.listScroll = 0
+  d.dragRow = -1
+  d.dragging = false
+  d.pressedOn = -1
+  d.error = ""
+
+proc rowHeight(row: CmdPart): float32 =
+  if row.isList: FileBoxH + 8 + FileBarH + 12
+  elif row.isPath: PickRowH + PlayRowH
+  else: PickRowH
+
+proc rowTop(d: PickDialog, i: int): float32 =
+  ## Row i's top, from the window's.
+  result = PickTop
+  for row in d.rows[0 ..< min(i, d.rows.len)]: result += row.rowHeight
 
 proc size*(d: PickDialog): tuple[w, h: int32] =
-  ## Taller with timestamp rows, for room to drop their lists down.
+  ## Taller with timestamp rows, for room to drop their lists down; wider
+  ## with a file list.
   let minH = if d.rows.anyIt(it.isTimestamp): 320'f32 else: 200'f32
-  (480'i32, int32(max(minH, PickTop + d.rows.len.float32 * PickRowH + 70)))
+  let w = if d.rows.anyIt(it.isList): 680'i32 else: 480'i32
+  (w, int32(max(minH, d.rowTop(d.rows.len) + 70)))
 
 proc choiceText(ch: TimeChoice): (string, string) =
   (ch.label, if ch.time < 0: "unknown" else: fmtTime(ch.time, millis = true))
@@ -1033,13 +1166,13 @@ proc entryY(choices: seq[TimeChoice], k: int): float32 =
   ## Top of entry k in the list, from the list's top.
   for ch in choices[0 ..< min(k, choices.len)]: result += ch.entryH
 
-proc dropRect(r: Rect, i: int): Rect =
-  rect(r.x + 16 + PickLabelW, r.y + PickTop + i.float32 * PickRowH, r.w - 32 - PickLabelW, 28)
+proc dropRect(d: PickDialog, r: Rect, i: int): Rect =
+  rect(r.x + 16 + PickLabelW, r.y + d.rowTop(i), r.w - 32 - PickLabelW, 28)
 
-proc listRect(r: Rect, i: int, contentH: float32): Rect =
+proc listRect(d: PickDialog, r: Rect, i: int, contentH: float32): Rect =
   ## The open dropdown's list: below its field, or above when there is more
   ## room there; it scrolls when the window is too short for all entries.
-  let dr = dropRect(r, i)
+  let dr = d.dropRect(r, i)
   let below = r.y + r.h - (dr.y + dr.h) - 6
   let above = dr.y - r.y - 6
   let h = min(contentH, max(below, above) - 2) + 2
@@ -1048,12 +1181,305 @@ proc listRect(r: Rect, i: int, contentH: float32): Rect =
 
 proc centerOn(d: PickDialog, r: Rect, i: int, choices: seq[TimeChoice]) =
   ## Scrolls row i's list to have its chosen entry in the middle.
-  let lr = listRect(r, i, choices.entryY(choices.len))
+  let lr = d.listRect(r, i, choices.entryY(choices.len))
   d.listScroll = choices.entryY(d.picks[i]) + RowH / 2 - (lr.h - 2) / 2
 
-proc draw*(d: PickDialog, ui: Ui, r: Rect, choices: seq[TimeChoice]): PickAction =
+# --- file lists ---------------------------------------------------------------
+
+proc revealFile(d: PickDialog, i, k: int) =
+  ## Scrolls file list i to have file k in view.
+  if k < 0: return
+  let top = k.float32 * FileRowH
+  if top < d.fileScroll[i]: d.fileScroll[i] = top
+  if top + FileRowH > d.fileScroll[i] + FileBoxH - 2:
+    d.fileScroll[i] = top + FileRowH - (FileBoxH - 2)
+
+proc selectOnly(d: PickDialog, i, k: int) =
+  for m in d.marked[i].mitems: m = false
+  if k >= 0 and k < d.files[i].len: d.marked[i][k] = true
+  d.cursor[i] = k
+  d.anchor[i] = k
+  d.revealFile(i, k)
+
+proc fileListRow*(d: PickDialog): int =
+  ## The first file list row, else -1.
+  for i, row in d.rows:
+    if row.isList: return i
+  -1
+
+proc dropTarget*(d: PickDialog, r: Rect, p: Vec2): tuple[row, at: int] =
+  ## Where files dropped at p (in the window's r) go: into the file list
+  ## under p, at the boundary nearest to it, else at the end of the first one.
+  result = (d.fileListRow, -1)
+  for i, row in d.rows:
+    if not row.isList: continue
+    let dr = d.dropRect(r, i)
+    let box = rect(dr.x, dr.y, dr.w, FileBoxH)
+    if p.inside(box):
+      let k = int(round((p.y - box.y - 1 + d.fileScroll[i]) / FileRowH))
+      return (i, clamp(k, 0, d.files[i].len))
+
+proc addFiles*(d: PickDialog, i: int, paths: seq[string], at = -1) =
+  ## Adds paths to file list row i, at the end or before file at, and selects
+  ## them. Paths with line breaks are left out: no list file could hold them.
+  if i < 0 or i >= d.rows.len or not d.rows[i].isList: return
+  let add = paths.filterIt(it.len > 0 and '\n' notin it and '\r' notin it)
+  if add.len == 0: return
+  let pos = if at < 0 or at > d.files[i].len: d.files[i].len else: at
+  d.files[i].insert(add, pos)
+  d.marked[i] = newSeq[bool](d.files[i].len)
+  for k in pos ..< pos + add.len: d.marked[i][k] = true
+  d.anchor[i] = pos
+  d.cursor[i] = pos + add.len - 1
+  d.revealFile(i, pos + add.len - 1)
+  d.revealFile(i, pos)
+  d.error = ""
+
+proc removeMarked*(d: PickDialog, i: int) =
+  ## Removes the selected files; the one after them is selected next.
+  var first = -1
+  var files: seq[string]
+  for k, f in d.files[i]:
+    if d.marked[i][k]:
+      if first < 0: first = k
+    else: files.add f
+  if first < 0: return
+  d.files[i] = files
+  d.marked[i] = newSeq[bool](files.len)
+  d.selectOnly(i, min(first, files.len - 1))
+
+proc moveMarked*(d: PickDialog, i, at: int) =
+  ## Moves the selected files, in their order, together before file at
+  ## (counted before the move; the length: to the end).
+  var moved, rest: seq[string]
+  var before = 0  # selected files above at: the place shifts up by them
+  for k, f in d.files[i]:
+    if d.marked[i][k]:
+      moved.add f
+      if k < at: inc before
+    else: rest.add f
+  if moved.len == 0: return
+  let pos = clamp(at - before, 0, rest.len)
+  d.files[i] = rest[0 ..< pos] & moved & rest[pos .. ^1]
+  d.marked[i] = newSeq[bool](d.files[i].len)
+  for k in pos ..< pos + moved.len: d.marked[i][k] = true
+  d.anchor[i] = pos
+  d.cursor[i] = pos + moved.len - 1
+  d.revealFile(i, d.cursor[i])
+  d.revealFile(i, pos)
+
+proc stepMarked*(d: PickDialog, i, dir: int) =
+  ## Moves each run of selected files a place up (dir < 0) or down; nothing
+  ## moves when one is at that end already.
+  let n = d.files[i].len
+  if n == 0 or not d.marked[i].anyIt(it): return
+  if (dir < 0 and d.marked[i][0]) or (dir > 0 and d.marked[i][n - 1]): return
+  template swapAt(a, b: int) =
+    swap(d.files[i][a], d.files[i][b])
+    swap(d.marked[i][a], d.marked[i][b])
+  if dir < 0:
+    for k in 1 ..< n:
+      if d.marked[i][k] and not d.marked[i][k - 1]: swapAt(k, k - 1)
+  else:
+    for k in countdown(n - 2, 0):
+      if d.marked[i][k] and not d.marked[i][k + 1]: swapAt(k, k + 1)
+  if d.cursor[i] >= 0: d.cursor[i] = clamp(d.cursor[i] + sgn(dir), 0, n - 1)
+  if d.anchor[i] >= 0: d.anchor[i] = clamp(d.anchor[i] + sgn(dir), 0, n - 1)
+  d.revealFile(i, d.cursor[i])
+
+proc sortFiles*(d: PickDialog, i: int) =
+  ## Sorts by file name, numbers by value; descending when ascending
+  ## already. With two files or more selected, only those, among the places
+  ## they hold.
+  let sel = toSeq(0 ..< d.files[i].len).filterIt(d.marked[i][it])
+  let places = if sel.len >= 2: sel else: toSeq(0 ..< d.files[i].len)
+  let names = places.mapIt(d.files[i][it])
+  var sorted = names.sorted(proc (a, b: string): int =
+    naturalCmp(a.extractFilename, b.extractFilename))
+  if sorted == names: sorted.reverse()
+  for j, k in places: d.files[i][k] = sorted[j]
+
+proc fileSummary(files: seq[string], info: proc (path: string): ListedFile): string =
+  ## "3 files · 00:41:22": the total length once every file's is known.
+  result = $files.len & (if files.len == 1: " file" else: " files")
+  var total = 0.0
+  for f in files:
+    let fi = info(f)
+    if not fi.known or fi.duration <= 0: return
+    total += fi.duration
+  if files.len > 0: result.add " · " & fmtTime(total, dur = total)
+
+proc fileList(d: PickDialog, ui: Ui, r: Rect, i: int,
+    info: proc (path: string): ListedFile): PickAction =
+  ## File list row i: the files in order, numbered, with their picture size
+  ## and length. Click selects, Ctrl+click adds or removes, Shift+click
+  ## selects a range; dragging the selected files moves them. With the list
+  ## focused, Up/Down/Home/End move, with Shift selecting as they go; as in
+  ## the playlist, Ctrl+Shift with them moves the selected files, Delete
+  ## removes them and Ctrl+A selects all.
+  let w = ui.window
+  let dr = d.dropRect(r, i)
+  let box = rect(dr.x, dr.y, dr.w, FileBoxH)
+  let inner = rect(box.x + 1, box.y + 1, box.w - 2, box.h - 2)
+  let id = "pk-" & $i
+  let focused = ui.tabStop(id, box)
+  let hov = ui.hover(inner)
+  let ctrl = w.buttonDown[KeyLeftControl] or w.buttonDown[KeyRightControl]
+  let shift = w.shiftDown
+  template n(): int = d.files[i].len
+  proc fileAt(y: float32): int = int(floor((y - inner.y + d.fileScroll[i]) / FileRowH))
+
+  if hov and ui.scroll() != 0:
+    d.fileScroll[i] += ui.scroll() * FileRowH / 10 * 3
+    ui.scrollConsumed = true
+  if hov and ui.pressed():
+    ui.consumeClick()
+    ui.navId = id
+    ui.focusId = ""
+    d.openRow = -1
+    let k = fileAt(ui.mouse.y)
+    d.pressedOn = -1
+    if k >= 0 and k < n:
+      if ctrl:
+        d.marked[i][k] = not d.marked[i][k]
+        d.cursor[i] = k
+        d.anchor[i] = k
+      elif shift and d.anchor[i] >= 0 and d.anchor[i] < n:
+        for m in d.marked[i].mitems: m = false
+        for j in min(k, d.anchor[i]) .. max(k, d.anchor[i]): d.marked[i][j] = true
+        d.cursor[i] = k
+      elif d.marked[i][k]:
+        d.pressedOn = k
+        d.cursor[i] = k
+        d.anchor[i] = k
+      else: d.selectOnly(i, k)
+      d.dragRow = i
+      d.dragFrom = ui.mouse
+      d.dragging = false
+    else: d.selectOnly(i, -1)
+
+  # Dragging the selected files: a line shows where they'd go; past the
+  # list's top or bottom it scrolls.
+  if d.dragRow == i:
+    if ui.down():
+      if not d.dragging and (ui.mouse - d.dragFrom).length > 4 and d.marked[i].anyIt(it):
+        d.dragging = true
+        d.pressedOn = -1
+      if d.dragging:
+        if ui.mouse.y < inner.y: d.fileScroll[i] -= max(2'f32, (inner.y - ui.mouse.y) / 3)
+        elif ui.mouse.y > inner.y + inner.h:
+          d.fileScroll[i] += max(2'f32, (ui.mouse.y - inner.y - inner.h) / 3)
+        d.dropAt = clamp(int(round((clamp(ui.mouse.y, inner.y, inner.y + inner.h) - inner.y +
+          d.fileScroll[i]) / FileRowH)), 0, n)
+    else:
+      if d.dragging: d.moveMarked(i, d.dropAt)
+      elif d.pressedOn >= 0 and d.pressedOn < n: d.selectOnly(i, d.pressedOn)
+      d.dragRow = -1
+      d.dragging = false
+      d.pressedOn = -1
+
+  if focused and ui.focusId.len == 0 and d.openRow < 0 and n > 0:
+    let p = w.buttonPressed
+    let c = d.cursor[i]
+    if ctrl and p[KeyA]:
+      for m in d.marked[i].mitems: m = true
+    elif p[KeyDelete]: d.removeMarked(i)
+    elif ctrl and shift and p[KeyUp]: d.stepMarked(i, -1)
+    elif ctrl and shift and p[KeyDown]: d.stepMarked(i, 1)
+    elif ctrl and shift and p[KeyHome]: d.moveMarked(i, 0)
+    elif ctrl and shift and p[KeyEnd]: d.moveMarked(i, n)
+    elif not ctrl:
+      var k = -2
+      if p[KeyUp]: k = if c < 0: n - 1 else: max(0, c - 1)
+      elif p[KeyDown]: k = if c < 0: 0 else: min(n - 1, c + 1)
+      elif p[KeyHome]: k = 0
+      elif p[KeyEnd]: k = n - 1
+      if k >= 0 and shift and d.anchor[i] in 0 ..< n:
+        # Shift extends the selection from where it started.
+        for m in d.marked[i].mitems: m = false
+        for j in min(k, d.anchor[i]) .. max(k, d.anchor[i]): d.marked[i][j] = true
+        d.cursor[i] = k
+        d.revealFile(i, k)
+      elif k >= 0: d.selectOnly(i, k)
+  let contentH = n.float32 * FileRowH
+  let maxScroll = max(0'f32, contentH - inner.h)
+  d.fileScroll[i] = clamp(d.fileScroll[i], 0, maxScroll)
+
+  ui.rect(box, colBackground)
+  ui.border(box, if d.dragging and d.dragRow == i: colAccent elif hov: colTextDim else: colBorder)
+  if focused: ui.focusRing(box)
+  let outerClip = ui.hitClip
+  ui.hitClip = inner
+  ui.sk.pushClipRect(inner)
+  if n == 0:
+    ui.textIn("Add files, or drop them here", inner, colTextDim, h = CenterAlign)
+  const NumW = 34'f32
+  let numW = max(NumW, ui.textSize($n, FontSmall).x + 14)
+  for k in max(0, int(d.fileScroll[i] / FileRowH)) ..< n:
+    let rr = rect(inner.x, inner.y + k.float32 * FileRowH - d.fileScroll[i], inner.w, FileRowH)
+    if rr.y > inner.y + inner.h: break
+    let f = d.files[i][k]
+    let sel = d.marked[i][k]
+    if sel: ui.rect(rr, colAccent)
+    elif ui.hover(rr) and not d.dragging: ui.rect(rr, colHover)
+    if focused and ui.navVisible and k == d.cursor[i]: ui.border(rr, colTextDim)
+    let fi = info(f)
+    var detail = "…"
+    if fi.known and fi.duration <= 0 and fi.width == 0: detail = "unknown"
+    elif fi.known:
+      detail = (if fi.width > 0 and fi.height > 0: $fi.width & "×" & $fi.height else: "no picture") &
+        (if fi.duration > 0: "    " & fmtTime(fi.duration, dur = fi.duration) else: "")
+    let dw = ui.textSize(detail, FontSmall).x
+    let dimCol = if sel: colOnAccent else: colTextDim
+    ui.textIn($(k + 1), rect(rr.x, rr.y, numW - 10, FileRowH), dimCol, FontSmall, h = RightAlign)
+    let nameW = rr.w - numW - dw - 22
+    ui.textIn(ui.ellipsize(f.extractFilename, nameW), rect(rr.x + numW, rr.y, nameW, FileRowH),
+      if sel: colOnAccent elif fi.known or f.fileExists: colText else: colError)
+    ui.textIn(detail, rect(rr.x + rr.w - dw - 10, rr.y, dw, FileRowH), dimCol, FontSmall)
+    if not d.dragging: ui.tip(rr, f)
+  if d.dragging and d.dragRow == i:
+    let y = inner.y + d.dropAt.float32 * FileRowH - d.fileScroll[i]
+    ui.rect(rect(inner.x + 2, y - 1, inner.w - 4, 2), colAccentHover)
+  ui.sk.popClipRect()
+  ui.hitClip = outerClip
+  if maxScroll > 0:
+    let th = max(16'f32, inner.h * inner.h / contentH)
+    let ty = inner.y + (inner.h - th) * (d.fileScroll[i] / maxScroll)
+    ui.rect(rect(box.x + box.w - 4, ty, 3, th), colTrack)
+
+  # Buttons under the list, and how many files and how long in all.
+  let by = box.y + box.h + 8
+  if ui.textButton(id & "-add", rect(dr.x, by, 76, FileBarH), "Add..."):
+    result = paAddFiles
+    d.addRow = i
+  let any = d.marked[i].anyIt(it)
+  var bx = dr.x + 84
+  for (name, icon, tip) in [("remove", "trash16", "Remove the selected files (Delete)"),
+                            ("up", "chevup16", "Move the selected files up (Ctrl+Shift+Up)"),
+                            ("down", "chevdown16", "Move the selected files down (Ctrl+Shift+Down)")]:
+    let br = rect(bx, by, 30, FileBarH)
+    ui.rect(br, colPanelRaised)
+    ui.border(br, colBorder)
+    if ui.iconButton(id & "-" & name, br, icon, tip, enabled = any):
+      case name
+      of "remove": d.removeMarked(i)
+      of "up": d.stepMarked(i, -1)
+      else: d.stepMarked(i, 1)
+      ui.navId = id
+    bx += 34
+  if ui.textButton(id & "-sort", rect(bx + 4, by, 64, FileBarH), "Sort"):
+    d.sortFiles(i)
+  ui.tip(rect(bx + 4, by, 64, FileBarH),
+    "Sort by file name, or the other way when sorted already; only the selected files when two or more are")
+  let sx = bx + 76
+  ui.textIn(ui.ellipsize(fileSummary(d.files[i], info), dr.x + dr.w - sx, FontSmall),
+    rect(sx, by, dr.x + dr.w - sx, FileBarH), colTextDim, FontSmall, h = RightAlign)
+
+proc draw*(d: PickDialog, ui: Ui, r: Rect, choices: seq[TimeChoice],
+    info: proc (path: string): ListedFile): PickAction =
   ## choices is what timestamp rows pick from (timeChoices), at this frame:
-  ## each row keeps its time as the list changes.
+  ## each row keeps its time as the list changes. info tells what file lists
+  ## show of a file.
   let w = ui.window
   for i, row in d.rows:
     if row.isTimestamp: d.picks[i] = choices.locate(d.chosen[i])
@@ -1064,7 +1490,7 @@ proc draw*(d: PickDialog, ui: Ui, r: Rect, choices: seq[TimeChoice]): PickAction
   # An open list takes the pointer; a press elsewhere closes it.
   var lr: Rect
   if d.openRow >= 0:
-    lr = listRect(r, d.openRow, contentH)
+    lr = d.listRect(r, d.openRow, contentH)
     let over = ui.mouse.inside(lr)
     if w.buttonPressed[KeyEscape]:
       d.openRow = -1
@@ -1087,12 +1513,16 @@ proc draw*(d: PickDialog, ui: Ui, r: Rect, choices: seq[TimeChoice]): PickAction
   proc iconRect(dr: Rect): Rect = rect(dr.x + dr.w - 28, dr.y, 28, dr.h)
   var hovRect = 0
   for i, row in d.rows:
-    if row.isRect and ui.hover(iconRect(dropRect(r, i))): hovRect = row.rect
+    if row.isRect and ui.hover(iconRect(d.dropRect(r, i))): hovRect = row.rect
   for i, row in d.rows:
-    let dr = dropRect(r, i)
+    let dr = d.dropRect(r, i)
     ui.textIn(ui.ellipsize(row.name, PickLabelW - 12),
       rect(r.x + 16, dr.y, PickLabelW - 12, dr.h), colText)
     let id = "pk-" & $i
+    if row.isList:
+      let a = d.fileList(ui, r, i, info)
+      if a != paNone: result = a
+      continue
     if row.isRect:
       discard ui.textField(id, rect(dr.x, dr.y, dr.w - 32, dr.h), d.texts[i], "number")
       d.texts[i] = if ui.focusId == id: d.texts[i].mathOnly else: d.texts[i].mathDigits
@@ -1117,6 +1547,11 @@ proc draw*(d: PickDialog, ui: Ui, r: Rect, choices: seq[TimeChoice]): PickAction
       if ui.iconButton(id & "-browse", iconRect(dr), "folder20", "Choose where to save"):
         result = paBrowse
         d.browseRow = i
+      let pr = vec2(dr.x, dr.y + dr.h + 4)
+      discard ui.checkbox(id & "-play", pr, "Open in a new player when finished", d.plays[i])
+      ui.tip(rect(pr.x, pr.y, dr.w, 22), "Once the command succeeds, plays " &
+        (if d.texts[i].strip.len > 0: d.texts[i].strip.extractFilename else: "the file") &
+        " in a player of its own")
       continue
     if not row.isTimestamp:
       discard ui.textField(id, dr, d.texts[i], "empty")
@@ -1148,6 +1583,8 @@ proc draw*(d: PickDialog, ui: Ui, r: Rect, choices: seq[TimeChoice]): PickAction
 
   ui.rect(rect(r.x + 1, r.y + r.h - 50, r.w - 2, 1), colBorder)
   let by = r.y + r.h - 40
+  if d.error.len > 0:
+    ui.textIn(ui.ellipsize(d.error, r.w - 250), rect(r.x + 16, by, r.w - 250, 30), colError)
   let keys = noField and d.openRow < 0
   let cancel = ui.textButton("pk-cancel", rect(r.x + r.w - 212, by, 92, 30), "Cancel")
   var run = ui.textButton("pk-run", rect(r.x + r.w - 112, by, 92, 30), "Run", primary = true)
@@ -1159,7 +1596,13 @@ proc draw*(d: PickDialog, ui: Ui, r: Rect, choices: seq[TimeChoice]): PickAction
      (w.buttonPressed[KeyEnter] or w.buttonPressed[NumpadEnter]):
     run = true
   if cancel or keys and not escUsed and w.buttonPressed[KeyEscape]: result = paCancel
-  elif run: result = paRun
+  elif run:
+    d.error = ""
+    for i, row in d.rows:
+      if row.isList and d.files[i].len == 0:
+        d.error = "Add files to “" & row.name & "” first."
+        break
+    if d.error.len == 0: result = paRun
 
   # The open list, over everything.
   if d.openRow >= 0 and d.openRow == open:

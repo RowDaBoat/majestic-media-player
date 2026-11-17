@@ -23,6 +23,8 @@ type
     error*: string      ## why it did not start
     stopped*: bool      ## ended by the Stop button
     reveal*: seq[string]  ## files whose folders open once it succeeds
+    play*: seq[string]    ## files played in a new player once it succeeds
+    temps*: seq[string]   ## files made for it (file lists), deleted once it ends
     cr: bool            ## a carriage return came: the next text replaces the line
 
 proc running*(e: RunEntry): bool = e.p != nil
@@ -166,6 +168,13 @@ proc stop*(e: RunEntry) =
   else:
     for child in descendants(pid): discard kill(child.Pid, SIGTERM)
     discard kill(pid.Pid, SIGTERM)
+
+proc removeTemps*(e: RunEntry) =
+  ## Deletes the files made for the run.
+  for f in e.temps:
+    try: removeFile(f)
+    except OSError: discard
+  e.temps.setLen 0
 
 proc trim*(log: var seq[RunEntry]) =
   var i = 0

@@ -10,6 +10,7 @@ Majestic's aim is to be the video player I wish I had.
 ## Features
 
 - **Commands from bookmarks, chapters and loops.** Cut clips, crop, measure the time between two marks, or run anything else you can type in a terminal.
+- **Join videos** from the Run menu: pick the files (or select them in the playlist first), put them in order by dragging, and run. Videos of any size, frame rate or shape (phone videos filmed upright included) come out as one, each a chapter named after its file; files that match can be joined in seconds without re-encoding instead. Your own commands can take lists of files too, and any command that makes a file can open it in a new player when it's done.
 - **YouTube and other online videos** through yt-dlp, timestamps and playlists included. Pick the stream quality, or save the video to disk.
 - **Drag & drop or Ctrl+V to open** files and links alike. Ctrl+C copies what's open; Shift+Ctrl+C copies it with the current timestamp.
 - **Bookmarks** on the seek bar: snap to them, use them in commands, or embed them as MKV chapters.

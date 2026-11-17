@@ -11,7 +11,9 @@
     "rect": 0,
     "dim": "none",
     "path": false,
-    "reveal": false
+    "reveal": false,
+    "play": false,
+    "list": "args"
    },
    {
     "text": "",
@@ -22,7 +24,9 @@
     "rect": 0,
     "dim": "none",
     "path": false,
-    "reveal": false
+    "reveal": false,
+    "play": false,
+    "list": "args"
    },
    {
     "text": " -to ",
@@ -33,7 +37,9 @@
     "rect": 0,
     "dim": "none",
     "path": false,
-    "reveal": false
+    "reveal": false,
+    "play": false,
+    "list": "args"
    },
    {
     "text": "",
@@ -44,7 +50,9 @@
     "rect": 0,
     "dim": "none",
     "path": false,
-    "reveal": false
+    "reveal": false,
+    "play": false,
+    "list": "args"
    },
    {
     "text": " -i ",
@@ -55,7 +63,9 @@
     "rect": 0,
     "dim": "none",
     "path": false,
-    "reveal": false
+    "reveal": false,
+    "play": false,
+    "list": "args"
    },
    {
     "text": "",
@@ -66,7 +76,9 @@
     "rect": 0,
     "dim": "none",
     "path": false,
-    "reveal": false
+    "reveal": false,
+    "play": false,
+    "list": "args"
    },
    {
     "text": " -pix_fmt yuv420p -movflags +faststart ",
@@ -77,7 +89,9 @@
     "rect": 0,
     "dim": "none",
     "path": false,
-    "reveal": false
+    "reveal": false,
+    "play": false,
+    "list": "args"
    },
    {
     "text": "",
@@ -88,7 +102,9 @@
     "rect": 0,
     "dim": "none",
     "path": true,
-    "reveal": true
+    "reveal": true,
+    "play": false,
+    "list": "args"
    },
    {
     "text": " ",
@@ -99,7 +115,9 @@
     "rect": 0,
     "dim": "none",
     "path": false,
-    "reveal": false
+    "reveal": false,
+    "play": false,
+    "list": "args"
    }
   ]
  },
@@ -115,7 +133,9 @@
     "rect": 0,
     "dim": "none",
     "path": false,
-    "reveal": false
+    "reveal": false,
+    "play": false,
+    "list": "args"
    },
    {
     "text": "",
@@ -126,7 +146,9 @@
     "rect": 0,
     "dim": "none",
     "path": false,
-    "reveal": false
+    "reveal": false,
+    "play": false,
+    "list": "args"
    },
    {
     "text": " \"$t/media\" && ffmpeg -ss ",
@@ -137,7 +159,9 @@
     "rect": 0,
     "dim": "none",
     "path": false,
-    "reveal": false
+    "reveal": false,
+    "play": false,
+    "list": "args"
    },
    {
     "text": "",
@@ -148,7 +172,9 @@
     "rect": 0,
     "dim": "none",
     "path": false,
-    "reveal": false
+    "reveal": false,
+    "play": false,
+    "list": "args"
    },
    {
     "text": " -to ",
@@ -159,7 +185,9 @@
     "rect": 0,
     "dim": "none",
     "path": false,
-    "reveal": false
+    "reveal": false,
+    "play": false,
+    "list": "args"
    },
    {
     "text": "",
@@ -170,7 +198,9 @@
     "rect": 0,
     "dim": "none",
     "path": false,
-    "reveal": false
+    "reveal": false,
+    "play": false,
+    "list": "args"
    },
    {
     "text": " -copyts -i ",
@@ -181,7 +211,9 @@
     "rect": 0,
     "dim": "none",
     "path": false,
-    "reveal": false
+    "reveal": false,
+    "play": false,
+    "list": "args"
    },
    {
     "text": "",
@@ -192,7 +224,9 @@
     "rect": 0,
     "dim": "none",
     "path": false,
-    "reveal": false
+    "reveal": false,
+    "play": false,
+    "list": "args"
    },
    {
     "text": " -vf \"subtitles=$t/media,setpts=PTS-STARTPTS\" -af \"asetpts=PTS-STARTPTS\" -pix_fmt yuv420p -movflags +faststart ",
@@ -203,7 +237,9 @@
     "rect": 0,
     "dim": "none",
     "path": false,
-    "reveal": false
+    "reveal": false,
+    "play": false,
+    "list": "args"
    },
    {
     "text": "",
@@ -214,7 +250,9 @@
     "rect": 0,
     "dim": "none",
     "path": true,
-    "reveal": true
+    "reveal": true,
+    "play": false,
+    "list": "args"
    },
    {
     "text": "; rm -r \"$t\"",
@@ -225,7 +263,9 @@
     "rect": 0,
     "dim": "none",
     "path": false,
-    "reveal": false
+    "reveal": false,
+    "play": false,
+    "list": "args"
    }
   ]
  },
@@ -241,7 +281,9 @@
     "rect": 0,
     "dim": "none",
     "path": false,
-    "reveal": false
+    "reveal": false,
+    "play": false,
+    "list": "args"
    },
    {
     "text": "",
@@ -252,7 +294,9 @@
     "rect": 0,
     "dim": "none",
     "path": false,
-    "reveal": false
+    "reveal": false,
+    "play": false,
+    "list": "args"
    },
    {
     "text": " -to ",
@@ -263,7 +307,9 @@
     "rect": 0,
     "dim": "none",
     "path": false,
-    "reveal": false
+    "reveal": false,
+    "play": false,
+    "list": "args"
    },
    {
     "text": "",
@@ -274,7 +320,9 @@
     "rect": 0,
     "dim": "none",
     "path": false,
-    "reveal": false
+    "reveal": false,
+    "play": false,
+    "list": "args"
    },
    {
     "text": " -i ",
@@ -285,7 +333,9 @@
     "rect": 0,
     "dim": "none",
     "path": false,
-    "reveal": false
+    "reveal": false,
+    "play": false,
+    "list": "args"
    },
    {
     "text": "",
@@ -296,7 +346,9 @@
     "rect": 0,
     "dim": "none",
     "path": false,
-    "reveal": false
+    "reveal": false,
+    "play": false,
+    "list": "args"
    },
    {
     "text": " -vf crop=",
@@ -307,7 +359,9 @@
     "rect": 0,
     "dim": "none",
     "path": false,
-    "reveal": false
+    "reveal": false,
+    "play": false,
+    "list": "args"
    },
    {
     "text": "",
@@ -318,7 +372,9 @@
     "rect": 1,
     "dim": "width",
     "path": false,
-    "reveal": false
+    "reveal": false,
+    "play": false,
+    "list": "args"
    },
    {
     "text": ":",
@@ -329,7 +385,9 @@
     "rect": 0,
     "dim": "none",
     "path": false,
-    "reveal": false
+    "reveal": false,
+    "play": false,
+    "list": "args"
    },
    {
     "text": "",
@@ -340,7 +398,9 @@
     "rect": 1,
     "dim": "height",
     "path": false,
-    "reveal": false
+    "reveal": false,
+    "play": false,
+    "list": "args"
    },
    {
     "text": ":",
@@ -351,7 +411,9 @@
     "rect": 0,
     "dim": "none",
     "path": false,
-    "reveal": false
+    "reveal": false,
+    "play": false,
+    "list": "args"
    },
    {
     "text": "",
@@ -362,7 +424,9 @@
     "rect": 1,
     "dim": "x",
     "path": false,
-    "reveal": false
+    "reveal": false,
+    "play": false,
+    "list": "args"
    },
    {
     "text": ":",
@@ -373,7 +437,9 @@
     "rect": 0,
     "dim": "none",
     "path": false,
-    "reveal": false
+    "reveal": false,
+    "play": false,
+    "list": "args"
    },
    {
     "text": "",
@@ -384,7 +450,9 @@
     "rect": 1,
     "dim": "y",
     "path": false,
-    "reveal": false
+    "reveal": false,
+    "play": false,
+    "list": "args"
    },
    {
     "text": " -pix_fmt yuv420p -movflags +faststart ",
@@ -395,7 +463,9 @@
     "rect": 0,
     "dim": "none",
     "path": false,
-    "reveal": false
+    "reveal": false,
+    "play": false,
+    "list": "args"
    },
    {
     "text": "",
@@ -406,7 +476,9 @@
     "rect": 0,
     "dim": "none",
     "path": true,
-    "reveal": false
+    "reveal": false,
+    "play": false,
+    "list": "args"
    },
    {
     "text": " ",
@@ -417,7 +489,9 @@
     "rect": 0,
     "dim": "none",
     "path": false,
-    "reveal": false
+    "reveal": false,
+    "play": false,
+    "list": "args"
    }
   ]
  },
@@ -433,7 +507,9 @@
     "rect": 0,
     "dim": "none",
     "path": false,
-    "reveal": false
+    "reveal": false,
+    "play": false,
+    "list": "args"
    },
    {
     "text": "",
@@ -444,7 +520,9 @@
     "rect": 0,
     "dim": "none",
     "path": false,
-    "reveal": false
+    "reveal": false,
+    "play": false,
+    "list": "args"
    },
    {
     "text": " --chapters ",
@@ -455,7 +533,9 @@
     "rect": 0,
     "dim": "none",
     "path": false,
-    "reveal": false
+    "reveal": false,
+    "play": false,
+    "list": "args"
    },
    {
     "text": "",
@@ -466,7 +546,9 @@
     "rect": 0,
     "dim": "none",
     "path": false,
-    "reveal": false
+    "reveal": false,
+    "play": false,
+    "list": "args"
    }
   ]
  },
@@ -482,7 +564,9 @@
     "rect": 0,
     "dim": "none",
     "path": false,
-    "reveal": false
+    "reveal": false,
+    "play": false,
+    "list": "args"
    },
    {
     "text": "",
@@ -493,7 +577,9 @@
     "rect": 0,
     "dim": "none",
     "path": false,
-    "reveal": false
+    "reveal": false,
+    "play": false,
+    "list": "args"
    },
    {
     "text": ";t2=",
@@ -504,7 +590,9 @@
     "rect": 0,
     "dim": "none",
     "path": false,
-    "reveal": false
+    "reveal": false,
+    "play": false,
+    "list": "args"
    },
    {
     "text": "",
@@ -515,7 +603,9 @@
     "rect": 0,
     "dim": "none",
     "path": false,
-    "reveal": false
+    "reveal": false,
+    "play": false,
+    "list": "args"
    },
    {
     "text": ";ms(){ IFS=: read -r h m s <<<\"$1\"; echo $(( (10#$h*3600 + 10#$m*60 + 10#${s%.*})*1000 + 10#${s#*.} )); };d=$(( $(ms \"$t2\") - $(ms \"$t1\") ));((d<0))&&d=$((-d));printf 'Length: %02d:%02d:%02d.%03d (%d.%03d seconds)\\n' $((d/3600000)) $((d/60000%60)) $((d/1000%60)) $((d%1000)) $((d/1000)) $((d%1000))",
@@ -526,7 +616,175 @@
     "rect": 0,
     "dim": "none",
     "path": false,
-    "reveal": false
+    "reveal": false,
+    "play": false,
+    "list": "args"
+   }
+  ]
+ },
+ {
+  "title": "Join videos",
+  "parts": [
+   {
+    "text": "set -o pipefail; n=0; T=0; W=; A=0; fc=; cat=; in=(); hv=(); ha=(); d=(); fs=(); m=$(mktemp) || exit; trap 'rm -f \"$m\"' EXIT; echo ';FFMETADATA1' > \"$m\"; for f in ",
+    "card": false,
+    "name": "",
+    "kind": "value",
+    "content": "",
+    "rect": 0,
+    "dim": "none",
+    "path": false,
+    "reveal": false,
+    "play": false,
+    "list": "args"
+   },
+   {
+    "text": "",
+    "card": true,
+    "name": "videos",
+    "kind": "reference",
+    "content": "files",
+    "rect": 0,
+    "dim": "none",
+    "path": false,
+    "reveal": false,
+    "play": false,
+    "list": "args"
+   },
+   {
+    "text": "; do [ \"$f\" -ef ",
+    "card": false,
+    "name": "",
+    "kind": "value",
+    "content": "",
+    "rect": 0,
+    "dim": "none",
+    "path": false,
+    "reveal": false,
+    "play": false,
+    "list": "args"
+   },
+   {
+    "text": "",
+    "card": true,
+    "name": "output",
+    "kind": "value",
+    "content": "~/joined.mp4",
+    "rect": 0,
+    "dim": "none",
+    "path": true,
+    "reveal": false,
+    "play": true,
+    "list": "args"
+   },
+   {
+    "text": " ] && { echo \"The output is one of the files to join: $f\" >&2; exit 1; }; s=$(ffprobe -v error -select_streams V:0 -show_entries stream=width,height,sample_aspect_ratio,avg_frame_rate,r_frame_rate:stream_side_data=rotation:format=duration -of default=nw=1 \"$f\" | awk -F= '{v[$1] = $2} END {w = v[\"width\"]; h = v[\"height\"]; split(v[\"sample_aspect_ratio\"], s, \":\"); if (s[1] > 0 && s[2] > 0) w = w * s[1] / s[2]; if (v[\"rotation\"] % 180) {t = w; w = h; h = t}; r = v[\"avg_frame_rate\"]; split(r, q, \"/\"); if (!(q[2] > 0 && q[1] / q[2] > 0 && q[1] / q[2] <= 240)) r = v[\"r_frame_rate\"]; split(r, q, \"/\"); if (!(q[2] > 0 && q[1] / q[2] > 0 && q[1] / q[2] <= 240)) r = 30; print (w > 0), int(w / 2 + .5) * 2, int(h / 2 + .5) * 2, r, v[\"duration\"] + 0}') || { echo \"Cannot read $f\" >&2; exit 1; }; read -r v w h r t <<< \"$s\"; [ \"$t\" = 0 ] && { echo \"Cannot tell how long this file is: $f\" >&2; exit 1; }; a=$(ffprobe -v error -select_streams a:0 -show_entries stream=index -of csv=p=0 \"$f\"); [ \"$v\" = 1 ] && [ -z \"$W\" ] && { W=$w; H=$h; R=$r; }; [ -n \"$a\" ] && A=1; hv+=(\"$v\"); ha+=(\"${a:+1}\"); d+=(\"$t\"); in+=(-i \"$f\"); fs+=(\"$f\"); n=$((n + 1)); done; [ -n \"$W\" ] || { echo \"None of the files has a picture.\" >&2; exit 1; }; for ((i = 0; i < n; i++)); do read -r k t <<< \"$(awk -v d=\"${d[i]}\" -v r=\"$R\" -v a=\"$A\" 'BEGIN {split(r, q, \"/\"); f = q[1] / (q[2] ? q[2] : 1); k = int(a ? d * f + 1e-6 : d * f + .5); if (k < 1) k = 1; print k, a ? d : k / f}')\"; if [ \"${hv[i]}\" = 1 ]; then fc+=\"[$i:V:0]scale=trunc(iw*sar/2)*2:ih,setsar=1,scale=$W:$H:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=$W:$H:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=$R,format=yuv420p,tpad=stop=-1:stop_mode=clone,trim=end_frame=$k[v$i];\"; else fc+=\"color=black:s=${W}x$H:r=$R,format=yuv420p,trim=end_frame=$k[v$i];\"; fi; cat+=\"[v$i]\"; if [ \"$A\" = 1 ]; then if [ \"${ha[i]}\" = 1 ]; then fc+=\"[$i:a:0]aresample=48000,aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,apad,atrim=duration=$t[a$i];\"; else fc+=\"anullsrc=r=48000:cl=stereo,atrim=duration=$t[a$i];\"; fi; cat+=\"[a$i]\"; fi; e=${fs[i]##*[/\\\\]}; printf '[CHAPTER]\\nTIMEBASE=1/1000\\nSTART=%s\\nEND=%s\\ntitle=%s\\n' $(awk -v a=\"$T\" -v b=\"$t\" 'BEGIN {printf \"%d %d\", a * 1000 + .5, (a + b) * 1000 + .5}') \"$(sed 's/[=;#\\\\]/\\\\&/g' <<< \"${e%.*}\")\" >> \"$m\"; T=$(awk -v a=\"$T\" -v b=\"$t\" 'BEGIN {printf \"%.6f\", a + b}'); done; fc+=\"${cat}concat=n=$n:v=1:a=$A[c]\"; maps=(-map \"[v]\"); [ \"$A\" = 1 ] && { fc+=\"[a]\"; maps+=(-map \"[a]\" -c:a aac -b:a 192k); }; fc+=\";[c]fps=$R[v]\"; echo \"Joining $n files at ${W}x$H, $R fps\"; ffmpeg -hide_banner -y \"${in[@]}\" -f ffmetadata -i \"$m\" -filter_complex \"$fc\" \"${maps[@]}\" -map_chapters $n -map_metadata $n -c:v libx264 -crf 18 -preset medium -movflags +faststart ",
+    "card": false,
+    "name": "",
+    "kind": "value",
+    "content": "",
+    "rect": 0,
+    "dim": "none",
+    "path": false,
+    "reveal": false,
+    "play": false,
+    "list": "args"
+   },
+   {
+    "text": "",
+    "card": true,
+    "name": "output",
+    "kind": "value",
+    "content": "~/joined.mp4",
+    "rect": 0,
+    "dim": "none",
+    "path": true,
+    "reveal": false,
+    "play": true,
+    "list": "args"
+   }
+  ]
+ },
+ {
+  "title": "Join videos (fast, no re-encode)",
+  "parts": [
+   {
+    "text": "set -o pipefail; l=$(mktemp) || exit; trap 'rm -f \"$l\"' EXIT; echo 'ffconcat version 1.0' > \"$l\"; k=; for f in ",
+    "card": false,
+    "name": "",
+    "kind": "value",
+    "content": "",
+    "rect": 0,
+    "dim": "none",
+    "path": false,
+    "reveal": false,
+    "play": false,
+    "list": "args"
+   },
+   {
+    "text": "",
+    "card": true,
+    "name": "videos",
+    "kind": "reference",
+    "content": "files",
+    "rect": 0,
+    "dim": "none",
+    "path": false,
+    "reveal": false,
+    "play": false,
+    "list": "args"
+   },
+   {
+    "text": "; do [ \"$f\" -ef ",
+    "card": false,
+    "name": "",
+    "kind": "value",
+    "content": "",
+    "rect": 0,
+    "dim": "none",
+    "path": false,
+    "reveal": false,
+    "play": false,
+    "list": "args"
+   },
+   {
+    "text": "",
+    "card": true,
+    "name": "output",
+    "kind": "value",
+    "content": "~/joined.mkv",
+    "rect": 0,
+    "dim": "none",
+    "path": true,
+    "reveal": false,
+    "play": true,
+    "list": "args"
+   },
+   {
+    "text": " ] && { echo \"The output is one of the files to join: $f\" >&2; exit 1; }; s=$(ffprobe -v error -show_entries stream=codec_type,codec_name,profile,width,height,pix_fmt,sample_rate,channels -of csv=p=0 \"$f\") || { echo \"Cannot read $f\" >&2; exit 1; }; [ -n \"$k\" ] || k=$s; [ \"$s\" = \"$k\" ] || { echo \"Its tracks differ from the first file's, so it can't be joined without re-encoding (use Join videos): $f\" >&2; exit 1; }; printf \"file '%s'\\n\" \"${f//\\'/\\'\\\\\\'\\'}\" >> \"$l\"; done; ffmpeg -hide_banner -y -f concat -safe 0 -i \"$l\" -map 0:V -map 0:a? -c copy ",
+    "card": false,
+    "name": "",
+    "kind": "value",
+    "content": "",
+    "rect": 0,
+    "dim": "none",
+    "path": false,
+    "reveal": false,
+    "play": false,
+    "list": "args"
+   },
+   {
+    "text": "",
+    "card": true,
+    "name": "output",
+    "kind": "value",
+    "content": "~/joined.mkv",
+    "rect": 0,
+    "dim": "none",
+    "path": true,
+    "reveal": false,
+    "play": true,
+    "list": "args"
    }
   ]
  }

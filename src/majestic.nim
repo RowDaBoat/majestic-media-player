@@ -36,7 +36,7 @@ const
   TypesSize = ivec2(600, 600)   ## Options > Libraries > Custom...
   NewPlayerArg = "--new-player" ## files opened in a player of their own, never handed to a running one
   RenameSize = ivec2(400, 178)
-  CommandsSize = ivec2(880, 520)
+  CommandsSize = ivec2(880, 560)
   YtdlpSize = ivec2(460, 176)
   EmbedSize = ivec2(460, 176)
   ConfirmWidth = 480'i32     ## the Yes/Cancel window's width; its height fits the text
@@ -645,6 +645,8 @@ type
     extQueue: seq[string]     ## its external-file cards still to ask about
     extPicks: Table[string, string]  ## the files chosen so far, by card name
     pickWin: Window
+    pickDropped: seq[string]  ## files dropped on the Run window, added next frame
+    pickDropAt: Vec2          ## where (UI units)
     pickSk: Silky
     pickUi: Ui
     rectEdit: RectEdit        ## a Run window rectangle being drawn over the video
@@ -3471,6 +3473,19 @@ proc probeNext(a: App, visible: Slice[int]) =
     return
   if a.prober == nil: a.prober = newProber()
   if a.prober != nil: a.prober.start(next)
+
+proc pickOpen(a: App): bool
+
+proc probePickFiles(a: App) =
+  ## Starts the background probe of the next file a Run window's file list
+  ## shows without its length and picture size.
+  if not a.pickOpen or a.prober != nil and a.prober.pending.len > 0: return
+  for files in a.pickDlg.files:
+    for f in files:
+      if f in a.mediaInfo: continue
+      if a.prober == nil: a.prober = newProber()
+      if a.prober != nil: a.prober.start(f)
+      return
 
 proc noteLink(a: App, url: string, title = "", m = MediaInfo(), looked = false) =
   ## Keeps what was found out about a link in the media cache.
@@ -7185,6 +7200,14 @@ proc autosavePlaylist(a: App, force = false) =
 
 proc askExternal(a: App)  # Run menu, below
 
+proc listablePaths(a: App, paths: seq[string]): seq[string] =
+  ## Files to add to a Run window's file list: each file as an absolute
+  ## path, a folder's media files in name order (numbers by value).
+  for p in paths:
+    if p.dirExists:
+      result.add mediaFilesIn(p, isMediaFile).mapIt(it.absolutePath)
+    elif p.fileExists: result.add p.absolutePath
+
 proc pickOpen(a: App): bool =
   ## The Run window is up. It doesn't hold the main window: the times it
   ## offers follow the seek bar as the player is used.
@@ -7211,6 +7234,11 @@ proc handleDialogResult(a: App, purpose: string, paths: seq[string]) =
   of "savemedia": a.startSave(paths[0])
   of "bmexport": a.exportBookmarks(paths[0])
   of "bmimport": a.importBookmarks(paths[0])
+  of "pickfiles":  # Run window, a file list's Add... button
+    let d = a.pickDlg
+    if a.pickOpen:
+      d.addFiles(d.addRow, a.listablePaths(paths))
+      a.pickWin.activate()
   of "pickpath":  # Run window, a path row's folder button
     let d = a.pickDlg
     if a.pickOpen and d.browseRow >= 0 and d.browseRow < d.texts.len:
@@ -8026,10 +8054,13 @@ proc runDir(a: App): string =
   let path = if a.player.loaded: a.player.path else: ""
   if path.len > 0 and not path.contains("://"): path.parentDir else: getHomeDir()
 
-proc execute(a: App, c: CommandLine, picks = initTable[string, string]()) =
+proc execute(a: App, c: CommandLine, picks = initTable[string, string](),
+             plays = initTable[string, bool]()) =
   ## Runs c with bash in the media file's folder, its cards resolved against
   ## the current file and picks (what the Run window gave each card). Output
-  ## goes to the run log (and our stdout).
+  ## goes to the run log (and our stdout). plays says which path cards' files
+  ## play in a new player once it succeeds (else the cards' own setting).
+  var picks = picks
   var path = if a.player.loaded: a.player.path else: ""
   # A link: tools like ffmpeg can't open its page, so its file cards get a
   # file on disk, the saved one when all of it is, else one downloaded first.
@@ -8063,23 +8094,42 @@ proc execute(a: App, c: CommandLine, picks = initTable[string, string]()) =
         fetch.add "echo " & quoteShellPosix("Downloading " & path) & "\n" &
           downloadScript(exe, path, file, cookies, format)
       path = file
+  # File lists passed as a list file get one for the run, deleted after it.
+  var temps: seq[string]
+  var listErr = ""
+  for p in c.parts.runCards:
+    if not p.isList or p.list == lfArgs or picks.getOrDefault(p.name).len == 0: continue
+    let f = getTempDir() /
+      &"majestic-{getCurrentProcessId()}-{int64(epochTime() * 1000)}-{p.name}.txt"
+    try:
+      writeFile(f, listFileText(picks[p.name].listItems, p.list))
+      temps.add f
+      picks[p.name] = f
+    except IOError, OSError:
+      listErr = "Cannot write the list of " & p.name & " to " & f
   var (script, err) = c.parts.compose(path, picks, timeFix)
   if fetchErr.len > 0: err = fetchErr
+  if listErr.len > 0: err = listErr
   script = fetch & script
   let dir = a.runDir
   let e = newRunEntry(c.title, dir)
+  e.temps = temps
   for p in c.parts:
-    if not (p.isPath and p.reveal): continue
-    let v = p.resolve(path, picks).value
+    if not p.isPath: continue
+    let play = plays.getOrDefault(p.name, p.play)
+    if not p.reveal and not play: continue
+    let v = p.resolve(path, picks).value.strip
     if v.len == 0: continue
     let f = if v.isAbsolute: v else: dir / v
-    if f notin e.reveal: e.reveal.add f
+    if p.reveal and f notin e.reveal: e.reveal.add f
+    if play and f notin e.play: e.play.add f
   a.runLog.add e
   a.runLog.trim()
   a.rlFollow = true
   a.setRunLogShown(true)
   if err.len > 0:
     e.error = err
+    e.removeTemps()
     a.osd(c.title & ": " & err)
     stderr.writeLine "run ", c.title, ": ", err
     return
@@ -8087,9 +8137,32 @@ proc execute(a: App, c: CommandLine, picks = initTable[string, string]()) =
     e.start(script)
     a.osd("Running " & c.title)
   except OSError as ex:
+    e.removeTemps()
     e.error = "cannot run bash: " & ex.msg
     a.osd(c.title & ": cannot run bash")
     stderr.writeLine "run ", c.title, ": ", ex.msg
+
+proc localFile(a: App, entry: string): string =
+  ## A playlist entry as a file on disk: itself, a link's saved file, or ""
+  ## (a link not saved, a missing file).
+  let f = if entry.isWebLink: a.savedFile(entry) else: entry
+  if f.len > 0 and not f.contains("://") and f.fileExists: f.absolutePath else: ""
+
+proc listSeed(a: App): tuple[files: seq[string], picked: bool] =
+  ## What a Run window's file lists start with: the files selected in the
+  ## playlist when two or more are (picked), else the media file playing.
+  let sel = a.plSelection
+  if sel.len >= 2:
+    for i in sel:
+      let f = a.localFile(a.playlist[i])
+      if f.len > 0: result.files.add f
+    if result.files.len >= 2:
+      result.picked = true
+      return
+    result.files.setLen 0
+  if a.player.loaded:
+    let f = a.localFile(a.player.path)
+    if f.len > 0: result.files.add f
 
 proc askExternal(a: App) =
   ## Asks for the next external file of a.extRun, then goes on with the run
@@ -8106,10 +8179,18 @@ proc askExternal(a: App) =
     a.osd(c.title & ": No media file is open")
     return
   a.menus.close()
-  a.pickDlg.start(c, a.timeChoices, c.lastValues)
+  let (seed, picked) = a.listSeed
+  a.pickDlg.start(c, a.timeChoices, c.lastValues, seed, picked)
   let (sw, sh) = a.pickDlg.size
   if a.pickWin == nil:
     (a.pickWin, a.pickSk, a.pickUi) = a.newDialogWindow("Run", ivec2(sw, sh), modal = false)
+    # Files dropped from a file manager go to a file list (one at a time
+    # from Windy: gathered, then added together).
+    a.pickWin.onFileDrop = proc (path: string, data: string) =
+      a.dirtyUntil = now() + 1.2
+      a.inputPending = true
+      if a.pickDropped.len == 0: a.pickDropAt = a.pickWin.mousePos.vec2 / a.pickSk.uiScale
+      a.pickDropped.add path
   a.pickWin.title = c.title
   a.pickUi.focusId = ""
   a.pickUi.navId = "pk-0"
@@ -8131,16 +8212,21 @@ proc closePick(a: App) =
     a.pickWin.visible = false
     a.window.activate()
 
+proc libPlayNew(a: App, paths: seq[string])
+
 proc pollJobs(a: App) =
   for e in a.runLog:
     if not e.running or not e.poll(): continue
     if a.cfg.showRunLog: a.dirtyUntil = max(a.dirtyUntil, now() + 0.1)
     if not e.running:
+      e.removeTemps()
       a.osd(if e.stopped: e.title & " stopped"
         elif e.code == 0: e.title & " finished"
         else: &"{e.title} failed (exit code {e.code})")
       if e.code == 0 and not e.stopped:
         for f in e.reveal: a.showInFolder(f)
+        let made = e.play.filterIt(it.fileExists)
+        if made.len > 0: a.libPlayNew(made)
 
 # --- yt-dlp -------------------------------------------------------------------
 # A link mpv can't open (its yt-dlp hook included) goes on from here: its
@@ -16887,6 +16973,12 @@ proc renderPick(a: App, shot: string) =
   let size = w.size
   if size.x <= 0 or size.y <= 0: return
   let choices = a.timeChoices
+  if a.pickDropped.len > 0:
+    let d = a.pickDlg
+    let (row, at) = d.dropTarget(rect(vec2(0, 0), ui.size), a.pickDropAt)
+    d.addFiles(row, a.listablePaths(a.pickDropped.mapIt(pathOrLink(it))), at)
+    a.pickDropped.setLen 0
+    w.activate()
   if not a.beginDialogDraw(w, a.pickSk, size): return  # retried next frame
   ui.beginFrame()
   a.pickSk.beginUi(w, size)
@@ -16894,7 +16986,12 @@ proc renderPick(a: App, shot: string) =
   glClearColor(colPanel.r.float32 / 255, colPanel.g.float32 / 255,
     colPanel.b.float32 / 255, 1)
   glClear(GL_COLOR_BUFFER_BIT)
-  let action = a.pickDlg.draw(ui, rect(vec2(0, 0), ui.size), choices)
+  let action = a.pickDlg.draw(ui, rect(vec2(0, 0), ui.size), choices,
+    proc (path: string): ListedFile =
+      # Probed in the background (probeNext), the list's first.
+      if path notin a.mediaInfo: return
+      let m = a.mediaInfo[path]
+      (true, m.duration, m.shownW, m.shownH))
   ui.drawTooltip()
   a.pickSk.endUi()
   ui.endFrame()
@@ -16905,16 +17002,47 @@ proc renderPick(a: App, shot: string) =
   of paCancel: a.closePick()
   of paDraw: a.beginRectDraw(a.pickDlg.drawRequest)
   of paBrowse: a.browsePickPath(a.pickDlg.browseRow)
+  of paAddFiles:
+    let d = a.pickDlg
+    a.ask(dkOpenFiles, "pickfiles", d.cmd.title & ": " & d.rows[d.addRow].name,
+      exts = @MediaExtensions, filterName = "Media files")
   of paRun:
     if a.dialog != nil and a.dialog.purpose == "pickpath": return  # its path is still to come
-    a.endRectDraw(true, refocus = false)
     let d = a.pickDlg
+    # A file being made can't be one of those read: ffmpeg -y would write
+    # over it while still reading it.
+    for i, row in d.rows:
+      if not row.isPath: continue
+      var v = d.texts[i].strip
+      if v.startsWith("~"): v = v.expandTilde
+      if v.len == 0: continue
+      let f = if v.isAbsolute: v else: a.runDir / v
+      for j, other in d.rows:
+        if not other.isList: continue
+        for g in d.files[j]:
+          var same = f.normalizedPath == g.normalizedPath
+          if not same and f.fileExists:
+            try: same = sameFile(f, g)
+            except OSError: discard
+          if same:
+            d.error = "“" & row.name & "” is one of the files in “" & other.name & "”."
+            return
+    a.endRectDraw(true, refocus = false)
     var picks = a.extPicks
     var used = initTable[string, RunValue]()
+    var plays = initTable[string, bool]()
     for i, row in d.rows:
+      if row.isList:
+        picks[row.name] = d.files[i].join("\n")
+        used[row.name] = RunValue(value: picks[row.name])
+        continue
       if row.kind == ckValue:
         picks[row.name] = d.texts[i]
         used[row.name] = RunValue(value: d.texts[i], crossed: d.crossed[i])
+        if row.isPath:
+          plays[row.name] = d.plays[i]
+          used[row.name].play = d.plays[i]
+          used[row.name].hasPlay = true
         continue
       if d.picks[i] < 0 or d.picks[i] >= choices.len: continue
       let ch = choices[d.picks[i]]
@@ -16922,7 +17050,7 @@ proc renderPick(a: App, shot: string) =
       used[row.name] = RunValue(which: ch.which, time: ch.time)
     d.cmd.rememberValues(used)
     a.closePick()
-    a.execute(d.cmd, picks)
+    a.execute(d.cmd, picks, plays)
 
 proc propertiesOverlay(a: App) =
   ## Scrollable sections, two columns: field name and value.
@@ -17169,6 +17297,13 @@ proc shortcutColumns(a: App): array[2, seq[ShortcutGroup]] =
       ("First / last field", "Ctrl+Home / Ctrl+End"),
       ("Clear the selected value", "Delete"),
       ("Copy / paste the selected value", "Ctrl+C / Ctrl+V")]),
+    ("Run window file list (after clicking it or Tab)", @[
+      ("Select previous / next file, first / last file", "Up / Down, Home / End"),
+      ("Extend the selection", "Shift+Up / Down / Home / End"),
+      ("Select all files", "Ctrl+A"),
+      ("Move selected files up / down", "Ctrl+Shift+Up / Down"),
+      ("Move selected files to top / bottom", "Ctrl+Shift+Home / End"),
+      ("Remove selected files from the list", "Delete")]),
     ("Mouse", @[
       ("Play / Pause", "Click video"), ("Full screen", "Double-click / Middle-click video"),
       ("Move window", "Drag video or empty controls bar"), ("Context menu", "Right-click"),
@@ -17181,6 +17316,9 @@ proc shortcutColumns(a: App): array[2, seq[ShortcutGroup]] =
       ("Expand / collapse a library or folder in the libraries' column", "Click its arrow / Double-click it"),
       ("Resize window (compact mode)", "Drag window edge"),
       ("Quick cover (music, video track off)", "Drop picture on video"),
+      ("Run window file list: select several / a range", "Ctrl+Click / Shift+Click"),
+      ("Run window file list: move the selected files", "Drag them"),
+      ("Run window file list: add files or folders", "Drop them on it"),
       ("Volume", "Wheel"), ("Zoom at cursor", "Ctrl+Wheel"),
       ("Restore zoom / panning", "Ctrl+Middle-click video"),
       ("Pan zoomed video", "Ctrl+Drag video"),
@@ -18008,6 +18146,15 @@ proc runScriptStep(a: App, st: ScriptStep) =
   of "cmdpath":  # name reveal(0|1) [default]: a path card at the caret
     a.cmdDlg.addCard(st.args[0], ckValue, if st.args.len > 2: st.args[2 .. ^1].join(" ") else: "",
       path = true, reveal = st.args[1] == "1")
+  of "cmdfiles":  # name args|ffconcat|lines: a file list card at the caret
+    a.cmdDlg.addCard(st.args[0], ckReference, "files",
+      list = if st.args.len > 1: parseEnum[ListForm](st.args[1]) else: lfArgs)
+  of "cmdplaypath":  # name play(0|1) [default]: a path card at the caret, played when done
+    a.cmdDlg.addCard(st.args[0], ckValue, if st.args.len > 2: st.args[2 .. ^1].join(" ") else: "",
+      path = true, play = st.args[1] == "1")
+  of "cmdnew": a.cmdDlg.load(CommandLine(title: arg))  # title: a new command line, as New would
+  of "cmdtext": a.cmdDlg.addText(st.args.join(" "))  # text typed at the caret (spaces kept)
+  of "cmdselect": a.cmdDlg.selectCard(arg)  # name: that card's properties shown
   of "cmdapply": a.cmdDlg.applyRequested = true
   of "run": a.runMenuPath(@["Run", arg])
   of "runstop": (for e in a.runLog: e.stop())  # the run log's Stop button
@@ -18020,6 +18167,47 @@ proc runScriptStep(a: App, st: ScriptStep) =
   of "pickdraw": a.beginRectDraw(a.pickDlg.rows[parseInt(arg)].rect)  # row: its rectangle icon
   of "pickbrowse": a.browsePickPath(parseInt(arg))  # row: its folder button
   of "pickcross": a.pickDlg.crossed[parseInt(arg)] = not a.pickDlg.crossed[parseInt(arg)]
+  of "pickfiles", "pickmark", "pickmove", "pickstep", "picksort", "pickremove", "pickplay":
+    # The Run window's file lists and play checkboxes:
+    #   pickfiles row path|path|...  files added, as its Add... button would
+    #   pickmark row k...            those files selected
+    #   pickmove row at              the selected ones moved before file at
+    #   pickstep row dir             moved a place up (-1) or down (1)
+    #   picksort row / pickremove row
+    #   pickplay row 0|1             a path row's "Open in a new player"
+    let d = a.pickDlg
+    let i = if st.args.len > 0: parseInt(st.args[0]) else: -1
+    if not a.pickOpen or i < 0 or i >= d.rows.len:
+      stderr.writeLine "script: ", st.cmd, ": no such row in an open Run window"
+    else:
+      case st.cmd
+      of "pickfiles": d.addFiles(i, a.listablePaths(st.args[1 .. ^1].join(" ").split('|')))
+      of "pickmark":
+        d.marked[i] = newSeq[bool](d.files[i].len)
+        for k in st.args[1 .. ^1]:
+          if parseInt(k) in 0 ..< d.files[i].len: d.marked[i][parseInt(k)] = true
+      of "pickmove": d.moveMarked(i, parseInt(st.args[1]))
+      of "pickstep": d.stepMarked(i, parseInt(st.args[1]))
+      of "picksort": d.sortFiles(i)
+      of "pickremove": d.removeMarked(i)
+      else: d.plays[i] = st.args[1] == "1"
+  of "pickdropfiles":  # x y path|path|...: dropped on the Run window there
+    a.pickDropAt = vec2(parseFloat(st.args[0]), parseFloat(st.args[1]))
+    a.pickDropped = st.args[2 .. ^1].join(" ").split('|')
+  of "pickdump":  # the Run window's rows, files and error
+    let d = a.pickDlg
+    stderr.writeLine "pick open=", a.pickOpen, " size=", d.size, " error=", d.error,
+      " mouse=", (if a.pickUi != nil: $a.pickUi.mouse else: "")
+    for i, row in d.rows:
+      stderr.writeLine "pick row ", i, " ", row.name, " list=", row.isList, " path=", row.isPath,
+        " play=", d.plays[i], " text=", d.texts[i]
+      for k, f in d.files[i]:
+        stderr.writeLine "pick file ", i, " ", k, (if d.marked[i][k]: " * " else: "   "), f
+  of "rundump":  # the run log's entries
+    for e in a.runLog:
+      stderr.writeLine "run ", e.title, " running=", e.running, " code=", e.code, " error=", e.error,
+        " play=", $e.play, " temps=", $e.temps, " reveal=", $e.reveal
+      for line in e.output: stderr.writeLine "run | ", line
   of "rectset":  # x y w h: the rectangle being drawn
     if a.rectEdit != nil:
       a.rectEdit.seed(parseInt(st.args[0]), parseInt(st.args[1]), parseInt(st.args[2]),
@@ -18577,6 +18765,7 @@ proc main() =
     a.bridgeFrames()
     a.releaseStandby()
     a.pollProbe()
+    a.probePickFiles()
     a.pollMediaKey()
     a.syncEqualizer()
     a.preview.pollEvents()

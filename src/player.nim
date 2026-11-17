@@ -1870,6 +1870,8 @@ type
   MediaInfo* = object
     duration*: float          ## seconds, 0 when unknown
     width*, height*: int      ## first real video track, 0 for audio only
+    shownW*, shownH*: int     ## its picture as shown: turned by its rotation,
+                              ## stretched by its pixel aspect
     audioBitrate*: float      ## bits per second, 0 when unknown
     title*, artist*, album*: string  ## from the tags, "" when absent
     track*, disc*, year*: int ## from the tags, 0 when absent
@@ -1999,6 +2001,11 @@ proc poll*(pr: Prober, wait = 0.0): bool =
           if t{"type"}.getStr == "video" and not t{"albumart"}.getBool:
             pr.info.width = t{"demux-w"}.getInt
             pr.info.height = t{"demux-h"}.getInt
+            let par = t{"demux-par"}.getFloat(1.0)
+            (pr.info.shownW, pr.info.shownH) =
+              (int(round(pr.info.width.float * (if par > 0: par else: 1.0))), pr.info.height)
+            if t{"demux-rotation"}.getInt mod 180 != 0:
+              swap(pr.info.shownW, pr.info.shownH)
             break
         pr.info.audioBitrate = pr.h.audioBitrate(tracks, pr.info.width > 0)
         for t in tracks:
