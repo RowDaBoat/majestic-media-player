@@ -217,7 +217,7 @@ proc pageChanged(p: OptionsPage, c, before: Config): bool =
   of opVisualizer: differs(showVisualizer) or differs(avsBeatThreshold) or differs(avsBeatSensitivity)
   of opReplayGain: differs(replayGain) or differs(replayGainFallback) or
     differs(replayGainNoClip) or differs(replayGainPreamp)
-  of opSubtitles: differs(subDelay) or differs(subPaths)
+  of opSubtitles: differs(subDelay) or differs(subDelayStep) or differs(subPaths)
   of opSubStyle: differs(subBold) or differs(subColor) or differs(subFont) or
     differs(subItalic) or differs(subLineSpacing) or differs(subOpacity) or
     differs(subOutlineColor) or differs(subOutlineOpacity) or differs(subOutlineSize) or
@@ -1584,6 +1584,12 @@ proc fontRow(d: OptionsDialog, ui: Ui, p: var Pane, value: var string) =
 proc subtitlesPage(d: OptionsDialog, ui: Ui, c: var Config, p: var Pane) =
   ui.group(p, "Subtitles")
   ui.numberRow(p, "o-sdelay", "Delay (milliseconds)", c.subDelay, 50, -600_000, 600_000)
+  ui.numberRow(p, "o-sdelaystep", "Delay step (milliseconds)", c.subDelayStep, 10, 1, 10_000)
+  let early = c.keyText(kaSubEarlier)
+  let late = c.keyText(kaSubLater)
+  ui.hint(p, "Each press of " & (if early.len > 0: early else: "Subtitles Earlier") & " (earlier) or " &
+    (if late.len > 0: late else: "Subtitles Later") & " (later) moves the playing file's subtitles this much.")
+  ui.hint(p, "Each file keeps its own shift, added to the delay above.")
   ui.textRow(p, "o-spaths", "Autoload paths", c.subPaths, "e.g. Subs;Subtitles;~/subs")
   ui.hint(p, "Folders searched for subtitles matching the file's name, separated by ';'.")
   ui.hint(p, "Relative paths start at the media file's folder.")

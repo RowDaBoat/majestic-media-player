@@ -21,6 +21,8 @@ let
   colText* = c("#e7e9ee")
   colTextDim* = c("#9aa0ab")
   colTextDisabled* = c("#5c616b")
+  colRemembered* = c("#ff9e9e")     ## a playlist or Library file opening where it was left off
+  colRememberedDim* = c("#c48a8a")  ## its dim columns
   colAccent* = c("#9d8cff")
   colAccentHover* = c("#b5a8ff")
   colAccentDim* = c("#9d8cff", 0.35)

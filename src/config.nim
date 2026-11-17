@@ -238,6 +238,7 @@ type
     webSizeGB*: int = 20
     # Options > Subtitles
     subDelay*: float = 0           # milliseconds
+    subDelayStep*: float = 50      # milliseconds the - and = keys shift it by
     subPaths*: string = ""         # extra subtitle folders, ';'-separated
     subFont*: string = ""          # font family, "" = mpv's sans-serif
     subBold*: bool = false
@@ -561,6 +562,10 @@ proc loadPositions*(): Positions =
     except CatchableError as e:
       stderr.writeLine "config: ignoring unreadable ", path, ": ", e.msg
 
+proc positionsStamp*(): Time =
+  ## When positions.json last changed, by this player or another one.
+  try: getLastModificationTime(positionsPath()) except OSError: Time()
+
 proc save*(p: Positions) =
   let path = positionsPath()
   try:
@@ -594,6 +599,30 @@ proc loadSubScales*(): SubScales =
 
 proc save*(s: SubScales) =
   let path = subScalesPath()
+  try:
+    createDir(path.parentDir)
+    writeAtomic(path, s.toJson)
+  except CatchableError as e:
+    stderr.writeLine "config: cannot save ", path, ": ", e.msg
+
+# --- remembered subtitle delays ------------------------------------------------
+
+type SubDelays* = OrderedTable[string, float]
+  ## path -> milliseconds the - and = keys shifted its subtitles by, on top of
+  ## Options' delay
+
+proc subDelaysPath(): string = configDir() / "subdelays.json"
+
+proc loadSubDelays*(): SubDelays =
+  let path = subDelaysPath()
+  if fileExists(path):
+    try:
+      result = readFile(path).fromJson(SubDelays)
+    except CatchableError as e:
+      stderr.writeLine "config: ignoring unreadable ", path, ": ", e.msg
+
+proc saveSubDelays*(s: SubDelays) =
+  let path = subDelaysPath()
   try:
     createDir(path.parentDir)
     writeAtomic(path, s.toJson)

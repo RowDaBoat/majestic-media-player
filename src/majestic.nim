@@ -246,6 +246,7 @@ type
     alignY: int = 2           ## 0 top, 1 middle, 2 bottom
     offset: Vec2              ## screen pixels, +x right, +y down
     scale: float32 = 1
+    delay: float              ## ms the - and = keys shifted the subtitles by, on top of Options'
 
   GapNext = object
     ## What mpv goes on to by itself at the end of the file playing.
@@ -531,6 +532,7 @@ type
     coverNames: string        ## Options' folder picture names
     positions: Positions      ## remembered playback positions
     subScales: SubScales      ## remembered subtitle sizes, per file
+    subDelays: SubDelays      ## remembered subtitle delay shifts, per file
     bookmarks: Bookmarks      ## per-file bookmarks, shown on the seek bar
     bmPath, bmKey: string     ## the current file and its mediaKey, once known
     bmPending: string         ## the file whose mediaKey is being worked out
@@ -649,6 +651,8 @@ type
     rectBefore: seq[string]   ## the Run window's values when it began, for Escape
     resumedAt: float          ## start time of the file being loaded, else 0
     savedPos: float           ## playback position last written to positions.json
+    positionsAt: Time         ## positions.json's time when last read, to see other players' saves
+    forgotPath: string        ## the file playing, its time forgotten: not remembered until opened again
     savedCfg: string          ## config.json as last written by autosave
     autosaveAt: float         ## when the remembered state was last checked
     instance: InstanceServer  ## receives files from later launches
@@ -821,6 +825,7 @@ type
     # mouse interaction with the video frame
     videoPress: bool
     videoPressPos: Vec2
+    videoClickAt: float       ## when a click on the video last played or paused it (a double-click's first click), 0: none
     ctlPress: bool            ## left button went down on the controls bar's empty part
     ctlPressPos: Vec2
     rotDrag: bool             ## Alt+Middle drag is turning the frame
@@ -1612,11 +1617,39 @@ proc savePosition(a: App) =
   a.savedPos = p.timePos
   # Reloaded first so positions other players remembered meanwhile survive.
   a.positions = loadPositions()
-  if p.timePos > 5 and p.timePos < p.duration - 5 and not p.eofReached:
+  if p.timePos > 5 and p.timePos < p.duration - 5 and not p.eofReached and p.path != a.forgotPath:
     a.positions.remember(p.path, p.timePos)
   else:
     a.positions.del(p.path)
   a.positions.save()
+
+proc hasRememberedTime(a: App, path: string): bool =
+  ## Opening the file resumes where it was left off: its playlist and
+  ## Library rows show in pale red.
+  a.cfg.rememberTime and path in a.positions
+
+proc forgetTimes(a: App, paths: seq[string]) =
+  ## Forgets where the files were left off, so they open from the start.
+  ## The file playing is no longer remembered until it's opened again.
+  if paths.len == 0: return
+  a.positions = loadPositions()
+  for path in paths:
+    a.positions.del(path)
+    if a.player.loaded and path == a.player.path: a.forgotPath = path
+  a.positions.save()
+  a.positionsAt = positionsStamp()
+  a.osd(if paths.len == 1: "Forgot the remembered time"
+        else: "Forgot the remembered times of " & $paths.len & " files")
+
+proc forgetTimeItem(a: App, m: MenuNode, paths: seq[string]) =
+  ## Forget Remembered Time, on top of a playlist or Library menu, for the
+  ## files selected that have one: contextual (purple), a separator under it.
+  let timed = paths.filterIt(a.hasRememberedTime(it))
+  if timed.len == 0: return
+  m.item("Forget Remembered Time" & (if timed.len > 1: &" ({timed.len} files)" else: ""),
+    action = proc () = a.forgetTimes(timed))
+  m.markContextual()  # about the files picked: purple, as such items are
+  m.sep()
 
 proc fileWritable(path: string): bool =
   ## Whether the file can be written: the file, or its folder when it's gone.
@@ -1684,6 +1717,11 @@ proc autosave(a: App) =
   let t = now()
   if t - a.autosaveAt < 2: return
   a.autosaveAt = t
+  # Another player remembered or forgot a time: the rows' colors follow.
+  let stamp = positionsStamp()
+  if stamp != a.positionsAt:
+    a.positionsAt = stamp
+    a.positions = loadPositions()
   if a.player.loaded and abs(a.player.timePos - a.savedPos) >= 1:
     a.savePosition()
   # Options edits the config live until OK or Cancel; never persist those.
@@ -2360,6 +2398,7 @@ proc playIndex(a: App, i: int, start = -1.0) =
     else: 0.0
   a.clearLoopMarks()
   a.subs.scale = a.subScales.getOrDefault(path, 1'f32)
+  a.subs.delay = a.subDelays.getOrDefault(path, 0.0)
   a.reopening = false  # another file instead
   if a.ytCaps.running and a.ytCaps.url != path:
     a.ytCaps.stop()
@@ -7270,7 +7309,7 @@ proc applyOsd(a: App) =
 proc syncSettings(a: App) =
   ## Pushes the player-facing options to mpv (and the title) when they change.
   let c = a.cfg
-  let key = &"{c.showOsd}|{c.osdTimestamp}|{c.showMillis}|{c.showRemaining}|{c.showFrames}|{c.subLangs}|{c.audioLangs}|{c.subDelay}|" &
+  let key = &"{c.showOsd}|{c.osdTimestamp}|{c.showMillis}|{c.showRemaining}|{c.showFrames}|{c.subLangs}|{c.audioLangs}|{c.subDelay}|{a.subs.delay}|" &
     &"{c.subPaths}|{c.titleFullPath}|{c.titleUseMediaTitle}|{c.subFont}|{c.subBold}|{c.subItalic}|" &
     &"{c.subSize}|{c.subSpacing}|{c.subLineSpacing}|{c.subColor}|{c.subOpacity}|{c.subOutlineSize}|{c.subOutlineColor}|" &
     &"{c.subOutlineOpacity}|{c.subShadowOffset}|{c.subShadowColor}|{c.subShadowOpacity}|{c.subStyleAss}"
@@ -7308,7 +7347,7 @@ proc syncSettings(a: App) =
   let h = a.player.h
   h.setProp("slang", langList(c.subLangs))
   h.setProp("alang", langList(c.audioLangs))
-  h.setProp("sub-delay", c.subDelay / 1000)
+  h.setProp("sub-delay", (c.subDelay + a.subs.delay) / 1000)
   h.setProp("osd-fractions", if c.showMillis: "yes" else: "no")
   h.setProp("sub-file-paths", subPathList(c.subPaths))
   # Options > Subtitles style: text subtitles (SRT...), and ASS ones too when asked.
@@ -9680,6 +9719,7 @@ proc libraryMenu(a: App): MenuNode =
   of lcFiles:
     let sel = a.libSelectedPaths
     let one = if sel.len == 1: sel[0] else: ""
+    a.forgetTimeItem(m, sel)
     m.item("Play", "Enter", enabled = sel.len > 0 and not a.editLocked, action = proc () = a.libPlay(sel))
     m.item("Add to Playlist", enabled = sel.len > 0 and not a.editLocked, action = proc () =
       a.libAddToPlaylist(sel))
@@ -10503,6 +10543,7 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
           a.saveReplayGain(rmAlbum, a.rgFiles))
         rgm.item("Remove ReplayGain Values" & count, enabled = ok, action = proc () =
           a.removeReplayGain(a.rgFiles))
+    if hasSel: a.forgetTimeItem(pl, a.plSelection.mapIt(a.playlist[it]))
     # Read only when picked: the menu is rebuilt every frame.
     pl.item("Add Clipboard to Playlist", k(kaAddClipboardPlaylist), enabled = edit,
       action = proc () = a.addFromClipboard())
@@ -10694,7 +10735,7 @@ const
   PaletteContext = "Right-Click Menu"  ## the right-click menu's own items
   ## Commands with a key but no menu item, filed under the menu of their key group.
   PaletteKeyOnly = {kaNextAudio, kaPrevAudio, kaNextSub, kaPrevSub, kaSeek10 .. kaSeek90,
-    kaSubTopLeft .. kaSubSmaller, kaFindPlaylist, kaNewPlaylist .. kaUnqueue,
+    kaSubTopLeft .. kaSubLater, kaFindPlaylist, kaNewPlaylist .. kaUnqueue,
     kaSearchLibrary}
   ## Submenus that come first among what a search finds.
   PaletteFavored = ["Play › Audio Track", "Play › Subtitle Track", "Play › Video Track"]
@@ -11309,6 +11350,21 @@ proc scaleSubs(a: App, dir: float32) =
     a.subScales.save()
   a.osd(&"Subtitle size: {int(round(a.subs.scale * 100))}%")
 
+proc shiftSubDelay(a: App, dir: float) =
+  ## Subtitles Earlier / Later: the file's own shift, on top of Options'
+  ## delay (syncSettings hands mpv the sum), remembered like the size.
+  let step = max(1.0, a.cfg.subDelayStep)
+  a.subs.delay = clamp(round(a.subs.delay + dir * step), -600_000.0, 600_000.0)
+  let path = a.player.path
+  if a.player.loaded and path.len > 0:
+    # Reloaded first so delays other players remembered meanwhile survive.
+    a.subDelays = loadSubDelays()
+    if a.subs.delay == 0: a.subDelays.del(path)
+    else: a.subDelays.remember(path, a.subs.delay)
+    a.subDelays.saveSubDelays()
+  let total = int(round(a.cfg.subDelay + a.subs.delay))
+  a.osd("Subtitle delay: " & (if total > 0: "+" else: "") & $total & " ms")
+
 proc subPadding(a: App): tuple[l, r, t, b: float32] =
   ## mpv can't shift centered subtitles, but text subtitles are laid out on
   ## the whole render target while video-margin-ratio keeps the video out of
@@ -11597,6 +11653,8 @@ proc runAction(a: App, act: KeyAction) =
   of kaSubMoveRight: a.moveSubs(vec2(SubMoveStep, 0))
   of kaSubBigger: a.scaleSubs(1)
   of kaSubSmaller: a.scaleSubs(-1)
+  of kaSubEarlier: a.shiftSubDelay(-1)
+  of kaSubLater: a.shiftSubDelay(1)
   of kaCompact: a.setCompact(not a.cfg.compactMode)
   of kaSeekBar: a.runMenuPath(@["View", "Seek Bar"])
   of kaControls: a.runMenuPath(@["View", "Controls"])
@@ -14611,9 +14669,12 @@ proc playlistPanel(a: App, r: Rect) =
           ui.textIn(label, rect(row.x + 4, row.y, w + 1, rowH), colAccent, FontSmall)
           shift = w + 10 - PlaylistIconW
     let path = a.playlist[i]
+    let timed = a.hasRememberedTime(path)  # opens where it was left off
     for j, (cr, f) in cells:
       a.playlistCell(a.cellText(path, f), rect(cr.x, row.y, cr.w, rowH), f, j == 0,
-        if current: colAccent elif f.cellFont == FontMain: colText else: colTextDim, f.cellFont,
+        if current: colAccent
+        elif f.cellFont == FontMain: (if timed: colRemembered else: colText)
+        elif timed: colRememberedDim else: colTextDim, f.cellFont,
         if j == 0: shift else: 0)
     if hov and ui.pressed():
       # Ctrl+click adds or drops a row, Shift+click selects up to it.
@@ -15493,9 +15554,12 @@ proc libraryPanel(a: App, r: Rect, under: bool) =
     if a.libArrows and f.path == a.libCursor: ui.border(row, colAccent)  # where Up/Down go from
     let cur = f.path == playing
     if cur: ui.icon("play16", vec2(row.x + 14, row.y + rowH / 2), colAccent)
+    let timed = a.hasRememberedTime(f.path)  # opens where it was left off
     for j, (cr, fld) in cells:
       a.playlistCell(a.libCellText(f[], fld), rect(cr.x, row.y, cr.w, rowH), fld, j == 0,
-        if cur: colAccent elif fld.cellFont == FontMain: colText else: colTextDim, fld.cellFont)
+        if cur: colAccent
+        elif fld.cellFont == FontMain: (if timed: colRemembered else: colText)
+        elif timed: colRememberedDim else: colTextDim, fld.cellFont)
     if hov:
       var facts = @[f.path]
       if f.title.len > 0:
@@ -16983,7 +17047,8 @@ proc shortcutColumns(a: App): array[2, seq[ShortcutGroup]] =
         @[kaSubBottomLeft, kaSubBottom, kaSubBottomRight, kaSubLeft, kaSubCenter, kaSubRight,
           kaSubTopLeft, kaSubTop, kaSubTopRight], "Shift+Numpad 1 ... 9"),
       ("Move", @SubMoveActions, "Shift+Arrows"),
-      ("Bigger / smaller", @[kaSubBigger, kaSubSmaller], "Shift+Numpad + / -")]),
+      ("Bigger / smaller", @[kaSubBigger, kaSubSmaller], "Shift+Numpad + / -"),
+      ("Show earlier / later (delay)", @[kaSubEarlier, kaSubLater], "- / =")]),
     ("Text fields", @[
       ("Next / previous word", "Ctrl+Right / Ctrl+Left"),
       ("Select next / previous word", "Ctrl+Shift+Right / Left"),
@@ -17381,6 +17446,12 @@ proc frame(a: App) =
       a.videoPress = true
       a.videoPressPos = ui.mouse
     if a.window.buttonPressed[DoubleClick]:
+      # Its first click played or paused: undo that, so going full screen
+      # leaves playback as it was (and the "Paused" message gone).
+      if a.videoClickAt > 0 and now() - a.videoClickAt < 1.0:
+        a.togglePlay()
+        a.osd("", 0)
+      a.videoClickAt = 0
       a.setFullscreen(not a.fullscreen)
       a.videoPress = false
     if ui.released(MouseRight):
@@ -17435,6 +17506,9 @@ proc frame(a: App) =
     if not ui.down():
       a.videoPress = false
       if ui.window.buttonReleased[MouseLeft]:
+        # Stopped or at the end, playing starts over: a double-click leaves it playing.
+        let p = a.player
+        a.videoClickAt = if p.loaded and not p.stopped and not p.eofReached: now() else: 0.0
         a.togglePlay()
     elif (ui.mouse - a.videoPressPos).length > 4:
       a.videoPress = false
@@ -17706,6 +17780,9 @@ proc runScriptStep(a: App, st: ScriptStep) =
     for n in a.buildMenu().context.children:
       if n.label == arg and n.enabled and n.action != nil: n.action()
     a.ctxMenu = cmVideo
+  of "posdump":  # the files with a remembered time
+    stderr.writeLine "positions ", $toSeq(a.positions.keys).mapIt(it.extractFilename), " forgot=",
+      a.forgotPath.extractFilename
   of "colaction":  # playlist header menu item by label, as clicking it
     a.ctxMenu = cmPlaylistColumns
     for n in a.buildMenu().context.children:
@@ -17746,6 +17823,8 @@ proc runScriptStep(a: App, st: ScriptStep) =
     for n in a.buildMenu().bar.children:
       for m in n.children:
         if m.label == "Video Track": stderr.writeLine "  menu ", $m.children.mapIt((it.label, it.checked))
+  of "playdump": stderr.writeLine "play paused=", a.player.paused, " stopped=", a.player.stopped,
+    " fullscreen=", a.fullscreen, " t=", a.player.timePos.formatFloat(ffDecimal, 2)
   of "pldump": stderr.writeLine "playlist ", a.plIndex, " ", $a.playlist.mapIt(it.extractFilename)
   of "plgroupdump":  # the playlist's groups as last drawn: text, first entry, count
     stderr.writeLine "plgroups ", $a.plGroups, " lines=", $a.plLines, " sel=", $a.plSelection
@@ -17952,7 +18031,8 @@ proc runScriptStep(a: App, st: ScriptStep) =
   of "fs": a.setFullscreen(arg == "1")
   of "subs":  # alignX alignY dx dy scale
     a.subs = SubLayout(alignX: parseInt(st.args[0]), alignY: parseInt(st.args[1]),
-      offset: vec2(parseFloat(st.args[2]), parseFloat(st.args[3])), scale: parseFloat(st.args[4]))
+      offset: vec2(parseFloat(st.args[2]), parseFloat(st.args[3])), scale: parseFloat(st.args[4]),
+      delay: a.subs.delay)
   of "seek": a.seekTo(parseFloat(arg))
   of "bmadd": a.addBookmark(parseFloat(arg))
   of "bmedit": a.showRename(parseInt(arg))  # index: Edit Bookmark for the current file's nth bookmark
@@ -18271,7 +18351,9 @@ proc main() =
   # Debug scripts only see other players in a folder of their own.
   if not scripted or existsEnv("MMP_SYNC_DIR"): a.peers = startPeerNet()
   a.positions = loadPositions()
+  a.positionsAt = positionsStamp()
   a.subScales = loadSubScales()
+  a.subDelays = loadSubDelays()
   a.bookmarks = loadBookmarks()
   a.equalizers = loadEqualizers()
   if a.cfg.seedPresets(): a.cfg.save()
@@ -18548,6 +18630,7 @@ proc main() =
         a.player.stop()
     if a.player.justLoaded:
       a.player.justLoaded = false
+      a.forgotPath = ""  # opened again: remembered again
       if a.stopOnLoad:  # gone online at Stop
         a.stopOnLoad = false
         a.player.stop()

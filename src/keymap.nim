@@ -74,6 +74,8 @@ type
     kaSubMoveRight = "sub-move-right"
     kaSubBigger = "sub-bigger"
     kaSubSmaller = "sub-smaller"
+    kaSubEarlier = "sub-delay-earlier"
+    kaSubLater = "sub-delay-later"
     kaCompact = "compact-mode"
     kaSeekBar = "seek-bar"
     kaControls = "controls"
@@ -187,6 +189,8 @@ const
     (kgSubtitles, "Move right", "Move Subtitles Right", "Shift+Right"),
     (kgSubtitles, "Bigger", "Bigger Subtitles", "Shift+Numpad +"),
     (kgSubtitles, "Smaller", "Smaller Subtitles", "Shift+Numpad -"),
+    (kgSubtitles, "Show earlier (decrease delay)", "Subtitles Earlier", "-"),
+    (kgSubtitles, "Show later (increase delay)", "Subtitles Later", "="),
     (kgView, "Compact mode", "Compact Mode", "Ctrl+1"),
     (kgView, "Seek bar", "Seek Bar", ""),
     (kgView, "Controls", "Controls", ""),
@@ -439,7 +443,8 @@ const
     @["align", "position", "place"],
     @["controls", "buttons", "toolbar"],
     @["status", "status bar"],
-    @["timestamp", "time"]]
+    @["timestamp", "time"],
+    @["delay", "sync", "timing", "earlier", "later"]]
   ## Words that also find other commands, but not the other way round.
   Aliases = [
     ("reset", @["center", "0 degrees", "restore", "default"]),

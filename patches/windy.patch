@@ -1,5 +1,5 @@
 diff --git a/src/windy/platforms/linux/x11.nim b/src/windy/platforms/linux/x11.nim
-index 5b29e3c..32afaac 100644
+index 5b29e3c..496ea53 100644
 --- a/src/windy/platforms/linux/x11.nim
 +++ b/src/windy/platforms/linux/x11.nim
 @@ -52,6 +52,8 @@ type
@@ -70,7 +70,41 @@ index 5b29e3c..32afaac 100644
    )
  
  proc delProperty(window: XWindow, property: Atom) =
-@@ -471,6 +486,23 @@ proc size*(window: Window): IVec2 =
+@@ -376,6 +391,33 @@ proc keysymToButton(sym: KeySym): Button =
+   of xk_9: Key9
+   else: ButtonUnknown
+ 
++const
++  ## Keycodes (evdev + 8, as every current X server and Xwayland use) of the
++  ## punctuation keys, read by place instead of by the layout's symbol: the
++  ## key right of 0 is "-" on any layout ("'" on Spanish), as Windows reads
++  ## them by scancode. A layout puts symbols there that have no button of
++  ## their own (Spanish ¡, German ß) or that belong to another key.
++  positionalKeys = [
++    (20, KeyMinus), (21, KeyEqual), (34, KeyLeftBracket), (35, KeyRightBracket),
++    (47, KeySemicolon), (48, KeyApostrophe), (49, KeyBacktick), (51, KeyBackslash),
++    (59, KeyComma), (60, KeyPeriod), (61, KeySlash)]
++
++proc positionalButton(keycode: int): Button =
++  for (code, b) in positionalKeys:
++    if code == keycode: return b
++  ButtonUnknown
++
++proc isPositional(b: Button): bool =
++  for (_, pb) in positionalKeys:
++    if pb == b: return true
++
++proc heldKeyButton(keycode: int): Button =
++  ## The button of a key found held, by its keycode.
++  result = positionalButton(keycode)
++  if result == ButtonUnknown:
++    result = keysymToButton display.XKeycodeToKeysym(keycode.char, 0)
++    if result.isPositional: result = ButtonUnknown
++
+ proc queryKeyboardState(): set[0..255] =
+   var r: array[32, char]
+   display.XQueryKeymap(r)
+@@ -471,6 +513,23 @@ proc size*(window: Window): IVec2 =
  proc framebufferSize*(window: Window): IVec2 =
    window.size
  
@@ -94,7 +128,7 @@ index 5b29e3c..32afaac 100644
  proc `size=`*(window: Window, v: IVec2) =
    let originalValue = window.size
    if originalValue == v:
-@@ -479,9 +511,18 @@ proc `size=`*(window: Window, v: IVec2) =
+@@ -479,9 +538,18 @@ proc `size=`*(window: Window, v: IVec2) =
    # Its important to swap buffers so that openGL viewport updates.
    window.swapBuffers()
    # TODO: for some reason Chrome GLFW just do display.XFlush() and its enough?
@@ -114,7 +148,7 @@ index 5b29e3c..32afaac 100644
  
  proc centerWindow*(window: Window) =
    ## Calculate centered position for a window on the primary screen.
-@@ -580,7 +621,7 @@ proc `style=`*(window: Window, v: WindowStyle) =
+@@ -580,7 +648,7 @@ proc `style=`*(window: Window, v: WindowStyle) =
        )
      of WmForDecoratedKind.kwm, WmForDecoratedKind.other:
        window.handle.setProperty(
@@ -123,7 +157,7 @@ index 5b29e3c..32afaac 100644
        )
      else:
        return
-@@ -788,6 +829,19 @@ proc newWindow*(
+@@ -788,6 +856,19 @@ proc newWindow*(
      result.handle, wmProtocols[0].addr, cint wmProtocols.len
    )
  
@@ -143,7 +177,7 @@ index 5b29e3c..32afaac 100644
    result.im = display.XOpenIM
    result.ic = result.im.XCreateIC(
      "clientWindow",
-@@ -814,8 +868,11 @@ proc newWindow*(
+@@ -814,8 +895,11 @@ proc newWindow*(
    result.applyCursor()
  
    # Enable XDnD awareness (version 5)
@@ -157,7 +191,7 @@ index 5b29e3c..32afaac 100644
  
    makeContextCurrent result
  
-@@ -829,9 +886,11 @@ proc newWindow*(
+@@ -829,9 +913,11 @@ proc newWindow*(
      else:
        raise WindyError.newException("VSync is not supported")
  
@@ -172,7 +206,7 @@ index 5b29e3c..32afaac 100644
    block xsync:
      var vEv, vEr: cint
      if display.XSyncQueryExtension(vEv.addr, vEr.addr):
-@@ -842,13 +901,51 @@ proc newWindow*(
+@@ -842,13 +928,51 @@ proc newWindow*(
          xaNetWMSyncRequestCounter,
          xaCardinal,
          32,
@@ -225,7 +259,7 @@ index 5b29e3c..32afaac 100644
  proc pollEvents(window: Window) =
  
    # Clear all per-frame data
-@@ -865,8 +962,8 @@ proc pollEvents(window: Window) =
+@@ -865,8 +989,8 @@ proc pollEvents(window: Window) =
      d: Display,
      event: ptr XEvent,
      userData: pointer
@@ -236,7 +270,7 @@ index 5b29e3c..32afaac 100644
  
    template pushButtonEvent(
      button: Button,
-@@ -909,25 +1006,35 @@ proc pollEvents(window: Window) =
+@@ -909,25 +1033,35 @@ proc pollEvents(window: Window) =
          window.xdndSource = cast[XWindow](ev.client.data.l[0])
          window.xdndVersion = (ev.client.data.l[1] shr 24).int32
          window.xdndFormat = 0
@@ -279,7 +313,7 @@ index 5b29e3c..32afaac 100644
              window.xdndFormat = fmt
              break
  
-@@ -941,6 +1048,13 @@ proc pollEvents(window: Window) =
+@@ -941,6 +1075,13 @@ proc pollEvents(window: Window) =
          if window.xdndVersion > 5:
            continue
  
@@ -293,17 +327,18 @@ index 5b29e3c..32afaac 100644
          # Send status back to source.
          let acceptFlag: clong = if window.xdndFormat != 0: 1 else: 0
          let action: clong = if window.xdndVersion >= 2 and window.xdndFormat != 0: cast[clong](xaXdndActionCopy) else: 0
-@@ -993,13 +1107,15 @@ proc pollEvents(window: Window) =
+@@ -993,13 +1134,13 @@ proc pollEvents(window: Window) =
        if window.ic != nil:
          XSetICFocus window.ic
  
 -      # press currently pressed keys
+-      for k in queryKeyboardState().mapit(
+-          keysymToButton display.XKeycodeToKeysym(it.char, 0
+-        )):
 +      # Keys held as focus arrives are down, not pressed here: they were
 +      # pressed in another window. (Enter accepting a file dialog would
 +      # otherwise press Enter again in the window focus returns to.)
-       for k in queryKeyboardState().mapit(
-           keysymToButton display.XKeycodeToKeysym(it.char, 0
-         )):
++      for k in queryKeyboardState().mapit(heldKeyButton(it)):
          if k == ButtonUnknown:
            continue
 -        pushButtonEvent(k, true)
@@ -311,7 +346,7 @@ index 5b29e3c..32afaac 100644
  
        if window.onFocusChange != nil:
          window.onFocusChange()
-@@ -1055,10 +1171,13 @@ proc pollEvents(window: Window) =
+@@ -1055,10 +1196,13 @@ proc pollEvents(window: Window) =
  
      of xeButtonPress, xeButtonRelease:
  
@@ -328,7 +363,22 @@ index 5b29e3c..32afaac 100644
  
        let
          now = getTime()
-@@ -1122,36 +1241,39 @@ proc pollEvents(window: Window) =
+@@ -1097,10 +1241,13 @@ proc pollEvents(window: Window) =
+         window.clickSeqLen = 0
+ 
+     of xeKeyPress, xeKeyRelease:
+-      var key = ButtonUnknown
++      var key = positionalButton(ev.key.keycode.int)
+       var i = 0
+       while i < 4 and key == ButtonUnknown:
+         key = keysymToButton(XLookupKeysym(ev.key.addr, i.cint))
++        # Punctuation goes by place only: another key whose symbol is
++        # "-" (Spanish, by the right Shift) must not press the "-" button.
++        if key.isPositional: key = ButtonUnknown
+         inc i
+       if key != ButtonUnknown:
+         pushButtonEvent(key, ev.kind == xeKeyPress)
+@@ -1122,36 +1269,39 @@ proc pollEvents(window: Window) =
  
      of xeSelection:
        # Handle XDnD selection data.
@@ -393,7 +443,7 @@ index 5b29e3c..32afaac 100644
  
      else:
        discard
-@@ -1224,8 +1346,8 @@ proc processClipboardEvents: bool =
+@@ -1224,8 +1374,8 @@ proc processClipboardEvents: bool =
      d: Display,
      event: ptr XEvent,
      userData: pointer
@@ -404,7 +454,7 @@ index 5b29e3c..32afaac 100644
  
    while display.XCheckIfEvent(
      ev.addr, checkEvent, cast[pointer](clipboardWindow)
-@@ -1234,8 +1356,13 @@ proc processClipboardEvents: bool =
+@@ -1234,8 +1384,13 @@ proc processClipboardEvents: bool =
      of xeSelection:
        template e: untyped = ev.selection
  
@@ -419,7 +469,7 @@ index 5b29e3c..32afaac 100644
  
        clipboardContent = clipboardWindow.property(
          xaWindyClipboardTargetProperty
-@@ -1296,7 +1423,13 @@ proc getClipboardString*: string =
+@@ -1296,7 +1451,13 @@ proc getClipboardString*: string =
      clipboardWindow
    )
  
@@ -434,7 +484,7 @@ index 5b29e3c..32afaac 100644
    result = clipboardContent
    clipboardContent = ""
  
-@@ -1348,8 +1481,12 @@ proc `icon=`*(window: Window, icon: Image) =
+@@ -1348,8 +1509,12 @@ proc `icon=`*(window: Window, icon: Image) =
    var data: seq[uint64]
    data.add icon.width.uint64
    data.add icon.height.uint64
@@ -449,7 +499,7 @@ index 5b29e3c..32afaac 100644
  
    display.XChangeProperty(
      window.handle,
-@@ -1455,3 +1592,4 @@ proc saveFileDialog*(
+@@ -1455,3 +1620,4 @@ proc saveFileDialog*(
      args.add("--file-filter=" & filter.name & " | " &
        filter.extensions.replace(";", " ").replace(",", " "))
    result = runZenity(args)
