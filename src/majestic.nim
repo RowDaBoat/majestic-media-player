@@ -196,7 +196,10 @@ type
     sbLoading   ## opening the file
     sbSeeking   ## going to its spot before A
     sbReady     ## waiting there, decoded
-    sbRolling   ## playing unseen, muted, about to take over
+    sbRolling   ## playing unseen, about to take over: muted, or heard
+                ## from A on (its own sound takes over, sbSounds)
+    sbDraining  ## the one taken over from, playing on unheard until its
+                ## fade-out at B has been heard (takeOver)
 
   LoopSoundState = enum
     lsOff       ## no loop to serve
@@ -272,6 +275,20 @@ type
     sbUsedAt: float           ## when something last needed the standby
     sbLastPos: float          ## the playing player's last position while rolling
     sbPlayingB: float = NaN   ## ab-loop-b as set on the playing player here
+    sbFaded: bool             ## it waits with its sound faded in at A (loopFadeIn)
+    sbSounds: bool            ## rolling, its own sound is heard from A on
+    sbFadeLen: float = 0.02   ## the takeover's crossfade, seconds
+    sbFmt: string             ## the playing player's sample format and rate,
+    sbRate: int               ## to put the standby's sound in line (alignLoop)
+    sbMeasureAt: float        ## when to measure it against the playing one's; 0 not
+    sbPass: int               ## measurements this run-up
+    sbFadesOn: Player         ## the player the loop's fades below are in, nil none
+    sbFadeIn, sbFadeOut: float  ## them: at A (taken over with), at B (loopFades)
+    sbFadeJumps: int          ## its jumps when they went in
+    sbDrainUntil: float       ## sbDraining: until then
+    sbSentAt: float           ## when it was last sent to wait
+    sbPrep: float = 0.3       ## how long that takes, learned (with some to spare)
+    sbMissed: bool            ## too late for its run-up this round: mpv's own jump
     sbHandoff: bool           ## it serves a link's saved part: opens the
                               ## stream to take over where the part ends
     sbOpts: string            ## mpv's per-file options it opens the file with
@@ -822,7 +839,7 @@ type
     palTrackBefore: Table[string, tuple[path: string, id: int]]  ## Disable Audio / Video:
                               ## the track each turned off ("aid"/"vid"), and in which file
     palCenter: bool           ## scroll palSel to the middle (a list opened on its current item)
-    palAnchor: Vec2           ## the mouse when it opened: its search field's middle goes there
+    palAnchor: Vec2           ## the mouse when it opened: its top-left corner goes there
     palAvsList: bool          ## Change Visualizer's list is open: highlighting a preset plays it
     palAvsBefore: string      ## the preset playing when it opened, back on Esc
     palBuilding: bool         ## buildMenu runs for the palette (Open Recent lists every file kept)
@@ -4734,15 +4751,41 @@ proc pollPeers(a: App): bool =
 # keyframe before A: with keyframes far apart, picture and sound freeze for a
 # moment every round. A second, hidden player (the standby) waits paused a
 # little before A with that work done; shortly before B it starts playing,
-# muted and unseen, and at B it takes over, the other one becoming the
-# standby for the next round. mpv's own A-B loop stays set as the fallback.
+# unseen, and at B it takes over, the other one becoming the standby for the
+# next round. mpv's own A-B loop stays set as the fallback.
 # While the loop sound plays (loopSound), the takeovers keep time with it.
+# Otherwise the sound changes hands as a seamless turn's does (turnTick): a
+# mute only reaches sound mpv hasn't given its output yet, and sending the
+# player taken over from back before A drops what it has queued, so swapping
+# their mutes at B left a silence as long as the output's latency (90 ms on
+# a null sink, tmp/abgap). Instead the standby's sound is faded in at A and
+# the playing player's out at B, placed by the file's time with ffmpeg's
+# afade (Player.setTurnFades), so each is heard up to its side of the seam
+# whenever mpv hands it on; the standby is heard as it runs up (silent before
+# A), measured against the playing player as both are heard and put in line
+# to the sample, and the player taken over from plays on unheard until its
+# fade-out has been heard.
 
 const
   StandbyPreroll = 0.2    ## how far before A the standby waits, media seconds
+  StandbyRunUp = 1.0      ## and as far as there's time for, its own sound to
+                          ## take over: time to measure it and put it in line
   StandbyMinLoop = 0.5    ## shorter loops jump the plain way
+  LoopArm = 0.45          ## the fades go in at least this long before the seam,
+                          ## seconds: mpv filters the sound up to ~0.3 s ahead of
+                          ## what's heard (as TurnArm)
+  LoopFade = 0.02         ## the crossfade at the seam, seconds
+  LoopFadeStretch = 0.08  ## with pitch correction at another speed (as TurnFadeStretch)
+  LoopStart = 0.06        ## from setting the standby playing until its time is good
+  LoopSettle = 0.33       ## until a change of its sound is all heard, seconds
+  LoopClose = 0.0004      ## in line closer than this: left as it is, seconds
+  LoopLate = 0.04         ## it starts this much later than it's learned to: its
+                          ## sound is only put in line by dropping some of it.
+                          ## Silence put in (adelay) stays held in the filter,
+                          ## dropped once the fade-in is taken out: a skip.
 
 proc soundTarget(a: App): float
+proc heardNow(p: Player): float
 
 proc loopRegion(a: App): tuple[a, b: float] =
   ## The A-B loop the playing player is in, b = 0 when none: ours, or as a
@@ -4750,6 +4793,20 @@ proc loopRegion(a: App): tuple[a, b: float] =
   if a.isSlave: a.followAb
   elif a.abLoop and a.loopReady and not a.pingPongAb: (a.loopA, a.loopB)
   else: (0.0, 0.0)  # a ping-pong loop turns around instead of jumping
+
+proc loopRunUp(la, lb: float): float =
+  ## How far before A the standby waits for the loop from la to lb: time for
+  ## its seek there after a takeover, the loop's length less its run-up.
+  max(StandbyPreroll, min(StandbyRunUp, lb - la - 0.5))
+
+proc loopSoundCarries(a: App): bool =
+  ## The loop sound has the loop's sound, or is about to: not the standby.
+  a.lsState != lsOff and a.lsound != nil and a.lsound.loadError.len == 0
+
+proc loopFadeLen(a: App): float =
+  let p = a.player
+  if abs(p.speed - 1) > 1e-6 and p.h.getStr("audio-pitch-correction") != "no": LoopFadeStretch
+  else: LoopFade
 
 proc mirrorOnto(a: App, sb: Player, skip: openArray[string] = []) =
   ## The playing player's settings (but skip) and added tracks, onto sb.
@@ -4776,13 +4833,21 @@ proc standbyForward(a: App) =
   sb.clearTurnFades()
   sb.h.setProp("hwdec", hwdecMode())
 
-proc standbyAt(a: App, path: string, start: float, opts = "") =
+proc standbyAt(a: App, path: string, start: float, opts = "", fadeIn = NaN) =
   ## Sends the standby (paused, muted) to `start` in `path`, opened with
-  ## mpv's per-file options `opts`.
+  ## mpv's per-file options `opts`, its sound faded in at fadeIn (silent
+  ## before it), or not (NaN).
   let sb = a.standby
   sb.h.setProp("mute", true)
+  sb.muted = true
   sb.stopped = false
   a.sbStart = start
+  if a.sbFadesOn == sb: a.sbFadesOn = nil  # its fades are this one's now
+  a.sbFaded = not math.isNaN(fadeIn)
+  a.sbSounds = false
+  a.sbMeasureAt = 0
+  a.sbSentAt = now()
+  a.sbMissed = false
   if path != a.sbPath or opts != a.sbOpts or not sb.loaded:
     a.sbPath = path
     a.sbOpts = opts
@@ -4796,19 +4861,42 @@ proc standbyAt(a: App, path: string, start: float, opts = "") =
     sb.sphere = a.player.sphere  # its added tracks come with mirroring
     sb.h.setProp("pause", true)
     a.standbyForward()
+    # Before opening, as filters made anew take them.
+    if a.sbFaded: sb.setTurnFades(fadeIn = fadeIn, d = a.sbFadeLen)
     # Before opening: changed later, it would reopen the sound output.
     sb.h.setProp("audio-device", a.player.h.getStr("audio-device"))
     sb.h.commandAsync("loadfile", path, "replace", "-1", withDecoderOpts(
       "start=" & formatFloat(start, ffDecimal, 6) & (if opts.len > 0: "," & opts else: ""), path))
     a.sbState = sbLoading
   else:
+    # Before the seek, which makes the filters anew with them.
+    sb.setTurnFades(fadeIn = fadeIn, d = a.sbFadeLen)
     # Seeking first: pausing first would have it wait for its sound to stop.
     sb.h.commandAsync("seek", formatFloat(start, ffDecimal, 6), "absolute", "exact")
     sb.h.setProp("pause", true)
     sb.seeking = true  # until mpv says otherwise
     a.sbState = sbSeeking
 
+proc loopFadeIn(a: App, la: float): float =
+  ## Where the standby's sound fades in for the loop from la: at A when its
+  ## own sound is to take over, NaN when the loop sound has it.
+  if a.loopSoundCarries: NaN else: la
+
+proc standbyBack(a: App, start = NaN) =
+  ## The standby back to wait before A of the loop it serves, its whole
+  ## run-up (loopRunUp) or from `start`.
+  let at = if math.isNaN(start): max(a.sbA - loopRunUp(a.sbA, a.sbB), 0) else: start
+  a.sbFadeLen = a.loopFadeLen
+  a.standbyAt(a.sbPath, at, a.sbOpts, a.loopFadeIn(a.sbA))
+
+proc dropLoopFades(a: App) =
+  ## The playing player's loop fades out, if in (loopFades).
+  let q = a.sbFadesOn
+  a.sbFadesOn = nil
+  if q != nil and q == a.player: q.clearTurnFades()
+
 proc standbyOff(a: App) =
+  a.dropLoopFades()
   if a.sbState == sbOff: return
   a.sbState = sbOff
   if not math.isNaN(a.sbPlayingB): a.applyAbLoop()  # B back where it was
@@ -4821,20 +4909,25 @@ proc takeOver(a: App, past = NaN) =
   ## At B: the standby, rolling, becomes the playing player; the other one
   ## goes back to wait before A. `past`: how far the loop sound is past A.
   let (old, sb) = (a.player, a.standby)
+  let sounds = a.sbSounds
+  # The fade-out at B in (loopFades), its sound is heard up to there: it
+  # plays on, unheard, until it's all been heard.
+  let drain = sounds and a.sbFadesOn == old and not math.isNaN(a.sbFadeOut)
   a.mirrorStandby()  # anything changed during its run-up
   sb.h.setProp("mute", old.muted)
-  old.h.setProp("mute", true)
+  if not drain: old.h.setProp("mute", true)
   # Its own A-B loop would jump back to A first, a second slow seek.
   old.h.setProp("ab-loop-b", "no")
   # Each player's own time to get going, learned from where it got to.
   # With the loop sound starting or playing, a miss puts picture and sound
   # apart for the round: learned in one go, for the other player too (they're
-  # alike).
-  let want = a.sbA + (if math.isNaN(past): max(old.posNow - a.sbB, 0) else: past)
-  let miss = want - sb.posNow
-  let sound = a.lsState in {lsRolling, lsOn}
-  sb.startDelay = clamp(sb.startDelay + (if sound: miss else: miss / 2), -0.1, 0.15)  # it varies a little
-  if sound: old.startDelay = sb.startDelay
+  # alike). Its own sound measured (alignLoop), learned from that.
+  if not (sounds and a.sbPass > 0):
+    let want = a.sbA + (if math.isNaN(past): max(old.posNow - a.sbB, 0) else: past)
+    let miss = want - sb.posNow
+    let sound = a.lsState in {lsRolling, lsOn}
+    sb.startDelay = clamp(sb.startDelay + (if sound: miss else: miss / 2), -0.1, 0.15)  # it varies a little
+    if sound: old.startDelay = sb.startDelay
   sb.muted = old.muted
   sb.volume = old.volume
   a.player = sb
@@ -4851,10 +4944,90 @@ proc takeOver(a: App, past = NaN) =
     old.h.setProp("pause", true)
     old.close()
     return
-  a.standbyAt(a.sbPath, a.sbStart)
+  # Its fade-in at A goes once heard (loopFades).
+  if a.sbFaded:
+    (a.sbFadesOn, a.sbFadeIn, a.sbFadeOut, a.sbFadeJumps) = (sb, a.sbA, NaN, sb.jumps)
+  else: a.sbFadesOn = nil
+  a.sbSounds = false
+  if drain:
+    # Until the fade-out's end is heard, and a little more.
+    let (hp, ht) = old.heardPos
+    let heard = if math.isNaN(hp): old.posNow else: hp + (now() - ht) * old.speed
+    let left = (a.sbB + a.sbFadeLen / 2 - heard) / max(old.speed, 0.01)
+    a.sbDrainUntil = now() + clamp(left, 0, 0.25) + 0.03
+    a.sbState = sbDraining
+    return
+  a.standbyBack()
+
+proc loopLate(a: App, la, lb: float): float =
+  ## How much later the standby's sound gets to A than the playing player's
+  ## to B, seconds (negative: sooner), as both are heard; NaN when that
+  ## can't be told now.
+  let (p, sb) = (a.player, a.standby)
+  var v: seq[float]
+  for i in 0 ..< 3:
+    let (mp, mt) = p.heardPos
+    let (sp, st) = sb.heardPos
+    if math.isNaN(mp) or math.isNaN(sp): continue
+    v.add la + (mp + p.speed * (st - mt) - lb) - sp
+  if v.len < 2: return NaN
+  v.sort
+  v[v.len div 2]
+
+proc alignLoop(a: App, la, lb: float) =
+  ## While the standby runs up, heard but silent before A: measures how far
+  ## off its sound is and puts it in line, to the sample, by dropping some
+  ## (Player.setTurnFades' shift); measured again once that's heard, and
+  ## mended if there's time. The first measurement also has the next round
+  ## start it that much earlier or later.
+  let (p, sb) = (a.player, a.standby)
+  if a.sbMeasureAt == 0 or now() < a.sbMeasureAt or sb.seeking or not sb.playing: return
+  let late = a.loopLate(la, lb)
+  if math.isNaN(late): return  # again next pass
+  a.sbMeasureAt = 0
+  inc a.sbPass
+  if abs(late) > 0.25: return  # way off: one of them stalled, nothing to mend
+  if a.sbPass == 1:  # both players alike
+    sb.startDelay = clamp(sb.startDelay + late - LoopLate, -0.1, 0.25)
+    p.startDelay = sb.startDelay
+  # Only in time to reach its sound before mpv filters A.
+  let ahead = (lb - p.posNow) / max(p.speed, 0.01)
+  if late < LoopClose or ahead < LoopArm + 0.04: return
+  sb.setTurnFades(fadeIn = la, d = a.sbFadeLen, shift = late, fmt = a.sbFmt, rate = a.sbRate)
+  a.sbMeasureAt = now() + LoopSettle  # to check, once heard
+
+proc loopFades(a: App, la, lb: float) =
+  ## The playing player's own fades while the standby's sound takes over: its
+  ## fade-out at B, once the standby is set to take over from there and in
+  ## time for mpv's filters (else it breaks off at the takeover, as ever);
+  ## the fade-in at A it took over with, out once that's been heard. Both
+  ## out should it be sent elsewhere, or anything change; kept while paused
+  ## (a change of af as playback goes on again held its sound back 0.3 s).
+  let p = a.player
+  var (fin, fout) = (NaN, NaN)
+  let mine = a.sbFadesOn == p and p.jumps == a.sbFadeJumps
+  if mine and not math.isNaN(a.sbFadeIn) and p.posNow - a.sbFadeIn <= a.sbFadeLen / 2 + 0.06:
+    fin = a.sbFadeIn
+  let lead = max(la - a.sbStart, LoopArm) + 0.1  # how long before B it goes in
+  let ok = a.sbFaded and not a.sbMissed and not a.loopSoundCarries and
+    p.posNow >= lb - max(lead, StandbyRunUp + 0.1) - 0.3
+  if ok and mine and a.sbFadeOut == lb: fout = lb
+  elif ok and a.sbState in {sbReady, sbRolling} and p.playing and not p.seeking and
+       p.posNow >= lb - lead and p.posNow < lb and
+       (lb - p.posNow) / max(p.speed, 0.01) >= LoopArm + 0.02:
+    fout = lb
+  if math.isNaN(fin) and math.isNaN(fout):
+    a.dropLoopFades()
+    return
+  let same = (proc (x, y: float): bool = x == y or math.isNaN(x) and math.isNaN(y))
+  if a.sbFadesOn == p and same(fin, a.sbFadeIn) and same(fout, a.sbFadeOut): return
+  if a.sbFadesOn != p: a.sbFadeJumps = p.jumps
+  (a.sbFadesOn, a.sbFadeIn, a.sbFadeOut) = (p, fin, fout)
+  p.setTurnFades(fadeIn = fin, fadeOut = fout, d = a.sbFadeLen)
 
 proc standbyStep(a: App, la, lb, start: float) =
-  ## One step of the standby's round: ready, rolling, taking over.
+  ## One step of the standby's round: ready, rolling, taking over. `start`:
+  ## where it waits as a link's handoff has it.
   let (p, sb) = (a.player, a.standby)
   case a.sbState
   of sbOff: discard
@@ -4864,15 +5037,43 @@ proc standbyStep(a: App, la, lb, start: float) =
       a.mirrorStandby()
       a.sbState = sbSeeking
   of sbSeeking:
-    if not sb.seeking and abs(sb.timePos - start) < 0.1:
+    if not sb.seeking and abs(sb.timePos - a.sbStart) < 0.1:
+      a.sbPrep = clamp(0.7 * a.sbPrep + 0.3 * 1.3 * (now() - a.sbSentAt), 0.05, 2)
       a.sbState = sbReady
   of sbReady:
     # Its run-up before A takes as long as the playing one's before B,
-    # started that much earlier as it takes to get going.
-    let rollAt = lb - (la - start) - sb.startDelay
-    let pos = if a.lsState == lsOn: a.soundTarget else: p.posNow
-    if p.playing and not p.seeking and pos >= rollAt and pos < lb:
+    # started that much earlier as it takes to get going (its own sound to
+    # take over, with time to put it in line: a little later, LoopLate).
+    let sounds = a.sbFaded and not a.sbHandoff and not a.loopSoundCarries
+    let runUp = la - a.sbStart
+    let late = if sounds and runUp >= LoopArm + LoopStart + 0.15: LoopLate else: 0.0
+    let rollAt = lb - runUp - sb.startDelay + late
+    var pos = if a.lsState == lsOn: a.soundTarget else: p.posNow
+    # Its own sound to take over: by the sound heard, which the picture is
+    # tens of milliseconds off (heardNow, asked only once close).
+    if sounds and pos >= rollAt - 0.2 and p.playing and not p.seeking: pos = p.heardNow
+    if a.sbMissed and pos < rollAt - 0.1: a.sbMissed = false  # mpv's jump made: a new round
+    if sounds and not a.sbMissed and p.playing and not p.seeking and pos >= rollAt + 0.06 and
+       pos < lb:
+      # Its moment gone by (playback went on, or got here, after it was sent):
+      # a run-up as long as there's time for, else none this round. Its
+      # sound starting late would leave a silence (silent before A).
+      let r = (lb - pos) - (a.sbPrep + 0.05) * max(p.speed, 0.01)
+      if r >= 0.1:
+        a.standbyBack(max(la - r, 0))
+      else: a.sbMissed = true
+      return
+    if p.playing and not p.seeking and not a.sbMissed and pos >= rollAt and pos < lb:
       a.mirrorStandby()
+      a.sbSounds = sounds
+      if sounds:
+        # Heard from A on (its fade-in): unmuted before any of its sound goes
+        # out, which happens as it plays.
+        sb.muted = p.muted
+        sb.h.setProp("mute", p.muted)
+        (a.sbFmt, a.sbRate) = (p.turnFormat, p.h.getInt("audio-params/samplerate"))
+        a.sbPass = 0
+        a.sbMeasureAt = if a.sbRate > 0: now() + LoopStart else: 0.0  # no sound: nothing to measure
       sb.h.setProp("pause", false)
       a.sbState = sbRolling
       a.sbLastPos = pos
@@ -4882,18 +5083,25 @@ proc standbyStep(a: App, la, lb, start: float) =
       let pos = a.soundTarget
       let wrapped = pos < a.sbLastPos - (lb - la) / 2
       if wrapped or pos >= lb - 0.004: a.takeOver(if wrapped: pos - la else: 0.0)
-      elif not p.playing: a.standbyAt(p.path, start, a.sbOpts)
+      elif not p.playing: a.standbyBack()
       else: a.sbLastPos = pos
       return
+    if a.sbSounds: a.alignLoop(la, lb)
     let pos = p.posNow
     let jumped = p.seeking or p.timePos < a.sbLastPos - 0.3
     # A little early: the frame at B is due then, and shown later this pass.
     if pos >= lb - 0.004 or p.eofReached or (jumped and a.sbLastPos >= lb - 0.05):
       a.takeOver()  # at B, or mpv's own loop just beat us to it
     elif jumped or not p.playing:  # sought or paused meanwhile: wait again
-      a.standbyAt(p.path, start, a.sbOpts)
+      if a.sbHandoff: a.standbyAt(p.path, start, a.sbOpts)
+      else: a.standbyBack()
     else:
       a.sbLastPos = pos
+  of sbDraining:
+    # The one taken over from: once its fade-out's been heard, or it can't
+    # play on.
+    if now() >= a.sbDrainUntil or not sb.playing or sb.eofReached:
+      a.standbyBack()
 
 proc seamlessLoop(a: App) =
   ## Keeps a standby ready for the loop playing, and hands over at B.
@@ -4910,12 +5118,15 @@ proc seamlessLoop(a: App) =
   let sb = a.standby
   discard sb.pollEvents()
   if sb.loadError.len > 0 and p.path == a.sbPath: return  # can't open it: plain jumps
-  let start = max(la - StandbyPreroll, 0)
+  let start = max(la - loopRunUp(la, lb), 0)
   if p.path != a.sbPath or la != a.sbA or lb != a.sbB or a.sbState == sbOff:
-    if a.sbState == sbRolling: sb.h.setProp("pause", true)
+    if a.sbState in {sbRolling, sbDraining}: sb.h.setProp("pause", true)
+    a.dropLoopFades()
     (a.sbA, a.sbB) = (la, lb)
-    a.standbyAt(p.path, start)
+    a.sbFadeLen = a.loopFadeLen
+    a.standbyAt(p.path, start, fadeIn = a.loopFadeIn(la))
   else: a.standbyStep(la, lb, start)
+  a.loopFades(la, lb)
 
 proc placeLoopEnd(a: App) =
   ## mpv's own jump back comes a moment before B: while the standby can take
@@ -4929,7 +5140,7 @@ proc placeLoopEnd(a: App) =
     if not math.isNaN(a.sbPlayingB): a.applyAbLoop()  # B back where it was
     return
   let video = q.hasRealVideo
-  let timed = a.sbState in {sbReady, sbRolling} or a.sbState == sbOff and
+  let timed = a.sbState in {sbReady, sbRolling} and not a.sbMissed or a.sbState == sbOff and
     (a.lsState == lsOn or not video and a.lsState in {lsReady, lsRolling})
   let past = if video: 0.1 else: 0.5
   let b = if timed and lb + past < q.duration: lb + past else: lb
@@ -5838,7 +6049,7 @@ proc loopSound(a: App) =
   if jumped and a.lsState in {lsRolling, lsOn}:
     if a.sbState == sbRolling:  # not to take over from where it went
       a.standby.h.setProp("pause", true)
-      a.standbyAt(a.sbPath, a.sbStart)
+      a.standbyBack()
     a.armLoopSound()
     return
   let heard = a.lsState in {lsRolling, lsOn}
@@ -11357,7 +11568,7 @@ proc paletteKeys(a: App) =
 
 proc paletteOverlay(a: App) =
   ## The command palette: a search field over the commands found, opened
-  ## with the field under the mouse and kept inside the window, in the look
+  ## with its top-left corner at the mouse and kept inside the window, in the look
   ## of Blender's menu search; the highlighted one runs with Enter or a
   ## click. In a submenu, a button left of the field goes back.
   let ui = a.ui
@@ -11378,8 +11589,8 @@ proc paletteOverlay(a: App) =
   # Clamped as though all the rows showed, so the field stays put as
   # typing changes how many do.
   let fullH = Pad * 2 + FieldH + Gap + MaxRows.float32 * RowH
-  let px = max(Edge, min(W - Edge - pw, floor(a.palAnchor.x - pw / 2)))
-  let py = max(Edge, min(H - Edge - fullH, floor(a.palAnchor.y - Pad - FieldH / 2)))
+  let px = max(Edge, min(W - Edge - pw, floor(a.palAnchor.x)))
+  let py = max(Edge, min(H - Edge - fullH, floor(a.palAnchor.y)))
   # The field's ground, drawn first: the field only draws its text.
   var fieldR = rect(px + Pad, py + Pad, pw - Pad * 2, FieldH)
   ui.roundRect(fieldR, colSearchField, 4)
