@@ -326,25 +326,41 @@ it held, to commit.
   are off. A header click selects its entries (Ctrl adds or drops them, Shift extends), a drag moves
   them as a row drag does, a double-click plays the first, a right-click selects them for the menu.
   Grouping pattern... opens Options > Player > Playlists, where an empty pattern means the default.
-  Column widths (the playlist's and the Library's): `layoutCells` gives a text column nobody resized
-  what the others leave (`fillsIn`), else the last column the slack; a panel too narrow takes the
-  excess from every column, each giving the same share of what it has above its narrowest, so the
-  rightmost isn't crushed first. A header edge drag (`startColumnDrag`, `dragColumn`, state in
-  `ColumnDrag`) snapshots the widths as drawn at the press and, from the first movement, writes
-  every column's width: the dragged one follows the pointer, the ones right of it move along keeping
-  their widths, a text column right of the edge that fills the panel gives way, else the last column
-  takes the slack, and once they'd pass the panel's edge the columns right of the edge all narrow
-  evenly (computed from the snapshot, so dragging back within the drag restores them). Saved widths
-  wider than the panel thus become what's drawn on the first drag.
-  A double-click on an edge (`fitColumn`, `libFitColumn`, both through `fitWidths`) fits the column
-  to the rows in view keeping its left edge: every column right of it moves along keeping its width
-  (not just the next one trading width with it). The text columns right of it that fill the panel
-  give way; without any, a narrower column leaves its width to the last column, and a wider one
-  narrows the columns pushed past the panel's edge, the last one first, each down to its narrowest.
-  The last column takes its width from the filling text columns, else from the column left of it.
-  The other columns are written as drawn, except text columns left of it that fill the panel,
-  which go on filling it when their share comes out the same (they're written when it doesn't,
-  as when a panel too narrow squeezed them). `tmp/colfit` checks it against `layoutCells`' math.
+  Column widths (the playlist's and the Library's): `columnWidths` lays them out from the panel's
+  width alone, so resizing the panel never changes what a later resize gives. The number columns
+  (`elastic` false: Duration, Size, Track...) keep their width, set by hand or natural (their widest
+  text); the text columns (Name, Filename, Artist, Album) share what those leave in proportion to
+  their weights (`columnWeight`: the width set by hand, else 240 for Name/Filename, 120 for the
+  others), none under `PlaylistMinTextW` (`spreadWeights`). With no text column shown, the room the
+  number columns don't need stays empty. Only a panel too narrow for that narrows the text columns
+  further (to `columnFloor`), then the number columns. A header edge drag (`startColumnDrag`,
+  `dragWidths`, `dragColumn`, state in `ColumnDrag`, computed from the press) keeps the columns left
+  of the edge, so the edge follows the pointer: the text columns right of it give or take the width
+  in proportion; without any, the empty room does, then the number columns right of it (the next
+  one first), and narrowing gives the next column the width. Only the columns it changes are written
+  (`setWidths`: a text column's as the weight that lays it out that wide at the press's
+  `textScale`), so laid out again every column is as dragged and nothing cut by a narrow panel gets
+  saved. A double-click on an edge (`fitColumn`, `libFitColumn`, both through `fitWidths`) fits the
+  column to the rows in view: a number column trades width with the text columns (all, in
+  proportion; with none, with the empty room), a text column with the other text columns (one
+  alone fills the rest, so it doesn't fit). The last column's edge is the panel's while text
+  columns fill it; with none shown, a drag there moves into the empty room. Older versions stretched
+  the last column into the slack and saved every column as drawn: their number columns' widths are
+  dropped once at start (`numberWidthsDropped`). `tmp/flexcols/check.sh` checks these on random
+  cases against the procs extracted from the source (`run.sh` and `celldump` for the real app).
+- The side column (playlist/library) and the video frame share a window resize Majestic didn't
+  ask for (`flexPanel` each frame, telling the edges apart by the window's left edge on screen,
+  `flexX`). Dragging the right edge resizes the side column, the left edge the video frame
+  (`edgeFlexedPanel`); narrowing, once that one is at its narrowest (`PlaylistMinWidth`, or half of
+  `MinWindow` for the video frame, as the column's grip leaves it), the other narrows. Any other
+  resize (both edges moving: maximizing, tiling, and the half second after restoring) goes by
+  `flexedPanel`: a wider window's room goes to whichever is wider (the video frame on a tie); on a
+  narrower one, the wider gives its width down to the other's, then both narrow alike. A width
+  that arrives a moment before the window says it's maximized is redone that way (`flexFromW`).
+  Majestic's own resizes (`ownResize`: showing or hiding the column, fitting the window to the
+  video, compact mode, leaving full screen) leave it alone. Maximized, its width is kept in
+  `maxPanelW`, the config keeping the normal window's. While the column shows, the window doesn't
+  ask the WM to keep the video's aspect (a right edge's drag doesn't resize the video frame).
   The tab menu's "Playlists in a Side Column" (`playlistTabsSide`) draws the playlists as a list left
   of the entries instead (`playlistSide`), with the same clicks, drags and drops; it fills the same
   `tabRects`/`tabPlus`/`tabStrip`, so file drops, row drags and right-clicks treat both alike. The
@@ -353,13 +369,14 @@ it held, to commit.
   panel by its width so the entries keep their room.
   Script commands: `tabdump`, `tabrects`, `tabnew`, `tabshow`, `tabclose`, `tabrestore`, `tabrename`,
   `tabmove`, `tabsend`, `tabctx`, `tabaction label`, `plmark`, `act <command id>`, `next`, `prev`, `eof`, `colctx x y
-  field`, `colaction label`, `coldump`, `plgroupdump` (the groups and rows drawn).
+  field`, `colaction label`, `coldump`, `celldump` (columns as drawn, side column and video widths),
+  `plgroupdump` (the groups and rows drawn).
 - With "Same player for each media file" (the default), a running player listens
   on `$XDG_RUNTIME_DIR/majestic-media-player.sock` and files opened from the
   file manager are handed to it instead of starting a second window. On
   Windows it listens on a loopback TCP port, written to
-  `%TEMP%\majestic-media-player.sock`. The shield button (left of the volume,
-  off in every new player, `setShield`) closes that listener, so the next launch
+  `%TEMP%\majestic-media-player.sock`. The shield button (left of the volume, also
+  File > Shield From Files Opened Elsewhere; off in every new player, `setShield`) closes that listener, so the next launch
   finds nobody and becomes a player of its own, listening in turn. Unshielding
   listens again; a player that's unshielded but not listening (another one was
   first) retries every 2 s from the main loop, taking over once that one quits.
@@ -561,7 +578,8 @@ it held, to commit.
   [playlist]` lists the items, `rgdump` prints the settings and each player's properties.
 - Analyzing ReplayGain into tags (the playlist menu's ReplayGain > Analyze and Apply as Tracks
   (track gains only) / Analyze and Apply as Album (track gains plus one album gain) / Remove
-  ReplayGain Values, for the selected local files; the controls' ReplayGain button has Analyze
+  ReplayGain Values, for the selected local files; the controls' ReplayGain button (and Play >
+  ReplayGain, the same menu: `replayGainMenu`) has Analyze
   and Apply as Track and Remove ReplayGain Values for the open file, disabled for a cue sheet's
   track, which has no tags of its own; `src/rgscan.nim`): a
   thread runs `ffmpeg -map 0:a:0 -c:a pcm_f32le -f wav -` per file (the WAV header gives the
@@ -962,8 +980,8 @@ it held, to commit.
   click on a crumb goes to its folder (`libGoToFolder`: the library listed if it shows it, else the
   first library in the column that does; the folders holding it expanded, then `libPick`); a click
   elsewhere on the header collapses or expands it.
-  Its columns are the playlist's (`PlaylistField`), laid out by the same `layoutCells`, `fillsIn` and
-  `minIn` with the library's own set and widths (`libraryColumns`, `libraryColumnWidths`,
+  Its columns are the playlist's (`PlaylistField`), laid out by the same `layoutCells`
+  (`columnWidths`) with the library's own set and widths (`libraryColumns`, `libraryColumnWidths`,
   `libraryShowMillis`): a header click sorts (again: the other way, `librarySort` keeps the field), a
   drag moves the column, its edge resizes it, a double-click there fits it (`libFitColumn`), and the
   header's menu picks the columns. Cell text comes from the index alone (`libCellText`; track, disc

@@ -112,8 +112,10 @@ type
     index: int            ## the column whose edge it is
     x: float32            ## the pointer's x at the press
     widths: seq[float32]  ## every column's width as drawn at the press
-    mins: seq[float32]    ## and the narrowest each can get
-    filler: int           ## a text column right of the edge filling the panel, giving way (-1: none)
+    mins: seq[float32]    ## and the narrowest a drag makes each
+    panelW: float32       ## the width the columns are laid out in
+    scale: float32        ## the text columns' width per unit of weight then (see textScale)
+    sizedAt: Table[string, float]  ## the widths set by hand then
     moved: bool           ## the pointer moved: the widths are set from then on
 
   Overlay = enum
@@ -430,6 +432,7 @@ type
     plColumnFrom: tuple[index: int, x: float32, moved: bool]  ## the header pressed, while "plcolumn" is active
     plRowFrom: tuple[index: int, y: float32, moved, reselect: bool, at: float]  ## while "plrow" is active: the row pressed, the pointer's y, whether it left the press, whether a click without a drag selects only that row, and when the list last auto-scrolled
     plWidthFrom: ColumnDrag   ## while "plwidth" is active
+    plCellsShown, libCellsShown: seq[(Rect, PlaylistField)]  ## the columns last drawn (celldump)
     plOverEdge: bool          ## the pointer is on a column header's resizable edge
     plDurSeconds: bool        ## the Duration column in plain seconds: nothing lasts over a minute
     plLines: seq[int32]       ## with groups shown, the rows drawn: entries (>= 0) under their
@@ -943,6 +946,19 @@ type
     title: string
     hintsKey: string
     fitPending: bool
+    # The side column (playlist/library) or the video frame taking a window
+    # resize (see flexPanel).
+    flexW: int32              ## the window's width (pixels) last frame, 0 before the first
+    flexX: int32              ## and its left edge on screen then
+    flexScale: float32        ## and the UI scaling then
+    ownW: int32               ## the width Majestic itself asked the window for
+    ownUntil: float           ## while that's on its way (resizes then don't flex)
+    maxPanelW: float32        ## the side column's width while maximized (0: not
+                              ## maximized; cfg.playlistWidth is the normal window's)
+    flexFrom: float           ## cfg.playlistWidth before the last flex,
+    flexAt: float             ## and when that was,
+    flexFromW: float32        ## and the window's width (UI units) before it
+    unmaxAt: float            ## when the window was last restored from maximized
     # render scheduling
     frameFlag, previewFlag: bool
     framePending: bool        ## mpv has a frame queued for frameDue
@@ -1121,8 +1137,49 @@ proc bottomHeight(a: App): float32 =
   (if a.cfg.showControls: ControlsHeight else: 0) +
   (if a.cfg.showStatus: StatusHeight else: 0)
 
+proc panelW(a: App): float32 =
+  ## The side column's width as set, unrounded: the maximized window's while
+  ## maximized, else the config's.
+  max(PlaylistMinWidth, (if a.maxPanelW > 0: a.maxPanelW else: a.cfg.playlistWidth.float32))
+
 proc playlistWidth(a: App): float32 =
-  max(PlaylistMinWidth, round(a.cfg.playlistWidth).float32)
+  round(a.panelW)
+
+proc flexedPanel(p, oldW, newW: float32): float32 =
+  ## The side column's width p in a window oldW wide (UI units) once the
+  ## window is newW wide. Whichever of it and the video frame is wider takes a
+  ## wider window's room (the video frame on a tie); on a narrower one, the
+  ## wider gives its width down to the other's, then both narrow alike (the
+  ## roles swapping as they pass each other).
+  let p = min(p, oldW)
+  let v = oldW - p
+  result =
+    if newW >= oldW: (if p > v: p + newW - oldW else: p)
+    elif p > v: max(newW - v, newW / 2)
+    else: min(p, newW / 2)
+  result = max(PlaylistMinWidth, result)
+
+proc edgeFlexedPanel(p, oldW, newW: float32, rightEdge: bool): float32 =
+  ## The side column's width p in a window oldW wide (UI units) once dragging
+  ## one of its edges makes it newW wide. The right edge's drag goes to the
+  ## side column next to it, the left edge's to the video frame; narrowing,
+  ## once that one is at its narrowest (PlaylistMinWidth, or the half of
+  ## MinWindow the column's grip leaves the video frame), the other narrows.
+  let p = max(PlaylistMinWidth, min(p, oldW))
+  let d = newW - oldW
+  if rightEdge: return max(PlaylistMinWidth, p + d)
+  if d >= 0: return p
+  let v = oldW - p
+  let videoGives = min(-d, max(0'f32, v - MinWindow.x.float32 / 2))
+  max(PlaylistMinWidth, p + d + videoGives)
+
+proc ownResize(a: App, size: IVec2) =
+  ## Majestic resizes the window to size (pixels): the side column keeps its
+  ## width while that arrives (see flexPanel).
+  if size.x != a.window.size.x:
+    a.ownW = size.x
+    a.ownUntil = epochTime() + 1.0
+  a.window.setClientSize(size)
 
 proc runLogHeight(a: App): float32 =
   max(RunLogMinHeight, round(a.cfg.runLogHeight).float32)
@@ -1163,6 +1220,59 @@ proc menuBarHeight(a: App): float32 =
 proc sideShown(a: App): bool =
   ## The column right of the video is shown: the playlist, the library or both.
   a.cfg.showPlaylist or a.cfg.showLibrary
+
+proc setPanelWidth(a: App, w: float32) =
+  ## The side column made w wide (by hand). Maximized, the normal window's
+  ## width in the config becomes what restoring the window would make of it.
+  if a.maxPanelW > 0:
+    a.maxPanelW = w
+    if a.cfg.windowW > 0:
+      let s = a.sk.uiScale
+      a.cfg.playlistWidth = flexedPanel(w, a.window.size.x.float32 / s, a.cfg.windowW.float32 / s)
+  else: a.cfg.playlistWidth = w
+
+proc flexPanel(a: App) =
+  ## Each frame: a change in the window's width Majestic didn't ask for goes
+  ## to the side column or the video frame. Dragging the window's right edge
+  ## (its left edge staying put), to the side column; its left edge, to the
+  ## video frame (edgeFlexedPanel). Any other (maximizing, tiling), to
+  ## whichever is wider (flexedPanel). Maximized, the side column's width is
+  ## kept apart (maxPanelW), so the config keeps the normal window's.
+  if a.fullscreen or a.window.minimized: return
+  let w = a.window.size.x
+  if w <= 0: return
+  let x = a.window.pos.x
+  let s = a.sk.uiScale
+  let t = epochTime()
+  if a.window.maximized:
+    if a.maxPanelW <= 0:
+      a.maxPanelW = a.panelW
+      # The window's width came a moment before it said it's maximized: the
+      # config gets back the normal window's, and the maximized window the
+      # width a resize that isn't an edge's drag gives it.
+      if t - a.flexAt < 0.5 and w == a.flexW:
+        a.cfg.playlistWidth = a.flexFrom
+        a.maxPanelW = flexedPanel(max(PlaylistMinWidth, a.flexFrom), a.flexFromW, w.float32 / s)
+  elif a.maxPanelW > 0:
+    a.cfg.playlistWidth = a.maxPanelW
+    a.maxPanelW = 0
+    a.unmaxAt = t
+  if a.flexW > 0 and w != a.flexW:
+    let own = t < a.ownUntil
+    if own and w == a.ownW: a.ownUntil = 0
+    if not own and s == a.flexScale and a.sideShown:
+      let (oldW, newW) = (a.flexW.float32 / s, w.float32 / s)
+      let leftStays = x == a.flexX
+      let rightStays = x + w == a.flexX + a.flexW
+      let p =
+        if a.window.maximized or t - a.unmaxAt < 0.5 or leftStays == rightStays:
+          flexedPanel(a.panelW, oldW, newW)
+        else: edgeFlexedPanel(a.panelW, oldW, newW, rightEdge = leftStays)
+      if a.maxPanelW > 0: a.maxPanelW = p
+      else:
+        (a.flexFrom, a.flexAt, a.flexFromW) = (a.cfg.playlistWidth, t, oldW)
+        a.cfg.playlistWidth = p
+  (a.flexW, a.flexX, a.flexScale) = (w, x, s)
 
 proc chromeSize(a: App): IVec2 =
   ## Window space not used by the video frame (windowed mode), in pixels.
@@ -1247,7 +1357,8 @@ proc updateAspectHints(a: App) =
   # Not on Windows, to resize freely as on KWin, which ignores the hint: Fit
   # letterboxes the video in whatever shape the window is given.
   let enforce = not defined(windows) and not a.fullscreen and a.cfg.preserveAspect and
-    a.cfg.frameMode == fmFit and a.player.hasVideo and not a.player.stopped
+    a.cfg.frameMode == fmFit and a.player.hasVideo and not a.player.stopped and
+    not a.sideShown  # a drag of the right edge goes to the side column
   let aspect = if enforce: a.videoAspect else: 0.0
   let chrome = a.chromeSize
   let key = &"{aspect:.4f}/{chrome.x}/{chrome.y}"
@@ -1268,13 +1379,13 @@ proc fitWindowToVideo(a: App) =
   var size = ivec2(int32(v.x + chrome.x), int32(v.y + chrome.y))
   size.x = max(size.x, a.minWindow.x)
   size.y = max(size.y, a.minWindow.y)
-  a.window.setClientSize(size)
+  a.ownResize(size)
 
 proc resizeKeepingVideo(a: App, delta: IVec2) =
   ## Grows/shrinks the window by delta when chrome is toggled, so the video
   ## frame keeps its size. delta is in UI units.
   if a.fullscreen or a.window.maximized: return
-  a.window.setClientSize(a.window.size + a.px(delta))
+  a.ownResize(a.window.size + a.px(delta))
 
 proc setFullscreen(a: App, on: bool) =
   if on == a.fullscreen: return
@@ -1282,6 +1393,9 @@ proc setFullscreen(a: App, on: bool) =
   a.fullscreen = on
   a.window.fullscreen = on
   a.hintsKey = ""
+  # The window going back to its width isn't a resize to flex (flexW stays
+  # the width it had, see flexPanel).
+  if not on and a.flexW > 0: (a.ownW, a.ownUntil) = (a.flexW, epochTime() + 1.0)
   if on:
     a.window.setAspectHints(0, ivec2(0, 0), a.minWindow)
   elif a.cfg.compactMode:
@@ -1324,7 +1438,7 @@ proc setCompact(a: App, on: bool) =
   var size = a.window.size - ivec2(0, d)
   size.x = max(size.x, a.minWindow.x)
   size.y = max(size.y, a.minWindow.y)
-  a.window.setClientSize(size)
+  a.ownResize(size)
   let moved = content + ivec2(0, d)
   a.window.moveFrame(if on: moved else: moved - a.frameInset)
 
@@ -2334,6 +2448,16 @@ proc loadTabs(a: App) =
       for l in c.playlistListed: a.ytListed.incl l
     a.tabs.add t
   if not a.tabs.anyIt(it.scratch): a.tabs.add newTab(a.tabNames.uniqueName(DefaultName), scratch = true)
+  if not a.cfg.numberWidthsDropped:
+    # Older versions stretched the last column to fill the panel and saved
+    # every column as cut by a narrow one: the number columns go back to
+    # fitting their text (the text columns' widths are kept, as weights).
+    a.cfg.numberWidthsDropped = true
+    for f in PlaylistField:
+      if PlaylistFields[f].sample.len > 0:
+        a.cfg.playlistColumnWidths.del $f
+        a.cfg.libraryColumnWidths.del $f
+        for t in a.tabs.mitems: t.columnWidths.del $f
   for t in a.tabs.mitems:
     if t.scratch:
       if not c.rememberPlaylist: (t.entries, t.file, t.selected) = (newSeq[string](), "", -1)
@@ -9734,6 +9858,7 @@ proc libPlayNew(a: App, paths: seq[string]) =
     a.osd(if paths.len == 1: "Playing in a new player" else: "Playing " & $paths.len & " files in a new player")
   except OSError as e:
     a.osd("Can't start another player: " & e.msg)
+    stderr.writeLine "new player: ", e.msg
 
 proc editLibraries(a: App, name = "", create = false) =
   ## Options > Libraries, with the library of that name selected, or a new
@@ -9929,6 +10054,24 @@ proc replayGainItems(a: App, m: MenuNode, rg: ReplayGain, read: bool) =
     a.showOverlay(ovOptions)
     a.optionsDlg.selectPage(a.optUi, opReplayGain))
 
+proc replayGainMenu(a: App, m: MenuNode) =
+  ## The ReplayGain button's menu (also Play > ReplayGain): its items, then
+  ## analyzing the open file or removing its values.
+  a.replayGainItems(m, a.currentRg, a.rgButton)
+  m.sep()
+  if a.rgJob.running:
+    m.item("Cancel Analysis", action = proc () = a.cancelReplayGain())
+  else:
+    # The open file's own tags (a sheet's track has none of its own).
+    let path = a.player.path
+    let ok = a.rgButton and not path.isCueEntry and canWriteGain(path)
+    m.item("Analyze and Apply as Track", enabled = ok, action = proc () =
+      a.saveReplayGain(rmTrack, @[path]))
+    m.item("Remove ReplayGain Values", enabled = ok, action = proc () =
+      a.removeReplayGain(@[path]))
+
+proc setShield(a: App, on: bool)  # below
+
 proc rlSelection(a: App): string =
   ## The run log text selected by dragging, its rows joined by newlines.
   var (s, e) = (a.rlSelFrom, a.rlSelTo)
@@ -10005,6 +10148,10 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
       filterName = "Audio files"))
   file.sep()
   file.item("Properties", k(kaProperties), enabled = loaded, action = proc () = a.showOverlay(ovProperties))
+  file.sep()
+  # The controls bar's Shield button: files opened elsewhere start a new player.
+  file.check("Shield From Files Opened Elsewhere", checked = a.shielded,
+    action = proc () = a.setShield(not a.shielded))
   file.sep()
   file.item("Exit", k(kaExit), action = proc () = a.window.closeRequested = true)
   let exitItem = file.children[^1]
@@ -10188,6 +10335,10 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
   vol.check("Mute", k(kaMute), p.muted, action = proc () = a.setMute(not a.player.muted))
   vol.item("Max", action = proc () =
     a.player.setVolume(100); a.osd("Volume: 100%"))
+  # The controls bar's Equalizer and ReplayGain buttons.
+  play.check("Equalizer", checked = a.eqWin != nil and a.eqWin.visible,
+    action = proc () = a.toggleEqualizer())
+  a.replayGainMenu(play.sub("ReplayGain"))
   let after = play.sub("After Playback")
   for (label, mode) in [("Do Nothing", apNothing), ("Play Next File In The Folder", apNextInFolder),
                         ("Turn Off The Monitor", apMonitorOff), ("Exit", apExit),
@@ -10459,18 +10610,7 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
     (root, m)
   of cmReplayGain:
     let rg = newMenuRoot()
-    a.replayGainItems(rg, a.currentRg, a.rgButton)
-    rg.sep()
-    if a.rgJob.running:
-      rg.item("Cancel Analysis", action = proc () = a.cancelReplayGain())
-    else:
-      # The open file's own tags (a sheet's track has none of its own).
-      let path = a.player.path
-      let ok = a.rgButton and not path.isCueEntry and canWriteGain(path)
-      rg.item("Analyze and Apply as Track", enabled = ok, action = proc () =
-        a.saveReplayGain(rmTrack, @[path]))
-      rg.item("Remove ReplayGain Values", enabled = ok, action = proc () =
-        a.removeReplayGain(@[path]))
+    a.replayGainMenu(rg)
     (root, rg)
   of cmTime:
     let timeCtx = newMenuRoot()
@@ -10737,9 +10877,9 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
       a.cfg.playlistTabsSide = not a.cfg.playlistTabsSide
       # The panel widens by the column, so that the entries keep their room.
       let side = max(PlaylistSideMinW, round(a.cfg.playlistSideWidth).float32) + 1
-      a.cfg.playlistWidth = clamp(a.cfg.playlistWidth +
+      a.setPanelWidth(clamp(a.panelW +
         (if a.cfg.playlistTabsSide: side else: -side), PlaylistMinWidth,
-        max(PlaylistMinWidth, a.ui.size.x - MinWindow.x.float32 / 2))
+        max(PlaylistMinWidth, a.ui.size.x - MinWindow.x.float32 / 2)))
       a.tabSeen = -1  # the shown one into view
       a.cfg.save())
     (root, tm)
@@ -10836,7 +10976,6 @@ const
 
 proc runAction(a: App, act: KeyAction)  # below
 proc trackerButton(a: App): bool  # below
-proc setShield(a: App, on: bool)  # below
 
 proc paletteKey(it: PaletteItem): string =
   result = (it.path & it.label).join(PaletteSep)
@@ -13729,173 +13868,245 @@ proc columnTitle(field: PlaylistField): string =
   of pfDisc: "Disc"
   else: PlaylistFields[field].label
 
-proc fillsIn(sized: Table[string, float], field: PlaylistField): bool =
-  ## A text column nobody resized (sized: the widths set by hand): it shares
-  ## the width the others leave.
-  PlaylistFields[field].sample.len == 0 and $field notin sized
+proc elastic(field: PlaylistField): bool =
+  ## A text column (Name, Filename, Artist, Album): it shares the width the
+  ## number columns leave with the other text columns, by its weight. The
+  ## number columns (Duration, Size, Track...) keep their widths, whatever the
+  ## panel's width.
+  PlaylistFields[field].sample.len == 0
 
-proc minIn(sized: Table[string, float], cells: seq[(Rect, PlaylistField)], i: int): float32 =
-  ## The narrowest column i can get.
-  if sized.fillsIn(cells[i][1]): PlaylistMinTextW
-  elif i == 0: PlaylistIconW + PlaylistMinColW
-  else: PlaylistMinColW
+proc columnWeight(sized: Table[string, float], field: PlaylistField): float32 =
+  ## A text column's share of the width the number columns leave, against the
+  ## others' (sized: the widths set by hand, a text column's as its weight).
+  if $field in sized: max(1'f32, sized[$field].float32)
+  elif field in {pfName, pfFilename}: 240
+  else: 120
+
+proc columnFloor(i: int): float32 =
+  ## The narrowest column i gets in a panel too narrow for the columns.
+  if i == 0: PlaylistIconW + PlaylistMinColW else: PlaylistMinColW
+
+proc columnMin(field: PlaylistField, i: int): float32 =
+  ## The narrowest a resize (a drag, a fit) makes column i.
+  if field.elastic: max(PlaylistMinTextW, columnFloor(i)) else: columnFloor(i)
+
+proc spreadWeights(weights, mins: seq[float32], room: float32): (seq[float32], float32) =
+  ## Widths for columns of these weights sharing room: in proportion, none
+  ## narrower than its min (those leave the rest to the others), and the width
+  ## per unit of weight, 0 when room is less than the mins (then the mins).
+  var widths = mins
+  if weights.len == 0 or room <= mins.sum: return (widths, 0'f32)
+  var atMin = newSeq[bool](weights.len)
+  var scale = 0'f32
+  while true:
+    var (free, wsum) = (room, 0'f32)
+    for j in 0 .. weights.high:
+      if atMin[j]: free -= mins[j] else: wsum += weights[j]
+    scale = free / wsum
+    var more = false
+    for j in 0 .. weights.high:
+      if not atMin[j] and weights[j] * scale < mins[j]:
+        atMin[j] = true
+        more = true
+    if not more: break
+  for j in 0 .. weights.high:
+    widths[j] = if atMin[j]: mins[j] else: weights[j] * scale
+  (widths, scale)
+
+proc columnWidths(cols: seq[PlaylistField], natural: seq[float32], sized: Table[string, float],
+                  panelW: float32): (seq[float32], float32) =
+  ## Columns cols' widths in a panel panelW wide, and the text columns' width
+  ## per unit of weight (0: none shown, or squeezed to their narrowest). A
+  ## number column is as wide as set by hand, else natural (its widest text);
+  ## the text columns share what those leave by their weights (columnWeight),
+  ## each at least PlaylistMinTextW. Without text columns, the room the number
+  ## columns don't need stays empty. Only a panel too narrow for that narrows
+  ## the text columns further, down to columnFloor, and only then the number
+  ## columns, each giving the same share of what it has above it.
+  var widths = newSeq[float32](cols.len)
+  var ew, em: seq[float32]
+  var fixedW = 0'f32
+  for i, f in cols:
+    if f.elastic:
+      ew.add sized.columnWeight(f)
+      em.add columnMin(f, i)
+    else:
+      widths[i] = if $f in sized: sized[$f].float32 else: natural[i]
+      fixedW += widths[i]
+  let (spread, scale) = spreadWeights(ew, em, panelW - fixedW)
+  var k = 0
+  for i, f in cols:
+    if f.elastic:
+      widths[i] = spread[k]
+      inc k
+  var excess = widths.sum - panelW
+  if excess <= 0: return (widths, scale)
+  var give = 0'f32
+  for i, f in cols:
+    if f.elastic: give += max(0'f32, widths[i] - columnFloor(i))
+  if give > 0:
+    let part = min(1'f32, excess / give)
+    for i, f in cols:
+      if f.elastic:
+        let g = max(0'f32, widths[i] - columnFloor(i)) * part
+        widths[i] -= g
+        excess -= g
+  if excess <= 0: return (widths, 0'f32)
+  give = 0
+  for i in 0 .. cols.high: give += max(0'f32, widths[i] - columnFloor(i))
+  if give > 0:
+    let part = min(1'f32, excess / give)
+    for i in 0 .. cols.high: widths[i] -= max(0'f32, widths[i] - columnFloor(i)) * part
+  (widths, 0'f32)
 
 proc layoutCells(a: App, hdr: Rect, cols: seq[PlaylistField], sized: Table[string, float],
                  longDur: bool): seq[(Rect, PlaylistField)] =
-  ## Columns cols left to right, always fitting hdr (the playlist's or the
-  ## library's). A resized column keeps its width; the others are as wide as
-  ## their widest text, except the text columns, which share what the rest
-  ## leave (with none shown, the last column takes it). longDur: Duration
-  ## shows milliseconds.
+  ## Columns cols left to right in hdr (the playlist's or the library's), as
+  ## columnWidths has them, a number column's natural width fitting its
+  ## widest text. longDur: Duration shows milliseconds.
   let ui = a.ui
-  var widths = newSeq[float32](cols.len)
-  var used = 0'f32
-  var shared = 0
+  var natural = newSeq[float32](cols.len)
   for i, f in cols:
+    if f.elastic: continue
     let sample = PlaylistFields[f].sample
-    if $f in sized:
-      widths[i] = sized[$f].float32
-      used += widths[i]
-    elif sample.len == 0: inc shared
-    else:
-      let longMillis = f == pfDuration and longDur
-      let text = if longMillis: sample & ".000" else: sample
-      widths[i] = max(ui.textSize(f.columnTitle, FontSmall).x, ui.textSize(text, FontSmall).x) + 18
-      if i == 0: widths[i] += PlaylistIconW
-      used += widths[i]
-  if shared == 0: widths[^1] += max(0'f32, hdr.w - used)  # too narrow a panel: see below
-  else:
-    for i, f in cols:
-      if sized.fillsIn(f): widths[i] = max(PlaylistMinTextW, (hdr.w - used) / shared.float32)
-  # Too narrow a panel takes it from every column, each giving as much of
-  # what it has above its narrowest (so none is crushed while others keep
-  # their width).
-  let excess = widths.sum - hdr.w
-  if excess > 0:
-    var give = 0'f32
-    for i in 0 .. cols.high:
-      give += max(0'f32, widths[i] - (if i == 0: PlaylistIconW + PlaylistMinColW else: PlaylistMinColW))
-    if give > 0:
-      let part = min(1'f32, excess / give)
-      for i in 0 .. cols.high:
-        let floorW = if i == 0: PlaylistIconW + PlaylistMinColW else: PlaylistMinColW
-        widths[i] -= max(0'f32, widths[i] - floorW) * part
+    let text = if f == pfDuration and longDur: sample & ".000" else: sample
+    natural[i] = max(ui.textSize(f.columnTitle, FontSmall).x, ui.textSize(text, FontSmall).x) + 18
+    if i == 0: natural[i] += PlaylistIconW
+  let (widths, _) = columnWidths(cols, natural, sized, hdr.w)
   var x = hdr.x
   for i, f in cols:
     result.add (rect(x, hdr.y, widths[i], hdr.h), f)
     x += widths[i]
 
+proc textScale(sized: Table[string, float], cells: seq[(Rect, PlaylistField)]): float32 =
+  ## The text columns' width per unit of weight as cells are drawn (see
+  ## columnWidths), 0 when they're all at their narrowest (or none shown).
+  for j, (cr, f) in cells:
+    if f.elastic and cr.w > columnMin(f, j) + 0.01: return cr.w / sized.columnWeight(f)
+
+proc setWidths(sized: var Table[string, float], cells: seq[(Rect, PlaylistField)],
+               widths: seq[float32], changed: seq[bool], scale: float32) =
+  ## Writes the columns changed as widths: a number column's as its width, a
+  ## text column's as the weight that lays it out that wide (scale: the text
+  ## columns' width per unit of weight as drawn). The others keep theirs, so
+  ## laid out again in the same panel every column is as wide as widths says.
+  ## Text columns all at their narrowest (scale 0) have every one written as
+  ## its width.
+  let all = scale <= 0 and toSeq(0 .. cells.high).anyIt(changed[it] and cells[it][1].elastic)
+  for j, (_, f) in cells:
+    if f.elastic:
+      if all or changed[j]: sized[$f] = float(if scale > 0: widths[j] / scale else: widths[j])
+    elif changed[j]: sized[$f] = widths[j].float
+
 proc startColumnDrag(sized: Table[string, float], cells: seq[(Rect, PlaylistField)],
-                     edge: int, x: float32): ColumnDrag =
-  ## A press on column edge's right edge (not the last column's: that one
-  ## only fits). A text column right of it that fills the panel gives way;
-  ## without one, the columns right of the edge do.
-  result = ColumnDrag(index: edge, x: x, filler: -1)
-  for j in edge + 1 .. cells.high:
-    if result.filler < 0 and sized.fillsIn(cells[j][1]): result.filler = j
-  for j, (cr, _) in cells:
+                     edge: int, x: float32, panelW: float32): ColumnDrag =
+  ## A press on column edge's right edge.
+  result = ColumnDrag(index: edge, x: x, panelW: panelW, sizedAt: sized,
+    scale: sized.textScale(cells))
+  for j, (cr, f) in cells:
     result.widths.add cr.w
-    result.mins.add(if j == result.filler: PlaylistMinTextW
-                    elif j == 0: PlaylistIconW + PlaylistMinColW
-                    else: PlaylistMinColW)
+    result.mins.add columnMin(f, j)
+
+proc dragWidths(fields: seq[PlaylistField], d: ColumnDrag, dx: float32): seq[float32] =
+  ## The widths for column d.index's right edge dragged by dx from the press:
+  ## that column takes dx and the ones left of it keep their widths, so the
+  ## edge follows the pointer. The text columns right of it give or take it,
+  ## in proportion to their widths; without any, the room the columns leave
+  ## empty does (with no text columns shown), then the number columns right of
+  ## it, the next one first, each down to its narrowest, and narrowing, the
+  ## next column takes the width it leaves.
+  let (w, m, e) = (d.widths, d.mins, d.index)
+  result = w
+  if e notin 0 .. w.high: return
+  let anyText = fields.anyIt(it.elastic)
+  if e == w.high and anyText: return  # the panel's edge
+  var right: seq[int]
+  for j in e + 1 .. w.high:
+    if fields[j].elastic: right.add j
+  let least = min(0'f32, m[e] - w[e])
+  if right.len > 0:
+    var room = 0'f32
+    for j in right: room += max(0'f32, w[j] - m[j])
+    let dx = clamp(dx, least, room)
+    result[e] = w[e] + dx
+    var rw, rm: seq[float32]
+    for j in right:
+      rw.add w[j]
+      rm.add m[j]
+    let (spread, _) = spreadWeights(rw, rm, rw.sum - dx)
+    for k, j in right: result[j] = spread[k]
+    return
+  let blank = if anyText: 0'f32 else: max(0'f32, d.panelW - w.sum)
+  var room = blank
+  for j in e + 1 .. w.high: room += max(0'f32, w[j] - m[j])
+  let dx = clamp(dx, least, room)
+  result[e] = w[e] + dx
+  if dx > 0:
+    var take = dx - blank
+    var j = e + 1
+    while take > 0 and j <= w.high:
+      let t = min(take, max(0'f32, w[j] - m[j]))
+      result[j] -= t
+      take -= t
+      inc j
+  elif dx < 0 and anyText: result[e + 1] -= dx  # (e < w.high: see above)
 
 proc dragColumn(sized: var Table[string, float], cells: seq[(Rect, PlaylistField)],
                 d: var ColumnDrag, x: float32) =
-  ## The widths for the pointer at x: only the dragged column changes width
-  ## and the ones right of it move along, each keeping the width it had at the
-  ## press. The filler gives way; without one, the last column takes up the
-  ## slack, and once they'd pass the panel's edge, the columns right of the
-  ## edge all narrow, each giving as much of what it has above its narrowest.
-  ## Every column keeps the width it's drawn with (a click alone changes
-  ## nothing), so what was cut to fit the panel is what's kept.
-  if d.index >= cells.high or d.widths.len != cells.len: return
+  ## The widths for the pointer at x (dragWidths), from those at the press:
+  ## only the columns it changes are written (setWidths), so a click alone
+  ## changes nothing and no column keeps a width a panel too narrow cut.
+  if d.widths.len != cells.len: return
   if not d.moved:
     if x == d.x: return
     d.moved = true
-  let e = d.index
-  var room = 0'f32
-  if d.filler >= 0: room = d.widths[d.filler] - d.mins[d.filler]
-  else:
-    for j in e + 1 .. cells.high: room += max(0'f32, d.widths[j] - d.mins[j])
-  let least = d.mins[e] - d.widths[e]
-  let dx = clamp(x - d.x, min(0'f32, least), max(0'f32, room))
-  var give = 0'f32
-  if d.filler < 0 and dx > 0: give = dx / max(room, 1e-3)
-  for j, (_, f) in cells:
-    if j == d.filler: sized.del $f  # fills what the others leave
-    elif j == e: sized[$f] = float(d.widths[j] + dx)
-    elif j > e and give > 0: sized[$f] = float(d.widths[j] - max(0'f32, d.widths[j] - d.mins[j]) * give)
-    else: sized[$f] = d.widths[j].float
+  let fields = cells.mapIt(it[1])
+  let widths = dragWidths(fields, d, x - d.x)
+  sized = d.sizedAt
+  var changed = newSeq[bool](cells.len)
+  for j in 0 .. cells.high: changed[j] = abs(widths[j] - d.widths[j]) > 0.01
+  changed[d.index] = true
+  sized.setWidths(cells, widths, changed, d.scale)
 
 proc fitWidths(sized: var Table[string, float], cells: seq[(Rect, PlaylistField)], i: int,
-               want: float32) =
+               want: float32, panelW: float32) =
   ## Column i made want wide (a double-click on its edge), as far as the
-  ## others let it, its left edge staying put: every column right of it moves
-  ## along keeping its width, not only the next one. What gives way: the text
-  ## columns right of it that fill the panel; without any, the columns at the
-  ## panel's right edge, the last one first, each down to its narrowest (and a
-  ## narrower column i leaves its width to the last one). The last column, with
-  ## none right of it, takes its width from the text columns filling the panel,
-  ## else from the column left of it. As with a drag, the other columns keep the
-  ## width they're drawn with; a text column left of i that fills the panel goes
-  ## on filling it while its share stays the same.
-  if cells.len < 2 or i notin 0 .. cells.high: return
-  let n = cells.len
-  var w = newSeq[float32](n)
-  var fills = newSeq[bool](n)
-  var mins = newSeq[float32](n)
-  for j, (cr, f) in cells:
-    w[j] = cr.w
-    fills[j] = sized.fillsIn(f)
-    mins[j] = sized.minIn(cells, j)
-  let total = w.sum  # the panel's width
-  # The text columns sharing what the others leave that give way.
-  var give: seq[int]
-  for j in i + 1 .. cells.high:
-    if fills[j]: give.add j
-  if i == cells.high:
-    for j in 0 ..< i:
-      if fills[j]: give.add j
-  var room = 0'f32
-  if give.len > 0:
-    for j in give: room += max(0'f32, w[j] - mins[j])
-  elif i < cells.high:
-    for j in i + 1 .. cells.high: room += max(0'f32, w[j] - mins[j])
-  else: room = max(0'f32, w[i - 1] - mins[i - 1])
-  let least = min(mins[i], w[i])  # one already narrower (saved so) may stay so
-  let nw = clamp(want, least, max(least, w[i] + room))
-  var dx = nw - w[i]
-  w[i] = nw
-  if give.len == 0:
-    if i == cells.high: w[i - 1] -= dx
-    elif dx < 0: w[^1] -= dx  # the last one takes what column i leaves
-    else:  # the ones passing the panel's edge narrow, the last one first
-      var j = cells.high
-      while dx > 0 and j > i:
-        let take = min(dx, max(0'f32, w[j] - mins[j]))
-        w[j] -= take
-        dx -= take
-        dec j
-  # The text columns left filling: the ones giving way, and (when none do) the
-  # others while what they share comes out the same as they're drawn.
-  var keep = newSeq[bool](n)
-  for j in give: keep[j] = true
-  if give.len == 0:
-    var used = 0'f32
-    var shared = 0
-    for j in 0 .. cells.high:
-      if fills[j] and j != i: inc shared
-      else: used += w[j]
-    if shared > 0:
-      let share = (total - used) / shared.float32
-      var same = share >= PlaylistMinTextW - 0.01
-      for j in 0 .. cells.high:
-        if fills[j] and j != i and abs(w[j] - share) > 0.5: same = false
-      if same:
-        for j in 0 .. cells.high:
-          if fills[j] and j != i: keep[j] = true
-  for j, (_, f) in cells:
-    if not keep[j]: sized[$f] = w[j].float
+  ## others let it. A number column takes the width from the text columns, or
+  ## gives it to them, all of them in proportion (the other number columns
+  ## keep their widths); with no text columns shown, from the room the columns
+  ## leave empty. A text column takes it from the other text columns, or gives
+  ## it to them; one alone is as wide as the number columns leave.
+  if i notin 0 .. cells.high: return
+  let f = cells[i][1]
+  var w, m: seq[float32]
+  for j, (cr, g) in cells:
+    w.add cr.w
+    m.add columnMin(g, j)
+  var others: seq[int]  # the text columns other than i
+  for j, (_, g) in cells:
+    if j != i and g.elastic: others.add j
+  var room = 0'f32  # what i can take
+  if others.len > 0:
+    for j in others: room += max(0'f32, w[j] - m[j])
+  elif f.elastic: return
+  else: room = max(0'f32, panelW - w.sum)
+  let nw = clamp(want, min(m[i], w[i]), w[i] + room)
+  if abs(nw - w[i]) < 0.01: return
+  if not f.elastic:
+    sized[$f] = nw.float  # the text columns share the rest by their weights
+    return
+  var ow, om: seq[float32]
+  for j in others:
+    ow.add w[j]
+    om.add m[j]
+  let (spread, _) = spreadWeights(ow, om, ow.sum - (nw - w[i]))
+  var widths = w
+  widths[i] = nw
+  for k, j in others: widths[j] = spread[k]
+  var changed = newSeq[bool](cells.len)
+  changed[i] = true
+  for j in others: changed[j] = true
+  sized.setWidths(cells, widths, changed, sized.textScale(cells))
 
 proc playlistCells(a: App, hdr: Rect): seq[(Rect, PlaylistField)] =
   ## The shown playlist's columns (see layoutCells).
@@ -13936,11 +14147,13 @@ proc cellFont(field: PlaylistField): string =
   ## Name and Filename read like the row's title, the rest as its details.
   if field in {pfName, pfFilename}: FontMain else: FontSmall
 
-proc fitColumn(a: App, cells: seq[(Rect, PlaylistField)], i: int, visible: Slice[int]) =
+proc fitColumn(a: App, cells: seq[(Rect, PlaylistField)], i: int, visible: Slice[int],
+               panelW: float32) =
   ## Column i as wide as the values in the rows in view (its header's text when
-  ## they have none), the columns right of it moving along (see fitWidths).
+  ## they have none), as far as the others let it (see fitWidths); panelW: the
+  ## width the columns are laid out in.
   let ui = a.ui
-  if cells.len < 2: return
+  if cells.len == 0: return
   let field = cells[i][1]
   var want = 0'f32
   for k in visible:
@@ -13949,7 +14162,7 @@ proc fitColumn(a: App, cells: seq[(Rect, PlaylistField)], i: int, visible: Slice
   if want == 0: want = ui.textSize(field.columnTitle, FontSmall).x
   want += 18
   if i == 0: want += PlaylistIconW
-  a.plColumnWidths.fitWidths(cells, i, want)
+  a.plColumnWidths.fitWidths(cells, i, want, panelW)
   a.saveColumns()
 
 proc playlistCell(a: App, s: string, cell: Rect, field: PlaylistField, first: bool,
@@ -14524,8 +14737,8 @@ proc playlistPanel(a: App, r: Rect) =
     ui.consumeClick()
   if ui.activeId == "plresize":
     let (x0, w0) = a.plResizeFrom
-    a.cfg.playlistWidth = clamp(w0 + x0 - ui.mouse.x, PlaylistMinWidth,
-      max(PlaylistMinWidth, ui.size.x - MinWindow.x.float32 / 2))
+    a.setPanelWidth(clamp(w0 + x0 - ui.mouse.x, PlaylistMinWidth,
+      max(PlaylistMinWidth, ui.size.x - MinWindow.x.float32 / 2)))
   let header = rect(r.x, r.y, r.w, 30)
   ui.icon("playlist16", vec2(r.x + 18, header.y + 15), colAccent)
   # Autosave: on, every change goes to the playlist's file. A new playlist
@@ -14644,6 +14857,7 @@ proc playlistPanel(a: App, r: Rect) =
   let barW = if maxScroll > 0: PlaylistBarW else: 0'f32
   let rows = rect(list.x, list.y, list.w - barW, list.h)
   let cells = a.playlistCells(rect(colHdr.x, colHdr.y, colHdr.w - barW, colHdr.h))
+  a.plCellsShown = cells
   let dragging = ui.activeId == "plcolumn"
   var edge = -1
   if not ui.hover(grip):
@@ -14653,12 +14867,13 @@ proc playlistPanel(a: App, r: Rect) =
   if edge >= 0 and a.window.buttonPressed[DoubleClick]:  # on the press or, on X11, its release
     ui.consumeClick()
     let top = int(a.plScroll / rowH)
-    a.fitColumn(cells, edge, a.plVisible(top, top + int(list.h / rowH) + 1))
+    a.fitColumn(cells, edge, a.plVisible(top, top + int(list.h / rowH) + 1), colHdr.w - barW)
   elif edge >= 0 and ui.pressed():
     ui.consumeClick()
-    if edge < cells.high:  # the last column's edge doesn't move: it only fits
+    # The last column's edge is the panel's while text columns fill it: it only fits.
+    if edge < cells.high or not cells.anyIt(it[1].elastic):
       ui.activeId = "plwidth"
-      a.plWidthFrom = startColumnDrag(a.plColumnWidths, cells, edge, ui.mouse.x)
+      a.plWidthFrom = startColumnDrag(a.plColumnWidths, cells, edge, ui.mouse.x, colHdr.w - barW)
   if ui.activeId == "plwidth":
     dragColumn(a.plColumnWidths, cells, a.plWidthFrom, ui.mouse.x)
     if ui.released() and a.plWidthFrom.moved: a.saveColumns()
@@ -15164,11 +15379,12 @@ proc libCellText(a: App, f: LibFile, field: PlaylistField): string =
     if y > 0: $y else: ""
   of pfAlbum: f.album
 
-proc libFitColumn(a: App, cells: seq[(Rect, PlaylistField)], i: int, ids: seq[int32]) =
+proc libFitColumn(a: App, cells: seq[(Rect, PlaylistField)], i: int, ids: seq[int32],
+                  panelW: float32) =
   ## Column i as wide as the values of the files in view (as the playlist's
-  ## fitColumn), the columns right of it moving along (see fitWidths).
+  ## fitColumn), as far as the others let it (see fitWidths).
   let ui = a.ui
-  if cells.len < 2: return
+  if cells.len == 0: return
   let field = cells[i][1]
   var want = 0'f32
   for id in ids:
@@ -15177,7 +15393,7 @@ proc libFitColumn(a: App, cells: seq[(Rect, PlaylistField)], i: int, ids: seq[in
   if want == 0: want = ui.textSize(field.columnTitle, FontSmall).x
   want += 18
   if i == 0: want += PlaylistIconW
-  a.cfg.libraryColumnWidths.fitWidths(cells, i, want)
+  a.cfg.libraryColumnWidths.fitWidths(cells, i, want, panelW)
   a.cfg.save()
 
 proc libraryPanel(a: App, r: Rect, under: bool) =
@@ -15200,8 +15416,8 @@ proc libraryPanel(a: App, r: Rect, under: bool) =
   if not a.cfg.showPlaylist:  # else the playlist follows the drag
     if ui.activeId == "plresize":
       let (x0, w0) = a.plResizeFrom
-      a.cfg.playlistWidth = clamp(w0 + x0 - ui.mouse.x, PlaylistMinWidth,
-        max(PlaylistMinWidth, ui.size.x - MinWindow.x.float32 / 2))
+      a.setPanelWidth(clamp(w0 + x0 - ui.mouse.x, PlaylistMinWidth,
+        max(PlaylistMinWidth, ui.size.x - MinWindow.x.float32 / 2)))
   let split = rect(r.x, r.y - 2, r.w, LibrarySplitGrip)
   if under:
     ui.rect(rect(r.x, r.y, r.w, 1), colBorder)
@@ -15456,6 +15672,7 @@ proc libraryPanel(a: App, r: Rect, under: bool) =
   let cells = a.layoutCells(rect(hdr.x, hdr.y, hdr.w - barW, hdr.h), a.cfg.libraryColumns,
     a.cfg.libraryColumnWidths, a.cfg.libraryShowMillis and not a.libDurSeconds)
   let sized = a.cfg.libraryColumnWidths
+  a.libCellsShown = cells
   let first = int(a.libScroll / rowH)
   let last = min(n, first + int(list.h / rowH) + 2) - 1
   let dragging = ui.activeId == "libcolumn"
@@ -15469,12 +15686,13 @@ proc libraryPanel(a: App, r: Rect, under: bool) =
     var shownIds: seq[int32]
     for i in first .. last:
       if a.libView[i] >= 0: shownIds.add a.libView[i]
-    a.libFitColumn(cells, edge, shownIds)
+    a.libFitColumn(cells, edge, shownIds, hdr.w - barW)
   elif edge >= 0 and ui.pressed():
     ui.consumeClick()
-    if edge < cells.high:  # the last column's edge doesn't move: it only fits
+    # The last column's edge is the panel's while text columns fill it: it only fits.
+    if edge < cells.high or not cells.anyIt(it[1].elastic):
       ui.activeId = "libwidth"
-      a.libWidthFrom = startColumnDrag(sized, cells, edge, ui.mouse.x)
+      a.libWidthFrom = startColumnDrag(sized, cells, edge, ui.mouse.x, hdr.w - barW)
   if ui.activeId == "libwidth":
     dragColumn(a.cfg.libraryColumnWidths, cells, a.libWidthFrom, ui.mouse.x)
     if ui.released() and a.libWidthFrom.moved: a.cfg.save()
@@ -17529,6 +17747,7 @@ proc frame(a: App) =
   if fb.x <= 0 or fb.y <= 0: return
 
   a.applyUiScale()
+  a.flexPanel()
   ui.beginFrame()
   let (root, ctxRoot) = a.buildMenu()
 
@@ -17988,6 +18207,10 @@ proc runScriptStep(a: App, st: ScriptStep) =
     for n in a.buildMenu().context.children:
       if n.label == arg and n.enabled and n.action != nil: n.action()
     a.ctxMenu = cmVideo
+  of "celldump":  # the columns as last drawn, the side column's width and the video frame's
+    let cw = proc (c: seq[(Rect, PlaylistField)]): string = c.mapIt(&"{it[1]}={it[0].w:.1f}").join(" ")
+    stderr.writeLine &"cells win={a.window.size.x} panel={a.playlistWidth:.1f} video={a.videoRect.w:.1f} ",
+      &"max={a.maxPanelW:.1f} cfg={a.cfg.playlistWidth:.1f} pl=[", cw(a.plCellsShown), "] lib=[", cw(a.libCellsShown), "]"
   of "coldump":  # the shown playlist's columns and widths, its own or shared, and the shared ones
     stderr.writeLine "columns ", (if a.ownColumns: "own " else: "shared "), $a.plColumns, " ",
       $a.plColumnWidths, " order=", $columnOrder(a.plColumnOrder, a.plColumns),
@@ -18654,7 +18877,9 @@ proc main() =
       a.window.moveFrame(p)
   if resumed:
     if rs.windowW >= minSize.x and rs.windowH >= minSize.y:
-      a.window.setClientSize(ivec2(rs.windowW.int32, rs.windowH.int32))
+      let size = ivec2(rs.windowW.int32, rs.windowH.int32)
+      # Maximized next, which the side column takes as a resize, as it did.
+      if rs.maximized: a.window.setClientSize(size) else: a.ownResize(size)
       a.window.moveFrame(ivec2(rs.windowX.int32, rs.windowY.int32))
     if rs.maximized: a.window.maximized = true
     let t = rs.transform

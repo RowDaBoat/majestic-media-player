@@ -19,8 +19,18 @@ let appImageFile* = findAppImage()
   ## The .AppImage this program runs from, "" when it doesn't.
 
 proc selfExe*(): string =
-  ## What starts this program anew.
-  if appImageFile.len > 0: appImageFile else: getAppFilename()
+  ## What starts this program anew. On Linux, once the running file was
+  ## replaced (installed anew, updated), the system names it "<path>
+  ## (deleted)", which nothing starts: the file now at <path> starts instead,
+  ## else (removed since) the running program's own, which lives on while it
+  ## runs.
+  if appImageFile.len > 0: return appImageFile
+  result = getAppFilename()
+  when defined(linux):
+    const Deleted = " (deleted)"
+    if result.endsWith(Deleted) and not fileExists(result):
+      let path = result[0 ..< result.len - Deleted.len]
+      result = if fileExists(path): path else: "/proc/self/exe"
 
 const
   DesktopFile = staticRead("../assets/desktop/majestic-media-player.desktop")

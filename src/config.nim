@@ -105,6 +105,8 @@ type
     libraryColumns*: seq[PlaylistField]  # its columns, left to right; set by loadConfig when empty
     libraryColumnWidths*: Table[string, float]  # pixels, by field name: the columns resized by hand
     libraryColumnOrder*: seq[PlaylistField]  # every column, hidden ones too, as the header's menu lists them
+    numberWidthsDropped*: bool  # the number columns' widths older versions saved (the last column's
+                                # stretched to fill the panel, others cut by it) were dropped, once
     libraryShowMillis*: bool = false # its Duration column as HH:MM:SS.mmm
     libraryGroupFolders*: bool = false  # its files under a header per folder
     libraryCollapsed*: seq[string]  # the folder groups shown collapsed, by their headers' labels
