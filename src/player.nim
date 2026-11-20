@@ -60,7 +60,7 @@ type
 
   Prop = enum
     pPause, pTimePos, pDuration, pEof, pTracks, pChapters, pVolume, pMute,
-    pSpeed, pVideoParams, pAudioChannels, pIdle, pSeeking, pCacheState,
+    pSpeed, pVideoParams, pAudioChannels, pAudioRate, pIdle, pSeeking, pCacheState,
     pPausedForCache
 
   Player* = ref object
@@ -87,6 +87,9 @@ type
     frameDur: float           ## the last step of timePos while playing, a frame
     holdTime*: bool           ## the app sets timePos (step frames): mpv's lags behind
     holdJumps*: int           ## jumps of the step holding it: any later jump's time counts
+    soundHold: float = -1     ## paused on the sound alone, where an exact seek went (-1 none):
+                              ## mpv's time lags it by what the output buffered (see seek)
+    soundHoldJumps: int       ## jumps of that seek: any later jump's time counts
     endPinned: bool           ## timePos is the last frame's (pinEnd), until eof-reached goes
     eofJumps: int             ## jumps when the end was reached
     timeJumps: int            ## jumps when the last time was taken
@@ -109,6 +112,7 @@ type
     pixelW*, pixelH*: int     ## stored size, as upright as shown (what ffmpeg
                               ## filters see, autorotation included)
     audioChannels*: int
+    audioRate*: int           ## the decoded sound's sample rate, 0 for none
     loadError*: string
     hookError*: string        ## yt-dlp's error opening the link (mpv's hook),
                               ## "ERROR: ..."; mpv's own (loadError) is then
@@ -155,6 +159,14 @@ type
     keepTime*: bool           ## opening: its time and duration stay as they are
     openSeek: float           ## sought there while keepTime, -1: not; done once open
     pausedAt: float           ## when it last paused, epoch seconds
+    resumes*: int             ## times it went from paused to playing
+    mpvTime: float            ## mpv's own last time, whatever timePos holds
+    mpvJumps: int             ## jumps when it came
+    jumpTarget*: float        ## where the jump `jumpJumps` went (noteTarget)
+    jumpJumps*: int = -1      ## while jumps are still these
+    jumpResumes*: int         ## and resumes these
+    jumpChapter: bool         ## a chapter jump: on a chapter's start, not known which
+    jumpPaused: bool          ## paused when it was asked for
     endPaused: bool           ## paused by mpv on reaching the end, not by the user
     endHold*: bool            ## sent to the last frame to stay there: not playback ending
     endResumed*: bool         ## a seek back from there just set it playing
@@ -273,6 +285,7 @@ proc observe(h: MpvHandle) =
       (pVolume, "volume", fmtDouble), (pMute, "mute", fmtFlag),
       (pSpeed, "speed", fmtDouble), (pVideoParams, "video-params", fmtNode),
       (pAudioChannels, "audio-params/channel-count", fmtInt64),
+      (pAudioRate, "audio-params/samplerate", fmtInt64),
       (pIdle, "idle-active", fmtFlag), (pSeeking, "seeking", fmtFlag),
       (pCacheState, "demuxer-cache-state", fmtNode),
       (pPausedForCache, "paused-for-cache", fmtFlag)]:
@@ -827,6 +840,9 @@ proc heardPos*(p: Player): tuple[pos, at: float] =
   # mpv's own times run negated backward.
   ((if p.backward: -v else: v), (t0 + t1) / 2)
 
+proc hasRealVideo*(p: Player): bool
+proc noteTarget*(p: Player, t: float)
+
 proc handleProp(p: Player, id: Prop, ev: ptr MpvEventProperty) =
   let d = ev.data
   template f: float = (if d == nil: 0.0 else: cast[ptr cdouble](d)[].float)
@@ -834,25 +850,32 @@ proc handleProp(p: Player, id: Prop, ev: ptr MpvEventProperty) =
   if p.keepTime and id in {pTimePos, pDuration}: return
   case id
   of pPause:
+    if p.paused and not b: inc p.resumes
     p.paused = b
     if b: p.pausedAt = epochTime()
   of pTimePos:
+    if d != nil: (p.mpvTime, p.mpvJumps) = (f, p.jumps)
     if p.holdTime and p.jumps == p.holdJumps or d == nil: return  # unavailable for a moment isn't 0
     if p.endPinned and p.jumps == p.eofJumps: return
+    # Paused where an exact seek went on the sound alone: that time, not
+    # mpv's (behind it by what the output buffered), until anything else.
+    if p.soundHold >= 0 and not (p.jumps == p.soundHoldJumps and p.paused and not p.hasRealVideo):
+      p.soundHold = -1
+    let t = if p.soundHold >= 0: p.soundHold else: f
     # With the video out, mpv's time is the sound's, behind it by the audio
     # output's latency. That's no step back, near the end of playing forward.
-    let back = p.timePos - f
+    let back = p.timePos - t
     if back > 0 and back < min(0.5, p.duration / 2) and p.jumps == p.timeJumps and
        not (p.paused or p.seeking or p.backward) and
        p.timePos >= p.duration - 3 * max(p.frameDur, 0.05) and epochTime() - p.timeAt < 0.6:
       return
     p.timeJumps = p.jumps
-    let step = abs(f - p.timePos)
+    let step = abs(t - p.timePos)
     if step > 0.001 and step < 0.1: p.frameDur = step
-    p.timePos = f
+    p.timePos = t
     p.timeAt = epochTime()
     # On past it: mpv tells of the spot itself before seeking there.
-    if p.sought >= 0 and not p.seeking and f > p.sought + 0.1 and f < p.sought + 15: p.sought = -1
+    if p.sought >= 0 and not p.seeking and t > p.sought + 0.1 and t < p.sought + 15: p.sought = -1
   of pDuration: p.duration = max(f, p.fullDuration)
   of pEof:
     p.eofReached = b
@@ -867,6 +890,8 @@ proc handleProp(p: Player, id: Prop, ev: ptr MpvEventProperty) =
   of pSeeking: p.seeking = b
   of pAudioChannels:
     p.audioChannels = if d == nil: 0 else: cast[ptr int64](d)[].int
+  of pAudioRate:
+    p.audioRate = if d == nil: 0 else: cast[ptr int64](d)[].int
   of pIdle: discard
   of pCacheState:
     p.buffered.setLen 0
@@ -1163,6 +1188,7 @@ proc wentOn(p: Player) =
   p.eofReached = false
   p.eofHandled = false
   p.holdTime = false
+  p.soundHold = -1
   p.endPinned = false
   p.timePos = p.nextStart
   p.duration = 0
@@ -1213,7 +1239,9 @@ proc pollEvents*(p: Player): bool =
       p.loadedRestarts = p.restarts
       if p.keepTime and p.openSeek >= 0:
         inc p.jumps
-        p.h.commandAsync("seek", formatFloat(p.openSeek, ffDecimal, 3), "absolute", "exact")
+        let at = formatFloat(p.openSeek, ffDecimal, 3)
+        p.noteTarget(parseFloat(at))
+        p.h.commandAsync("seek", at, "absolute", "exact")
       p.keepTime = false
       p.loadError = ""
       p.eofHandled = false
@@ -1342,6 +1370,7 @@ proc load*(p: Player, path: string, start = 0.0, demux = dmAhead, opts = "",
   p.eofReached = false
   p.eofHandled = false
   p.holdTime = false
+  p.soundHold = -1
   p.timePos = start
   p.duration = fullDuration
   p.loadError = ""
@@ -1386,6 +1415,7 @@ proc reopen*(p: Player, demux: DemuxMode) =
   p.releaseLink()
   p.resetNext()
   p.holdTime = false
+  p.soundHold = -1
   p.eofReached = false
   p.eofHandled = false
   inc p.jumps
@@ -1493,6 +1523,7 @@ proc stop*(p: Player) =
   p.setBackward(false)
   p.clearTurnFades()
   p.h.setProp("pause", true)
+  p.noteTarget(0)
   p.h.commandAsync("seek", "0", "absolute", "exact")
   p.stopped = true
 
@@ -1529,7 +1560,47 @@ proc noteSeek(p: Player, t: float) =
     p.endResumed = true
   if t < p.duration - 0.5: (p.endPaused, p.endHold) = (false, false)
 
-proc seek*(p: Player, t: float, exact = true) =
+proc noteTarget*(p: Player, t: float) =
+  ## The jump just asked for (after inc jumps) lands on t exactly: mpv's
+  ## hr-seek=default makes every seek exact on the sound alone (no video, or a
+  ## cover), relative ones from mpv's own time (mpvTime). Paused, mpv's time
+  ## then lags it by the output's latency (playing_audio_pts takes off
+  ## ao_get_delay, which counts the device's latency while nothing plays):
+  ## playing goes on from t (resumePos).
+  (p.jumpTarget, p.jumpJumps, p.jumpResumes) = (max(t, 0), p.jumps, p.resumes)
+  (p.jumpChapter, p.jumpPaused) = (false, p.paused)
+
+proc noteChapterJump*(p: Player) =
+  ## A chapter jump was just asked for (after inc jumps): mpv picks the
+  ## chapter by its own time, so which is known once it lands (heldTarget).
+  p.noteTarget(0)
+  p.jumpChapter = true
+
+proc heldTarget*(p: Player): float =
+  ## Where playing goes on from, when mpv's time doesn't tell (noteTarget):
+  ## the last jump's target until anything plays past it; -1 otherwise.
+  ## Sound alone only (with a picture, mpv's time is the frame's).
+  result = -1
+  if p.jumps != p.jumpJumps or p.resumes != p.jumpResumes or p.backward: return
+  if p.jumpChapter:
+    # Landed paused, the chapter's start is the first at or after mpv's time
+    # (behind it by less than a second).
+    if p.jumpPaused and p.mpvJumps == p.jumps:
+      for c in p.chapters:
+        if c.time >= p.mpvTime - 0.0005 and c.time - p.mpvTime < 1: return c.time
+    return
+  # Played past it (mpv's time from before the jump doesn't tell).
+  if p.mpvJumps == p.jumps and p.mpvTime > p.jumpTarget + 0.0005: return
+  result = p.jumpTarget
+
+proc resumePos*(p: Player): float =
+  ## Where playing goes on from: heldTarget, else timePos.
+  let t = p.heldTarget
+  if t >= 0: t else: p.timePos
+
+proc seek*(p: Player, t: float, exact = true, digits = 6) =
+  ## digits: of the time mpv is given; exact seeks land on it to the
+  ## microsecond (a bookmark's sample, the frame starting there).
   if not p.loaded or p.pastPart(t): return
   p.noteSeek(t)
   if p.opening and p.keepTime:  # mpv has no file to seek in yet
@@ -1538,7 +1609,13 @@ proc seek*(p: Player, t: float, exact = true) =
     return
   p.clearTurnFades()
   inc p.jumps
-  p.h.commandAsync("seek", formatFloat(max(t, 0), ffDecimal, 3), "absolute",
+  # Paused on the sound alone (no video, or a cover), mpv's time is where the
+  # output is, short of the spot by what it buffered for playing on from
+  # there (0.1-0.2 s): playing goes on from the spot, so it's the time held.
+  p.soundHold = if exact and p.paused and not p.hasRealVideo: max(t, 0) else: -1
+  p.soundHoldJumps = p.jumps
+  if exact: p.noteTarget(t)
+  p.h.commandAsync("seek", formatFloat(max(t, 0), ffDecimal, digits), "absolute",
     if exact: "exact" else: "keyframes")
 
 proc turnAt*(p: Player, back: bool, at: float, fadeIn = NaN, d = 0.02, soft = false) =
@@ -1562,6 +1639,11 @@ proc turnAt*(p: Player, back: bool, at: float, fadeIn = NaN, d = 0.02, soft = fa
   p.h.commandStr((if soft: "set hwdec no; " else: "") &
     "set play-direction " & (if back: "backward" else: "forward") &
     "; seek " & formatFloat(max(at, 0), ffDecimal, 6) & " absolute exact")
+
+proc holdSoundAt*(p: Player, t: float) =
+  ## The exact seek just asked for lands on t instead of the time asked for
+  ## (a module's row FFmpeg starts at): the time held while paused.
+  if p.soundHold >= 0 and p.soundHoldJumps == p.jumps: p.soundHold = max(t, 0)
 
 proc landOn*(p: Player, t: float) =
   ## An exact seek to t was just asked for: its time is the one to show. mpv's
@@ -1591,6 +1673,7 @@ proc seekRelative*(p: Player, d: float) =
   p.noteSeek(p.timePos + d)
   p.clearTurnFades()
   inc p.jumps
+  p.noteTarget(p.mpvTime + d)
   p.h.commandAsync("seek", $d, "relative")
 
 proc seekPercent*(p: Player, percent: float) =
@@ -1598,6 +1681,7 @@ proc seekPercent*(p: Player, percent: float) =
   p.noteSeek(p.duration * percent / 100)
   p.clearTurnFades()
   inc p.jumps
+  p.noteTarget(p.duration * percent / 100)
   p.h.commandAsync("seek", $percent, "absolute-percent")
 
 proc dumpFrom*(p: Player, start: float, file: string) =

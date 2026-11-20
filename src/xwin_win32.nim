@@ -550,6 +550,30 @@ proc shiftHeld*(): bool =
   ## Whether Shift is held, even while another window has the keyboard.
   (GetAsyncKeyState(VK_SHIFT).int and 0x8000) != 0
 
+proc altHeld*(): bool =
+  ## Whether Alt is held, even while another window has the keyboard.
+  (GetAsyncKeyState(VK_MENU).int and 0x8000) != 0
+
+const ModifierKeys = [(KeyLeftControl, KeyRightControl), (KeyLeftShift, KeyRightShift),
+                      (KeyLeftAlt, KeyRightAlt)]
+
+proc syncModifiers*(window: Window): bool =
+  ## Brings the window's Ctrl, Shift and Alt in line with the keyboard, for
+  ## modifiers held as it gains focus: Windy forgets every key as the focus
+  ## changes, and a key held then comes back only as it repeats. Whether
+  ## anything changed.
+  privateAccess(Window)
+  let held = [ctrlHeld(), shiftHeld(), altHeld()]
+  for i, (l, r) in ModifierKeys:
+    let down = l in window.state.buttonDown or r in window.state.buttonDown
+    if held[i] and not down:
+      window.state.buttonDown.incl l
+      result = true
+    elif down and not held[i]:
+      window.state.buttonDown.excl l
+      window.state.buttonDown.excl r
+      result = true
+
 var grabbedBy: HWND
 
 proc grabPointer*(window: Window): bool =

@@ -38,6 +38,12 @@ type
     ## Options > Playback > ReplayGain: which of a file's gains is applied.
     rgOff, rgTrack, rgAlbum
 
+  AvsCycleOrder* = enum
+    ## Visualizers' Cycle presets: which preset comes next.
+    acShuffle = "shuffle"         ## each preset turned on once, in a random order, then again
+    acIncremental = "incremental" ## Next's order (the menu's list)
+    acDecremental = "decremental" ## Previous's
+
   AfterPlayback* = enum
     apNothing, apNextInFolder, apMonitorOff, apExit, apSleep, apHibernate,
     apShutdown, apLogOff, apLock
@@ -74,6 +80,9 @@ type
     equalizerMinGain*: float = -12 # dB at the bottom of its sliders (the top is +12)
     compactMode*: bool = false     # no window frame and no menu bar
     showSeekBar*: bool = true
+    seekWaveform*: bool = false    # the seek bar shows the sound's waveform
+    waveformHeight*: float = 64    # pixels, the seek bar's height with it, dragged up by its top edge
+    seekMarks*: bool = true        # chapters, bookmarks and loop marks drawn on the seek bar
     showControls*: bool = true
     showStatus*: bool = true
     showPlaylist*: bool = false
@@ -213,6 +222,12 @@ type
     avsLastDir*: string            # where Visualizers' Add... last took presets from
     avsAddSubfolders*: bool = true # Visualizers' Add Folder... also lists its subfolders' presets
     avsWindowW*, avsWindowH*: int = 0  # Visualizers' window as last resized, UI units; 0: AvsSize
+    avsCycle*: bool = false        # Visualizer > Cycle Presets: the preset changes by itself
+    avsCycleOrder*: AvsCycleOrder = acShuffle  # Visualizers' Cycle presets: to which
+    avsCyclePerSong*: bool = false # once per song (as one starts), else every avsCycleSeconds
+    avsCycleSeconds*: float = 30   # seconds a preset plays (paused time not counted)
+    avsCycleFollow*: bool = false  # Visualizers' Follow: the grid's highlight jumps to each
+                                   # preset cycling switches to
     soundFont*: string = ""        # the SoundFont MIDI files play with when their folder
                                    # has none (midistream.soundFontFor)
     trackerPitch*: float = 0       # the tracker button's pitch shift, semitones

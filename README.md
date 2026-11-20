@@ -1,6 +1,6 @@
 # Majestic Media Player
 
-![Screenshot](screenshot.png)
+<a href="screenshot.png"><img src="screenshot.png" alt="Screenshot: a video with a seek bar preview" width="49%"></a> <a href="screenshot-visualizer.png"><img src="screenshot-visualizer.png" alt="Screenshot: the AVS visualizer playing music, with the playlist and the Library" width="49%"></a>
 
 Inspired by Media Player Classic Home Cinema, built on [libmpv](https://mpv.io) with
 [Silky](https://github.com/treeform/silky) UI, vibecoded in Nim.
@@ -37,6 +37,7 @@ Majestic's aim is to be the video player I wish I had.
 
 <!-- Unreleased (newer than v0.25.0). Once a release with them is tagged, put them in the list above:
 - After "A command palette": - **Join videos** of any size, frame rate or shape.
+- After "Seek bar previews": - **A waveform seek bar.**
 - A-B line: - **A-B loops, ping-pong, smooth reverse playback and an equalizer.**
 - Playlists line: - **Several playlists**, foobar2000-style, with a playback queue and group headers.
 - Tag editor line: - **A tag editor**, even for files that can't hold tags (MIDI, tracker modules...).
@@ -95,4 +96,4 @@ The AVS visualizer is ported from the source of Advanced Visualization Studio 2.
 
 ---
 
-<sub>Screenshot: [Sintel](https://durian.blender.org) trailer, © Blender Foundation, CC BY 3.0.</sub>
+<sub>Screenshots: [Sintel](https://durian.blender.org) trailer © Blender Foundation, CC BY 3.0. Music by Kevin MacLeod ([incompetech.com](https://incompetech.com)), CC BY 4.0.</sub>

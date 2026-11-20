@@ -36,6 +36,9 @@ let
   colMarker* = c("#ffc857")
   colBookmark* = c("#ff4d4d")
   colLoop* = c("#4dd2ff")
+  colWave* = c("#3a3d46")         ## the seek bar's waveform, not played yet: its peaks
+  colWaveRms* = c("#5c616b")      ## its loudness (RMS)
+  colWavePlayed* = c("#5b4bc4")   ## played: its peaks (its loudness in colAccent)
   colEqualizer* = c("#4f9dff")  ## the controls' equalizer button while it's on
   colError* = c("#ff6b6b")
   colGreen* = c("#5fd068")      ## adds something: Options > Libraries' new library
@@ -63,6 +66,7 @@ let
 const
   MenuBarHeight* = 28'f32
   SeekBarHeight* = 26'f32
+  SeekGripH* = 4'f32   ## the waveform seek bar's top edge, dragged to make it taller
   ControlsHeight* = 38'f32
   StatusHeight* = 24'f32
   PlaylistMinWidth* = 180'f32

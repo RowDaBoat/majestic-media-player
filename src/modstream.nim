@@ -126,6 +126,20 @@ proc prepare*(path: string): string =
     slots[id mod Slots] = Slot(id: id, data: move data)
     result = Protocol & "://" & $id
 
+proc landsAt*(path: string, t: float): float =
+  ## Where a seek to t in the module at path lands with FFmpeg's module
+  ## demuxer, which leaves it to libopenmpt: a row's start, usually after t.
+  ## -1 when libopenmpt is missing or can't read it.
+  result = -1
+  if not loadApi(): return
+  var data: string
+  try: data = readFile(path)
+  except IOError, OSError: return
+  let m = openModule(data)
+  if m == nil: return
+  result = api.setPosition(m, t)
+  api.destroy(m)
+
 proc put32(h: var array[HeaderBytes, byte], at: int, v: uint32) =
   for i in 0 .. 3: h[at + i] = byte((v shr (8 * i)) and 0xff)
 

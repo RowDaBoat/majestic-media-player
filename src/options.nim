@@ -1001,7 +1001,7 @@ proc visualizerPage(ui: Ui, c: var Config, p: var Pane) =
   ui.group(p, "Visualizer")
   ui.checkRow(p, "o-visualizer", "Show the visualizer for sound without a picture", c.showVisualizer)
   ui.hint(p, "AVS presets, playing to what you hear. Add your own .avs files")
-  ui.hint(p, "to the presets folder (right-click the video: Visualizer Preset).")
+  ui.hint(p, "to the presets folder (right-click the video: Visualizer).")
   ui.numberRow(p, "o-avsbeat", "Beat threshold (%)", c.avsBeatThreshold, 5, 0, 400)
   ui.hint(p, "How loud the sound must be for beats: 100 is Winamp's, lower makes quiet music beat")
   ui.hint(p, "(ReplayGain makes it quieter), 0 lets any sound. Presets can still beat by themselves.")

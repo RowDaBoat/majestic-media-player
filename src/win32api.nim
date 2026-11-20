@@ -33,6 +33,7 @@ const
   VK_MBUTTON* = 0x04'i32
   VK_SHIFT* = 0x10'i32
   VK_CONTROL* = 0x11'i32
+  VK_MENU* = 0x12'i32  # Alt
   SM_SWAPBUTTON* = 23'i32
   ASFW_ANY* = -1'i32
   CF_HDROP* = 15'u32

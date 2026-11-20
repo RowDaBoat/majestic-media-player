@@ -8,7 +8,7 @@ import appimage, mpv, videogl, xwin, config, dialogs, theme, ui, menutree, playe
   options, instance, playlists, peers, cmdlines, runlog, mediainfo, inhibit, spherical, keymap, mediactl,
   rectedit, syncdlg, ytdlp, websave, mediasave, mkvtoolnix, updater, ytthumb, ytboard, srv3,
   netprobe, tracker, trackerchart, modstream, midisong, midistream, midichart, rgscan, tagdlg, avsdlg,
-  avsview, plmanager, cue, animpic, library, libtypes, glyphcache, crashlog
+  avsview, plmanager, cue, animpic, library, libtypes, glyphcache, crashlog, waveform
 from coverart import pictures
 from assoc import loadAssocItems
 import wsaud, m2c
@@ -45,6 +45,7 @@ const
   EqMaxGain = 12.0          ## dB at the top of the equalizer's sliders
   EqMinGainLimit = -60.0    ## the lowest its bottom can be set to
   EqSettle = 0.4            ## seconds after an equalizer change it's set for good
+  AvsHistoryMax = 200       ## Visualizer's Previous: how many presets shown it can go back through
   PlaylistRowH = 26'f32
   PlaylistHeaderH = 24'f32  ## column headers
   PlaylistIconW = 28'f32    ## the first column's room for the playing icon
@@ -69,6 +70,7 @@ const
   PlaylistGripW = 5'f32     ## draggable left edge of the playlist
   PlaylistFindH = 30'f32    ## the search bar under the playlist's header (Ctrl+F)
   PlaylistTabH = 26'f32     ## a row of the playlist tabs
+  PlaylistPlusGap = 9'f32   ## the side column's gap above New playlist, its separator inside
   PlaylistTabMinW = 44'f32  ## narrowest a tab gets, and widest:
   PlaylistTabMaxW = 170'f32
   PlaylistTabRenameW = 150'f32  ## a tab being renamed, at least
@@ -362,6 +364,10 @@ type
     sfMovedAt: float          ## when it last paused or was sent elsewhere
     sfWanted: float           ## when stepping last seemed likely
     sfPlainAt: float          ## when it last stepped the plain way
+    ssAt: int64               ## sound only: the sample last stepped to,
+    ssJumps: int              ## while the player's jumps are still these,
+    ssResumes: int            ## it hasn't played since,
+    ssPath: string            ## and its file this
     rbState: BridgeState      ## keyframe bridge (a video playing backward)
     rbKey: string             ## the file, size and look its frames are for
     rbFrames: seq[LoopFrame]  ## the frames just before rbK, in time order
@@ -412,6 +418,7 @@ type
     queue: seq[tuple[tab: int, path: string, at: int]]  ## the playback queue: playlist id, entry and where it was
     tabRects: seq[Rect]       ## the tabs as last drawn, and the + button after them
     tabPlus: Rect
+    tabNew: Rect              ## where rows or files dropped make a new playlist
     tabStrip: Rect
     tabFrom: tuple[index: int, x: float32, moved: bool]  ## the tab pressed, while "pltab" is active (x is y in the side column)
     tabScroll: float32        ## the side column of playlists (playlistTabsSide), scrolled
@@ -615,6 +622,10 @@ type
     qcSetAt: float            ## when it was put on
     chart: TrackerChart       ## the tracker module's chart, in the video frame
     chartDrawn: float         ## when it was last drawn, to pace its scrolling
+    chartT: float             ## the song's time it was last drawn at
+    chartBefore: bool         ## the file before showed the chart (see chartHeld)
+    heldSide: SideTags        ## the .m2c of the file whose chart is held
+    heldSideFor: string
     avs: AvsView              ## the visualizer, for sound without a picture (nil until shown)
     avsArea: Vec2             ## the frame's size it last drew at, in pixels
     soundBefore: bool         ## the file before was sound without a picture (see soundOnly)
@@ -665,6 +676,7 @@ type
     extQueue: seq[string]     ## its external-file cards still to ask about
     extPicks: Table[string, string]  ## the files chosen so far, by card name
     pickWin: Window
+    pickGrabbing: bool        ## the Run window shows the closed hand of a file drag
     pickDropped: seq[string]  ## files dropped on the Run window, added next frame
     pickDropAt: Vec2          ## where (UI units)
     pickSk: Silky
@@ -718,10 +730,18 @@ type
     syncSk: Silky
     syncUi: Ui
     tagDlg: TagDialog         ## the playlist's Properties, its window created on first use
-    avsDlg: AvsDialog         ## Visualizer Preset > Visualizers..., a window of its own
+    avsDlg: AvsDialog         ## Visualizer > Visualizers..., a window of its own
     avsWin: Window            ## shown beside the player, not over it (like the Equalizer)
     avsMenus: MenuSystem      ## its context menus (popups of their own, like the main ones)
     avsMenuOpenedAt: float
+    avsCycleId: string        ## Cycle Presets: the preset playing when last looked,
+    avsCycleClock: float      ## seconds it has played since (not paused, shown),
+    avsCycleTick: float       ## counted from here,
+    avsCycleSong: string      ## and the song it showed for last
+    avsShuffled: seq[string]  ## Shuffle: the presets played this round
+    avsSeen: string           ## Previous / Next: the preset shown when last looked,
+    avsBack: seq[string]      ## the ones shown before it (oldest first), however they came,
+    avsForward: seq[string]   ## and the ones Previous went back from (latest last)
     avsSk: Silky
     avsUi: Ui
     tagWin: Window
@@ -883,6 +903,11 @@ type
     seekDragT: float
     seekRect: Rect            ## seek bar as last drawn
     seekSpan: float           ## seconds the seek bar's width stands for
+    seekGrip: Rect            ## the waveform seek bar's top edge, while drawn
+    seekResizeFrom: (float32, float32)   ## pointer y and the seek bar's height when that drag began
+    wave: Wave                ## the seek bar's waveform, of waveKey's sound
+    waveKey: string           ## the path and audio track it is of; "" none
+    waveCache: seq[(string, Wave)]  ## waveforms decoded whole, the latest last
     padLen: float             ## the delay under way after a short file; 0 none
     padAt: float              ## when it began, or while held the seconds it has run
     padHeld: bool             ## paused during the delay
@@ -983,6 +1008,7 @@ type
     renderNow: bool           ## render the queued frame this iteration
     dirtyUntil: float
     focusLostAt: float        ## when the window lost focus, else 0
+    modSyncAt: float          ## when the focused window's modifiers were last checked
     menuOpenedAt: float       ## when the menus opened, else 0
     fakeMods: string          ## debug scripting: "ctrl", "alt+shift", ...
     inputPending: bool        ## button/key/scroll this iteration; Windy clears
@@ -1035,6 +1061,18 @@ proc trackerFactor(a: App): float =
   result = pow(2.0, a.cfg.trackerPitch / 12)
   if not a.cfg.trackerStretch and a.player.speed > 0: result /= a.player.speed
 
+proc streamModule(a: App): bool =
+  ## Opens the module FFmpeg plays again as a module stream, where it is (its
+  ## time, as it may have just been set); false if it can't be one.
+  let p = a.player
+  let url = modstream.prepare(p.path)
+  if url.len == 0: return false
+  a.tkFactor = a.trackerFactor
+  setPitchFactor(a.tkFactor)
+  p.source = url
+  p.reopen(p.demux)
+  true
+
 proc syncTrackerAudio(a: App) =
   ## The open module's sound as the tracker button has it. FFmpeg plays a
   ## module until a setting differs; then it's opened again as a module
@@ -1050,12 +1088,7 @@ proc syncTrackerAudio(a: App) =
   if not streamed and a.trackerCustom and a.isModule and p.duration > 0 and
      a.tkTried != p.path:
     a.tkTried = p.path
-    let url = modstream.prepare(p.path)
-    if url.len > 0:
-      a.tkFactor = a.trackerFactor
-      setPitchFactor(a.tkFactor)
-      p.source = url
-      p.reopen(p.demux)
+    discard a.streamModule()
     return
   if not streamed: return
   let f = a.trackerFactor
@@ -1081,9 +1114,27 @@ proc chartShown(a: App): bool =
     a.chart.song.path == a.player.path and a.player.loaded and not a.player.stopped and
     not a.player.hasVideo and a.chart.song.marks.len > 0
 
+proc thumbShown(a: App): bool
+
+proc chartHeld(a: App): bool =
+  ## The chart of the file before stays up, as last drawn, while the next
+  ## file opens, until that one shows a chart of its own or turns out to have
+  ## none (or a picture): no frame of the visualizer between two songs. A
+  ## module's chart can only open once mpv has named the file's format. Not
+  ## for a link, which has no chart and may take seconds to open.
+  let c = a.chart
+  let p = a.player
+  a.chartBefore and a.cfg.showTrackerChart and c != nil and c.song != nil and
+    c.song.path != p.path and c.song.marks.len > 0 and p.switching and
+    not p.path.contains("://") and
+    (p.loaded or p.opening) and not p.stopped and not p.hasVideo and not a.thumbShown
+
 proc soundOnly(a: App): bool
 proc avsShown(a: App): bool
 proc avsStep(a: App, how: int)
+proc noteAvs(a: App)
+proc setAvsCycle(a: App, on: bool)
+proc cycleAvs(a: App, shown: bool)
 proc showAvsList(a: App)
 proc addAvs(a: App, paths: seq[string])
 proc avsRateMenu(a: App, m: MenuNode, ids: seq[string])
@@ -1096,16 +1147,25 @@ proc pollTracker(a: App) =
   a.syncTrackerAudio()
   if a.chart == nil: a.chart = TrackerChart()
   let c = a.chart
-  if c.song != nil and (c.song.path != p.path or not p.loaded):
+  if not p.switching: a.chartBefore = a.chartShown
+  let held = a.chartHeld
+  if not held: a.heldSideFor = ""
+  elif a.heldSideFor != c.song.path:
+    # Its .m2c as the chart was drawn with, the playing file's being the next one's.
+    a.heldSideFor = c.song.path
+    a.heldSide = if a.sideFor == c.song.path: a.sideTags else: readSide(c.song.path)
+  if c.song != nil and (c.song.path != p.path or not p.loaded) and not held:
     c.close()
   if c.tried != p.path: c.tried = ""  # another file: this one may be opened again later
   let midi = a.isMidi
   if not (module or midi) or not a.cfg.showTrackerChart or p.stopped: return
-  if c.song == nil and c.tried != p.path:
+  if (c.song == nil or c.song.path != p.path) and c.tried != p.path:
     c.tried = p.path
-    c.song = if midi: openMidiChart(openMidi(p.path), a.midiFont) else: openTracker(p.path)
+    let song = if midi: openMidiChart(openMidi(p.path), a.midiFont) else: openTracker(p.path)
+    c.close()  # the one held for the file before
+    c.song = song
     a.dirtyUntil = max(a.dirtyUntil, now() + 0.1)
-  if c.song == nil: return
+  if c.song == nil or c.song.path != p.path: return
   if c.song.build(0.004): a.dirtyUntil = max(a.dirtyUntil, now() + 0.02)
   let t = now()
   if p.playing and t - a.chartDrawn >= 1 / 144:
@@ -1149,8 +1209,14 @@ proc entryExists(path: string): bool =
   ## whose sheet and audio file are there.
   path.contains("://") or fileExists(path) or path.cueEntryExists
 
+proc seekBarH(a: App): float32 =
+  ## The seek bar's height: taller with its waveform, as dragged by its top
+  ## edge, never shorter than without it.
+  if a.cfg.seekWaveform: max(SeekBarHeight, round(a.cfg.waveformHeight).float32)
+  else: SeekBarHeight
+
 proc bottomHeight(a: App): float32 =
-  (if a.cfg.showSeekBar: SeekBarHeight else: 0) +
+  (if a.cfg.showSeekBar: a.seekBarH else: 0) +
   (if a.cfg.showControls: ControlsHeight else: 0) +
   (if a.cfg.showStatus: StatusHeight else: 0)
 
@@ -3202,12 +3268,20 @@ proc playButton(a: App) =
 
 proc seekTo(a: App, t: float, exact = true) =
   if a.padLen > 0 and t >= a.player.duration: return  # already there, waiting
+  var at = a.clampTime(t)
   if not a.slaveDo("seek", $(t - a.followOffset), $exact):
     a.player.stopped = false
-    a.player.seek(a.clampTime(t), exact)
+    a.player.seek(at, exact)
+    # A module FFmpeg plays lands on a row's start, usually after the time
+    # asked for: that's the time to show (paused, held as soundHold).
+    if exact and a.isModule and not a.moduleStreamed:
+      let row = modstream.landsAt(a.player.path, at)
+      if row >= 0:
+        at = row
+        a.player.holdSoundAt(row)
     a.syncSend("seek", $t, $exact)
   if exact:
-    a.player.landOn(a.clampTime(t))
+    a.player.landOn(at)
     a.dirtyUntil = max(a.dirtyUntil, now() + LandingWait + 0.1)
 
 proc goToEnd(a: App) =
@@ -3701,6 +3775,65 @@ proc pollYtInfo(a: App) =
   j.infos.setLen 0
   if not j.running: a.ytInfo = nil
 
+proc waveTrack(a: App): tuple[stream: int, file: string, id: int] =
+  ## The audio track playing: its place among the file's own audio streams,
+  ## or an added track's file; id 0 when none plays.
+  var n = 0
+  for t in a.player.tracks:
+    if t.kind != "audio": continue
+    if t.selected: return (if t.external: (0, t.file, t.id) else: (n, "", t.id))
+    if not t.external: inc n
+
+proc waveSource(a: App): WaveSource =
+  ## What the seek bar's waveform shows: the sound playing, as decoded from
+  ## the file (a cue track's stretch of its album's), else file "": a link,
+  ## no audio track playing.
+  let p = a.player
+  let (stream, ext, id) = a.waveTrack
+  if id == 0: return
+  result = WaveSource(duration: p.duration, stream: stream)
+  if ext.len > 0:
+    if not ext.contains("://"): result.file = ext
+  elif p.path.contains("://"): discard
+  elif a.isMidi:
+    if a.midiFont.len > 0: (result.file, result.font) = (p.path, a.midiFont)
+  elif p.path.isCueEntry:
+    let (sheet, i) = p.path.cueTrack
+    if i >= 0:
+      let (start, length) = sheet.span(i)
+      (result.file, result.start, result.length) = (sheet.audio, start, max(0.0, length))
+  else: result.file = p.path
+
+proc pollWaveform(a: App) =
+  ## Keeps the seek bar's waveform that of the sound playing, while shown:
+  ## decoded anew for another file or audio track (or taken from the last
+  ## few decoded), and redrawn as it fills.
+  let p = a.player
+  let key =
+    if not (a.cfg.seekWaveform and a.cfg.showSeekBar and p.loaded) or p.opening or
+       p.duration <= 0: ""
+    else:
+      let tr = a.waveTrack
+      if tr.id == 0: "" else: p.path & "\x00" & $tr.id & "\x00" & tr.file
+  if key != a.waveKey:
+    let old = a.wave
+    if old != nil and old.done and old.error.len == 0 and
+       a.waveCache.allIt(it[0] != a.waveKey):
+      a.waveCache.add (a.waveKey, old)
+      if a.waveCache.len > 4: a.waveCache.delete 0
+    elif old != nil and not old.done: waveform.cancel()
+    a.waveKey = key
+    a.wave = nil
+    if key.len > 0:
+      for (k, wv) in a.waveCache:
+        if k == key: a.wave = wv
+      if a.wave == nil:
+        let src = a.waveSource
+        if src.file.len > 0: a.wave = waveform.request(src)
+    a.dirtyUntil = max(a.dirtyUntil, now() + 0.05)
+  if a.wave != nil and a.wave.poll():
+    a.dirtyUntil = max(a.dirtyUntil, now() + 0.05)
+
 proc pollProbe(a: App) =
   ## Collects a finished background probe and redraws to show it.
   if a.prober == nil or a.prober.pending.len == 0: return
@@ -4110,11 +4243,72 @@ proc applyNoVideo(a: App) =
   a.player.setNoVideo(a.cfg.noVideo)
   if a.standby != nil: a.standby.setNoVideo(a.cfg.noVideo)
 
+proc stepsSamples(a: App): bool =
+  ## No frames to step (no video track on, or only a cover): the frame keys
+  ## step the sound's samples instead.
+  let p = a.player
+  p.loaded and p.tracks.anyIt(it.kind == "audio" and it.selected) and
+    not p.tracks.anyIt(it.kind == "video" and it.selected and not it.albumArt)
+
+proc sampleStep(a: App, forward: bool) =
+  ## Pauses a sample after (or before) the one heard, at the rate the sound
+  ## is decoded at.
+  let p = a.player
+  var rate = p.audioRate
+  if rate <= 0:
+    for t in p.tracks:
+      if t.kind == "audio" and t.selected: rate = t.sampleRate
+  if rate <= 0: return
+  let r = rate.float
+  let last = max(int64(ceil(p.duration * r - 1e-6)) - 1, 0)
+  # From the sample last stepped to while nothing else moved the player or
+  # played; else where a jump went while it hasn't played since (paused,
+  # mpv's time lags it by the output's latency: Player.noteTarget); else
+  # mpv's time.
+  let held = p.heldTarget
+  var n = if a.ssPath == p.path and a.ssJumps == p.jumps and a.ssResumes == p.resumes and
+             not p.backward: a.ssAt
+          elif held >= 0:
+            # FFmpeg's module seeks land on a row's start instead.
+            let at = if a.isModule and not a.moduleStreamed: modstream.landsAt(p.path, held) else: -1.0
+            int64(round((if at >= 0: at else: held) * r))
+          elif p.eofReached: last
+          else: int64(round(p.timePos * r))
+  let was = n
+  n += (if forward: 1 else: -1)
+  if p.duration > 0: n = min(n, last)
+  n = max(n, 0)
+  if n == was and p.paused: return
+  p.stopped = false
+  p.keepAtEnd()
+  if not p.paused:
+    p.pause()
+    p.paused = true  # mpv is by the seek: it takes them in order
+  # A quarter sample in: mpv drops the decoded samples before the time asked
+  # for, rounding down.
+  let t = (n.float + 0.25) / r
+  var reopened = false
+  if a.isModule and not a.moduleStreamed:
+    # FFmpeg's module seeks land on the next row's start: the module stream
+    # lands on the sample. It opens there, and the module stays one.
+    let was = p.timePos
+    p.timePos = t
+    reopened = a.streamModule()
+    if not reopened: p.timePos = was
+  if not reopened: p.seek(t, digits = 9)
+  p.landOn(t)
+  (a.ssAt, a.ssJumps, a.ssResumes, a.ssPath) = (n, p.jumps, p.resumes, p.path)
+  a.osd("Sample " & insertSep($n, ',') & " (" & fmtTime(t, millis = true, p.duration) & ")")
+  a.syncSend("frame", $forward, $t)
+
 proc frameStep(a: App, forward: bool) =
   let p = a.player
   if not p.loaded: return
   if a.isSlave:  # the master steps, if it can; then the group goes with it
     a.peers.send(a.syncMaster, "frame", $forward)
+    return
+  if a.stepsSamples:
+    a.sampleStep(forward)
     return
   if a.atStepEdge(forward): return
   p.stopped = false
@@ -4220,6 +4414,7 @@ proc chapterStep(a: App, d: int) =
       if j >= 0 and j < p.chapters.len: a.seekTo(p.chapters[j].time)
       return
     inc p.jumps
+    p.noteChapterJump()
     if a.osdApart:
       p.h.commandStr("add chapter " & $d)
       p.expandText("Chapter: ${chapter}")
@@ -10373,7 +10568,7 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
     a.setCompact(not a.cfg.compactMode))
   view.check("Seek Bar", k(kaSeekBar), cfg.showSeekBar, action = proc () =
     a.cfg.showSeekBar = not a.cfg.showSeekBar
-    a.resizeKeepingVideo(ivec2(0, int32(if a.cfg.showSeekBar: SeekBarHeight else: -SeekBarHeight))))
+    a.resizeKeepingVideo(ivec2(0, int32(if a.cfg.showSeekBar: a.seekBarH else: -a.seekBarH))))
   view.check("Controls", k(kaControls), cfg.showControls, action = proc () =
     a.cfg.showControls = not a.cfg.showControls
     a.resizeKeepingVideo(ivec2(0, int32(if a.cfg.showControls: ControlsHeight else: -ControlsHeight))))
@@ -10481,8 +10676,11 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
     action = proc () = a.playPause())
   play.item("Stop", k(kaStop), enabled = loaded, action = proc () = a.stop())
   let (playPause, stop) = (play.children[0], play.children[1])
-  play.item("Frame Forward", k(kaFrameForward), enabled = loaded, action = proc () = a.frameStep(true))
-  play.item("Frame Back", k(kaFrameBack), enabled = loaded, action = proc () = a.frameStep(false))
+  let samples = a.stepsSamples
+  play.item(if samples: "Next Sample" else: "Frame Forward", k(kaFrameForward), enabled = loaded,
+    action = proc () = a.frameStep(true))
+  play.item(if samples: "Previous Sample" else: "Frame Back", k(kaFrameBack), enabled = loaded,
+    action = proc () = a.frameStep(false))
   play.item(&"Fast-Forward (+{a.cfg.rateStep:g}x)", k(kaFaster), enabled = loaded,
     action = proc () = a.changeRate(1))
   play.item(&"Slow Down (-{a.cfg.rateStep:g}x)", k(kaSlower), enabled = loaded,
@@ -10635,7 +10833,6 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
       if first: run.sep()
       first = false
       run.item(c.title, action = bindAct(runOne, c))
-  run.markListed(1)  # the command lines, after Commands...
 
   # Help
   let help = root.sub("Help")
@@ -10696,12 +10893,15 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
       a.cfg.save()
       a.dirtyUntil = max(a.dirtyUntil, now() + 0.1))
     if a.avsShown and a.avs != nil:
-      let pre = ctx.sub("Visualizer Preset")
+      let pre = ctx.sub("Visualizer")
       pre.item("Visualizers...", action = proc () = a.showAvsList())
       pre.sep()
       pre.item("Next", action = proc () = a.avsStep(1))
       pre.item("Previous", action = proc () = a.avsStep(-1))
       pre.item("Random", action = proc () = a.avsStep(0))
+      # How it cycles is set in Visualizers...
+      pre.check("Cycle Presets", checked = a.cfg.avsCycle, action = proc () =
+        a.setAvsCycle(not a.cfg.avsCycle))
       if a.avs.current >= 0:
         pre.sep()
         let rates = pre.sub("Frame Rate")
@@ -10871,6 +11071,15 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
     sb.item("Clear Loop", enabled = a.hasLoopA or a.hasLoopB, action = proc () =
       a.clearLoopMarks(); a.osd("Loop cleared"))
     sb.sep()
+    # The video frame keeps its size, as with View > Seek Bar.
+    sb.check("Waveform", checked = a.cfg.seekWaveform, action = proc () =
+      let before = a.seekBarH
+      a.cfg.seekWaveform = not a.cfg.seekWaveform
+      a.resizeKeepingVideo(ivec2(0, int32(a.seekBarH - before)))
+      a.cfg.save())
+    sb.check("Show Marks", checked = a.cfg.seekMarks, action = proc () =
+      a.cfg.seekMarks = not a.cfg.seekMarks
+      a.cfg.save())
     sb.check("Bookmarks as chapters", checked = a.cfg.bookmarksAsChapters, action = proc () =
       a.cfg.bookmarksAsChapters = not a.cfg.bookmarksAsChapters
       a.cfg.save())
@@ -11184,6 +11393,9 @@ const
   ## Other names that find a command as well as its own.
   PaletteAliases = [(PaletteAvs, "Switch Visualizer"),
     ("View" & PaletteSep & "Search Library", "Find Library")]
+  ## Other first words for the commands in a menu that start with a word:
+  ## (menu, word, alias), "Join videos" found as "Concatenate videos" too.
+  PaletteWordAliases = [("Run", "Join", "Concatenate")]
 
 proc runAction(a: App, act: KeyAction)  # below
 proc trackerButton(a: App): bool  # below
@@ -11400,6 +11612,10 @@ proc paletteFind(a: App): seq[PaletteItem] =
     for (key, alias) in PaletteAliases:
       if it.paletteKey == key:
         score = max(score, searchScore(alias, where & " " & it.shortcut, a.palText))
+    for (menu, word, alias) in PaletteWordAliases:
+      if it.path == @[menu] and it.label.startsWith(word & " "):
+        let label = alias & it.label[word.len .. ^1]
+        score = max(score, searchScore(label, where & " " & it.shortcut, a.palText))
     if score < 0: continue
     if it.kind == mkSub:
       score += PaletteSubBonus
@@ -12763,8 +12979,8 @@ proc soundOnly(a: App): bool =
 proc avsShown(a: App): bool =
   ## The visualizer plays in the frame: sound without a picture (no video
   ## track, cover, chart or thumbnail), playing or paused.
-  a.cfg.showVisualizer and a.soundOnly and not a.chartShown and not a.thumbShown and
-    not a.holding
+  a.cfg.showVisualizer and a.soundOnly and not a.chartShown and not a.chartHeld and
+    not a.thumbShown and not a.holding
 
 proc avsGain(a: App): float32 =
   ## The tap hears mpv's output, after its volume (cubic): this undoes it, so
@@ -12805,6 +13021,10 @@ proc renameAvs(a: App, old, new: string) =
     a.cfg.avsDisabled.keepItIf(it != old)
     if new notin a.cfg.avsDisabled: a.cfg.avsDisabled.add new
   if a.cfg.avsPreset == old: a.cfg.avsPreset = new
+  for h in [addr a.avsBack, addr a.avsForward]:
+    for it in h[].mitems:
+      if it == old: it = new
+  if a.avsSeen == old: a.avsSeen = new
   template moveKey(t: untyped) =
     if old in t:
       if new notin t: t[new] = t[old]
@@ -12858,22 +13078,123 @@ proc pollAvs(a: App) =
     if not a.avs.selectId(a.cfg.avsPreset): discard a.avs.randomPreset()
     if a.avs.current >= 0: a.cfg.avsPreset = a.avs.presets[a.avs.current]
   let p = a.player
+  a.cycleAvs(shown)
+  a.noteAvs()
   if a.avs.update(shown, a.avsArea, a.avsGain, p.timePos * 1000, p.duration, a.cfg.avsBeatThreshold,
       a.cfg.avsBeatSensitivity):
     a.dirtyUntil = max(a.dirtyUntil, now() + 0.001)
 
+proc noteAvs(a: App) =
+  ## Previous / Next's history: a preset shown in place of another, by any
+  ## means (Cycle Presets, the menu, Visualizers...), puts that one on the
+  ## way back and forgets the way forward.
+  if a.avs == nil or a.avs.current < 0: return
+  let id = a.avs.presets[a.avs.current]
+  if id == a.avsSeen: return
+  if a.avsSeen.len > 0:
+    a.avsBack.add a.avsSeen
+    if a.avsBack.len > AvsHistoryMax: a.avsBack.delete(0)
+  a.avsForward.setLen 0
+  a.avsSeen = id
+
+proc avsHistoryStep(a: App, back: bool): bool =
+  ## Previous: the preset shown before this one; Next after Previous: the one
+  ## it went back from. Presets turned off or gone since are passed over.
+  a.noteAvs()
+  let v = a.avs
+  while (if back: a.avsBack.len > 0 else: a.avsForward.len > 0):
+    let id = if back: a.avsBack.pop() else: a.avsForward.pop()
+    let i = v.presets.find(id)
+    if id == a.avsSeen or i < 0 or not v.enabled(i) or not v.select(i): continue
+    if back: a.avsForward.add a.avsSeen else: a.avsBack.add a.avsSeen
+    a.avsSeen = id
+    return true
+
 proc avsStep(a: App, how: int) =
-  ## Next (1), previous (-1) or a random (0) preset, named on the OSD.
+  ## Next (1), previous (-1) or a random (0) preset, named on the OSD. Previous
+  ## goes back through the presets shown, Next forward again after it; past
+  ## either end they go by the list (Previous's still retraced by Next).
   if a.avs == nil: return
-  let ok = if how == 0: a.avs.randomPreset() else: a.avs.step(how)
+  var ok = how != 0 and a.avsHistoryStep(back = how < 0)
+  if not ok:
+    ok = if how == 0: a.avs.randomPreset() else: a.avs.step(how)
+    if ok and how < 0:
+      if a.avsSeen.len > 0: a.avsForward.add a.avsSeen
+      a.avsSeen = a.avs.presets[a.avs.current]
   if ok:
     a.cfg.avsPreset = a.avs.presets[a.avs.current]
     a.cfg.save()
     a.osd(presetName(a.cfg.avsPreset))
   elif not toSeq(0 ..< a.avs.presets.len).anyIt(a.avs.enabled(it)):
-    a.osd("Every preset is turned off (Visualizer Preset > Visualizers...)")
+    a.osd("Every preset is turned off (Visualizer > Visualizers...)")
 
-# --- Visualizer Preset > Visualizers... ----------------------------------------
+proc cycleAvsStep(a: App): bool =
+  ## Cycle Presets' next preset, in its order: Shuffle plays each preset
+  ## turned on once before any comes again (a new round never starts with
+  ## the one playing).
+  let v = a.avs
+  case a.cfg.avsCycleOrder
+  of acIncremental: result = v.step(1)
+  of acDecremental: result = v.step(-1)
+  of acShuffle:
+    let cur = if v.current >= 0: v.presets[v.current] else: ""
+    if cur.len > 0 and cur notin a.avsShuffled: a.avsShuffled.add cur
+    var pool: seq[int]
+    for i in 0 ..< v.presets.len:
+      if v.enabled(i) and v.presets[i] notin a.avsShuffled: pool.add i
+    if pool.len == 0:  # a new round
+      a.avsShuffled = if cur.len > 0: @[cur] else: @[]
+      for i in 0 ..< v.presets.len:
+        if v.enabled(i) and i != v.current: pool.add i
+    if pool.len == 0: return false
+    let i = pool[rand(pool.high)]
+    a.avsShuffled.add v.presets[i]
+    result = v.select(i)
+  if result:
+    a.cfg.avsPreset = v.presets[v.current]
+    a.cfg.save()
+
+proc cycleAvs(a: App, shown: bool) =
+  ## Cycle Presets: a new preset as a song starts (`avsCyclePerSong`), or
+  ## after `avsCycleSeconds` of one playing, counted while the visualizer
+  ## shows and isn't paused, from 0 again whenever the preset changes (by
+  ## hand too).
+  let t = now()
+  # A long gap between frames (none were drawn) isn't counted.
+  let dt = if a.avsCycleTick > 0 and t - a.avsCycleTick in 0.0 .. 0.5: t - a.avsCycleTick else: 0.0
+  a.avsCycleTick = t
+  let v = a.avs
+  if not shown or v.current < 0: return
+  let id = v.presets[v.current]
+  if id != a.avsCycleId: (a.avsCycleId, a.avsCycleClock) = (id, 0.0)
+  let p = a.player
+  # Followed with the cycling off too, so turning it on doesn't count the
+  # song playing as a new one.
+  let song = if p.loaded and not p.switching: p.path else: a.avsCycleSong
+  let newSong = song != a.avsCycleSong and a.avsCycleSong.len > 0
+  a.avsCycleSong = song
+  if not a.cfg.avsCycle: return
+  if a.cfg.avsCyclePerSong:
+    if not newSong: return
+  else:
+    if not p.paused: a.avsCycleClock += dt
+    if a.avsCycleClock < a.cfg.avsCycleSeconds: return
+  a.avsCycleClock = 0
+  if a.cycleAvsStep():
+    a.avsCycleId = a.cfg.avsPreset
+    if a.cfg.avsCycleFollow and a.avsDlg != nil: a.avsDlg.jumpTo(a.cfg.avsPreset)
+    a.dirtyUntil = max(a.dirtyUntil, now() + 0.1)
+
+proc setAvsCycle(a: App, on: bool) =
+  ## Cycle Presets on or off; on, the preset playing gets its full time.
+  a.cfg.avsCycle = on
+  a.cfg.save()
+  a.avsCycleClock = 0
+  a.osd(if not on: "Cycle Presets: off"
+        elif a.cfg.avsCyclePerSong: "Cycle Presets: once per song"
+        else: "Cycle Presets: every " & $int(round(a.cfg.avsCycleSeconds)) & " s")
+
+# --- Visualizer > Visualizers... ----------------------------------------
 
 proc showAvsList(a: App) =
   ## Shows the presets' window, or brings it up, scrolled to the preset
@@ -13288,19 +13609,24 @@ proc seekBarContext(a: App, pos: Vec2) =
   if dur <= 0 or not a.player.loaded: return
   a.ctxSeekT = min(clamp((pos.x - x0) / w, 0, 1) * span, dur)
   a.ctxBookmark = -1
+  # Marks hidden (Show Marks off) aren't picked: all but an active loop's.
+  let marks = a.cfg.seekMarks
+  let loops = marks or a.abLoop and a.loopReady
   var best = max(a.cfg.snapDistance, 4)
-  for i, b in a.fileBookmarks:
-    let d = abs(x0 + w * (b.time / span) - pos.x)
-    if d <= best:
-      best = d
-      a.ctxBookmark = i
+  if marks:
+    for i, b in a.fileBookmarks:
+      let d = abs(x0 + w * (b.time / span) - pos.x)
+      if d <= best:
+        best = d
+        a.ctxBookmark = i
   # Nearest chapter, bookmark or loop mark, for the loop marks.
   a.ctxOnMarker = a.ctxBookmark >= 0
   if a.ctxOnMarker: a.ctxMarkerT = a.fileBookmarks[a.ctxBookmark].time
   var times: seq[float]
-  for c in a.player.chapters: times.add c.time
-  if a.hasLoopA: times.add a.loopA
-  if a.hasLoopB: times.add a.loopB
+  if marks:
+    for c in a.player.chapters: times.add c.time
+  if a.hasLoopA and loops: times.add a.loopA
+  if a.hasLoopB and loops: times.add a.loopB
   for mt in times:
     let d = abs(x0 + w * (mt / span) - pos.x)
     if d < best or (d <= best and not a.ctxOnMarker):
@@ -13328,6 +13654,30 @@ proc heldRanges(a: App): seq[(float, float)] =
       result[^1][1] = max(result[^1][1], s[1])
     else: result.add s
 
+proc drawWave(a: App, wv: Wave, x0, x1: float32, dur: float, cy, half, playX: float32) =
+  ## The seek bar's waveform from x0 (the start) to x1 (dur), a column per
+  ## unit: the peaks dim, the loudness (RMS) bright over them, played up to
+  ## playX in the accent's colors. Past what's decoded, the bare midline.
+  let ui = a.ui
+  let cols = int(x1 - x0)
+  ui.rect(rect(x0, cy - 0.5, x1 - x0, 1), colTrack)
+  if cols <= 0 or wv.peak.len == 0 or dur <= 0: return
+  let top = max(wv.top, 0.05)  # silence stays flat
+  for i in 0 ..< cols:
+    let b0 = int(dur * i.float / cols.float / wv.bucket)
+    if b0 >= wv.peak.len: break
+    let b1 = min(wv.peak.len, max(b0 + 1, int(ceil(dur * float(i + 1) / cols.float / wv.bucket))))
+    var (pk, rm) = (0'f32, 0'f32)
+    for b in b0 ..< b1:
+      pk = max(pk, wv.peak[b])
+      rm = max(rm, wv.rms[b])
+    let x = x0 + i.float32
+    let played = x < playX
+    let ph = round(min(1, pk / top) * half)
+    let rh = round(min(1, rm / top) * half)
+    if ph > 0: ui.rect(rect(x, cy - ph, 1, ph * 2), if played: colWavePlayed else: colWave)
+    if rh > 0: ui.rect(rect(x, cy - rh, 1, rh * 2), if played: colAccent else: colWaveRms)
+
 proc seekBar(a: App, r: Rect) =
   let ui = a.ui
   let p = a.player
@@ -13337,6 +13687,24 @@ proc seekBar(a: App, r: Rect) =
   let w = r.w - 24
   let cy = r.y + r.h / 2
   let dur = p.duration
+  # Waveform: its top edge, dragged up, makes the bar taller (never shorter
+  # than without it); the video frame gives the room.
+  let waveOn = a.cfg.seekWaveform
+  if waveOn:
+    a.seekGrip = rect(r.x, r.y, r.w, SeekGripH)
+    if ui.hover(a.seekGrip) and ui.pressed() and not a.seekDragging:
+      ui.activeId = "seekresize"
+      a.seekResizeFrom = (ui.mouse.y, r.h)
+      ui.consumeClick()
+    if ui.activeId == "seekresize":
+      let (y0, h0) = a.seekResizeFrom
+      let others = a.bottomHeight - r.h +
+        (if a.fullscreen: 0'f32 else: a.menuBarHeight + (if a.cfg.showRunLog: a.runLogHeight else: 0))
+      a.cfg.waveformHeight = clamp(h0 - (ui.mouse.y - y0), SeekBarHeight,
+        max(SeekBarHeight, ui.size.y - others - MinWindow.y.float32 / 2))
+  let half = round((r.h - 12) / 2)  # the waveform's, above and below cy
+  let wv = if waveOn and a.wave != nil and a.waveKey.len > 0: a.wave else: nil
+  let showWave = wv != nil and wv.peak.len > 0 and dur > 0 and p.loaded
   # A short file's delay takes up the bar past its end.
   let pad = if a.padLen > 0: a.padLen else: a.shortAudioPad
   let span = dur + pad
@@ -13345,16 +13713,11 @@ proc seekBar(a: App, r: Rect) =
   # The bar spans the window's width, so leaving it sideways leaves the window
   # too, and Windy keeps reporting the last pointer position from inside it.
   let mouseIn = ui.fakeMouse.x >= 0 or a.window.mouseInside
-  let hov = (ui.hover(r) and mouseIn or active) and dur > 0 and p.loaded
+  let barR = if waveOn: rect(r.x, r.y + SeekGripH, r.w, r.h - SeekGripH) else: r
+  let hov = (ui.hover(barR) and mouseIn and ui.activeId != "seekresize" or active) and
+    dur > 0 and p.loaded
   let th = if hov: 6'f32 else: 4'f32
   let endX = if span > 0: round(x0 + w * (dur / span)) else: x0 + w
-  ui.rect(rect(x0, cy - th / 2, endX - x0, th), colTrack)
-  let held = a.heldRanges
-  if dur > 0 and p.loaded:
-    # What has been read ahead, beneath the played part.
-    for (bs, be) in held:
-      let bx = x0 + w * clamp(bs / span, 0, 1)
-      ui.rect(rect(bx, cy - th / 2, x0 + w * clamp(be / span, 0, 1) - bx, th), colBuffered)
   let landing = p.landingOn
   let cur = if active: a.seekDragT
             elif landing >= 0: landing
@@ -13362,8 +13725,18 @@ proc seekBar(a: App, r: Rect) =
             elif pad > 0 and p.eofReached or a.atLastFrame: dur
             else: p.timePos
   let frac = if dur > 0: clamp(cur / span, 0, 1) else: 0
-  ui.rect(rect(x0, cy - th / 2, min(w * frac, endX - x0), th), colAccent)
-  if dur > 0 and p.loaded and p.path.isWebLink:
+  let held = a.heldRanges
+  if showWave:
+    a.drawWave(wv, x0, endX, dur, cy, half, x0 + w * frac)
+  else:
+    ui.rect(rect(x0, cy - th / 2, endX - x0, th), colTrack)
+    if dur > 0 and p.loaded:
+      # What has been read ahead, beneath the played part.
+      for (bs, be) in held:
+        let bx = x0 + w * clamp(bs / span, 0, 1)
+        ui.rect(rect(bx, cy - th / 2, x0 + w * clamp(be / span, 0, 1) - bx, th), colBuffered)
+    ui.rect(rect(x0, cy - th / 2, min(w * frac, endX - x0), th), colAccent)
+  if dur > 0 and p.loaded and p.path.isWebLink and not showWave:
     # What a link's download jumped over, up to as far as it got: stripes, in
     # the played part's color left of the knob.
     let reach = max(p.timePos, if held.len > 0: held[^1][1] else: 0)
@@ -13387,27 +13760,35 @@ proc seekBar(a: App, r: Rect) =
     ui.rect(rect(endX - 5, cy - 7, 4, 2), colText)
     ui.rect(rect(endX - 5, cy + 5, 4, 2), colText)
 
+  # Marks span the waveform's height; without it, a little over the bar's.
+  let markH = if showWave: half + 1 else: 0'f32
+  # Show Marks off hides all but an active loop's.
+  let marks = a.cfg.seekMarks
+  let loopOn = a.abLoop and a.loopReady
   # A-B loop: the looped span when active, and each mark set.
   if dur > 0 and p.loaded:
-    if a.abLoop and a.loopReady:
+    if loopOn:
       let (lx, rx) = (x0 + w * (a.loopA / span), x0 + w * (a.loopB / span))
-      ui.rect(rect(lx, cy + th / 2 + 2, rx - lx, 2), colLoop)
-    for (has, lt) in [(a.hasLoopA, a.loopA), (a.hasLoopB, a.loopB)]:
-      if has:
-        let lx = round(x0 + w * (lt / span))
-        ui.rect(rect(lx - 1, cy - 9, 2, 18), colLoop)
+      ui.rect(rect(lx, cy + max(th / 2, markH) + 2, rx - lx, 2), colLoop)
+    if marks or loopOn:
+      for (has, lt) in [(a.hasLoopA, a.loopA), (a.hasLoopB, a.loopB)]:
+        if has:
+          let lx = round(x0 + w * (lt / span))
+          let lh = max(9'f32, markH)
+          ui.rect(rect(lx - 1, cy - lh, 2, lh * 2), colLoop)
 
   # Markers: chapters, bookmarks and loop marks, all snapped to. Loop marks
-  # are drawn above, and name the hover label only while snapped to. The last
-  # field: it names the hover label up to the next one, as a chapter does.
-  var markers: seq[(float, string, ColorRGBX, bool, bool)]
+  # are drawn above, and name the hover label only while snapped to. The
+  # fifth field: it names the hover label up to the next one, as a chapter
+  # does. The last: it's shown, so drawn and snapped to.
+  var markers: seq[(float, string, ColorRGBX, bool, bool, bool)]
   for i, c in p.chapters:
-    markers.add (c.time, (if c.title.len > 0: c.title else: &"Chapter {i + 1}"), colMarker, false, true)
+    markers.add (c.time, (if c.title.len > 0: c.title else: &"Chapter {i + 1}"), colMarker, false, true, marks)
   for i, b in a.fileBookmarks:
-    markers.add (b.time, b.label(i), colBookmark, false, a.cfg.bookmarksAsChapters)
-  if a.hasLoopA: markers.add (a.loopA, "Loop A", colLoop, true, false)
-  if a.hasLoopB: markers.add (a.loopB, "Loop B", colLoop, true, false)
-  markers.sort(proc (x, y: (float, string, ColorRGBX, bool, bool)): int = cmp(x[0], y[0]))
+    markers.add (b.time, b.label(i), colBookmark, false, a.cfg.bookmarksAsChapters, marks)
+  if a.hasLoopA: markers.add (a.loopA, "Loop A", colLoop, true, false, marks or loopOn)
+  if a.hasLoopB: markers.add (a.loopB, "Loop B", colLoop, true, false, marks or loopOn)
+  markers.sort(proc (x, y: (float, string, ColorRGBX, bool, bool, bool)): int = cmp(x[0], y[0]))
 
   # While the seek bar's context menu is open, the hover label and thumbnail
   # stay where it was opened.
@@ -13420,6 +13801,7 @@ proc seekBar(a: App, r: Rect) =
     if a.cfg.snapWithShift == a.window.shift:
       var best = a.cfg.snapDistance
       for i, m in markers:
+        if not m[5]: continue
         let d = abs(x0 + w * (m[0] / span) - mx)
         if d <= best:
           best = d
@@ -13428,14 +13810,20 @@ proc seekBar(a: App, r: Rect) =
 
   for i, m in markers:
     if dur <= 0: break
+    if not m[5]: continue
     let mx = round(x0 + w * (m[0] / span))
     let hl = i == snapped
     if m[3] and not hl: continue
-    ui.rect(rect(mx - (if hl: 1.5 else: 1), cy - (if hl: 8 else: 6), (if hl: 3 else: 2), (if hl: 16 else: 12)),
+    let mh = max(if hl: 8'f32 else: 6'f32, markH + (if hl: 1 else: 0))
+    ui.rect(rect(mx - (if hl: 1.5 else: 1), cy - mh, (if hl: 3 else: 2), mh * 2),
       if hl: colWhite else: m[2])
 
   if dur > 0 and p.loaded:
-    ui.icon("knob16", vec2(x0 + w * frac, cy), colWhite)
+    if showWave:
+      # A playhead across the waveform for a knob.
+      ui.rect(rect(round(x0 + w * frac) - 1, cy - half - 2, 2, half * 2 + 4), colWhite)
+    else:
+      ui.icon("knob16", vec2(x0 + w * frac, cy), colWhite)
 
   if hov and not active and ui.released(MouseRight):
     a.seekBarContext(ui.mouse)
@@ -13470,12 +13858,13 @@ proc seekBar(a: App, r: Rect) =
     if snapped >= 0: label.add "  " & markers[snapped][1]
     else:
       # Not snapping: a bookmark under the pointer still names itself, by the
-      # reach the context menu picks markers with.
+      # reach the context menu picks markers with. The chapter the time is in
+      # names itself even with the marks hidden.
       var on = -1
       var best = max(a.cfg.snapDistance, 4)
       for i, m in markers:
         let d = abs(x0 + w * (m[0] / span) - mx)
-        if not m[3] and not m[4] and d <= best:
+        if m[5] and not m[3] and not m[4] and d <= best:
           best = d
           on = i
       if on < 0:
@@ -14675,7 +15064,7 @@ proc playlistTabs(a: App, x, y, w: float32): float32 =
   let plus = rect(cx, cy, 24, th)
   result = cy + PlaylistTabH - y
   let strip = rect(x, y, w, result)
-  (a.tabRects, a.tabPlus, a.tabStrip) = (rects, plus, strip)
+  (a.tabRects, a.tabPlus, a.tabNew, a.tabStrip) = (rects, plus, plus, strip)
   ui.rect(strip, colPanelRaised)
   ui.rect(rect(x, y + result - 1, w, 1), colBorder)
 
@@ -14787,7 +15176,9 @@ proc playlistSide(a: App, x, y, w, h: float32, blocked: bool) =
   let n = a.tabs.len
   let strip = rect(x, y, w, h)
   let top = y + 2
-  let maxScroll = max(0'f32, (n + 1).float32 * rowH + 4 - h)
+  # A gap between the playlists and + after them, a line across its middle.
+  let gapH = if n > 0: PlaylistPlusGap else: 0'f32
+  let maxScroll = max(0'f32, (n + 1).float32 * rowH + gapH + 4 - h)
   let rowDrag = ui.activeId == "plrow" and a.plRowFrom.moved or a.libDragging  # rowDragTab 0 for the library's
   let tabDrag = ui.activeId == "pltab" and a.tabFrom.moved
   if a.tabSeen != a.tabView:  # shown some other way (Ctrl+Tab, Show Playing): into view
@@ -14807,8 +15198,11 @@ proc playlistSide(a: App, x, y, w, h: float32, blocked: bool) =
   a.plainBar("tabscroll", bar, maxScroll, a.tabScroll, a.tabThumbFrom, blocked)
   var rects: seq[Rect]
   for i in 0 ..< n: rects.add rect(x, top + i.float32 * rowH - a.tabScroll, w - barW, rowH)
-  let plus = rect(x, top + n.float32 * rowH - a.tabScroll, w - barW, rowH)
-  (a.tabRects, a.tabPlus, a.tabStrip) = (rects, plus, strip)
+  let plus = rect(x, top + n.float32 * rowH + gapH - a.tabScroll, w - barW, rowH)
+  # Rows or files dropped anywhere below the separator make a new playlist.
+  let newTop = max(y, floor(plus.y - gapH / 2))
+  let newZone = rect(x, newTop, w - barW, max(0'f32, y + h - newTop))
+  (a.tabRects, a.tabPlus, a.tabNew, a.tabStrip) = (rects, plus, newZone, strip)
 
   var over = -1
   if ui.hover(strip) and not blocked:
@@ -14848,9 +15242,11 @@ proc playlistSide(a: App, x, y, w, h: float32, blocked: bool) =
   if not a.playlistLocked:
     let newKey = a.cfg.keyText(kaNewPlaylist)
     let onPlus = ui.hover(strip) and ui.hover(plus) and not blocked
-    let plusTarget = rowDrag and onPlus
-    if plusTarget: ui.border(plus, colAccent)
-    elif onPlus and not tabDrag: ui.rect(plus, colHover)
+    let plusTarget = rowDrag and ui.hover(strip) and ui.hover(newZone) and not blocked
+    if onPlus and not plusTarget and not tabDrag: ui.rect(plus, colHover)
+    if n > 0:  # the separator, in the gap above it
+      ui.rect(rect(plus.x + 8, floor(plus.y - gapH / 2), max(0'f32, plus.w - 16), 1), colBorder)
+    if plusTarget: ui.border(newZone, colAccent)  # after the separator, not under it
     ui.icon("plus16", vec2(plus.x + 15, plus.y + plus.h / 2), if onPlus: colText else: colTextDim)
     ui.textIn(ui.ellipsize("New playlist", plus.w - 34, FontSmall),
       rect(plus.x + 26, plus.y, max(0'f32, plus.w - 34), plus.h),
@@ -14911,7 +15307,7 @@ proc playlistSide(a: App, x, y, w, h: float32, blocked: bool) =
         if over != a.tabView:
           a.inTab(over): a.dropRows(-1)
         else: a.dropRows(-1)
-      elif over < 0 and ui.hover(plus) and not a.editLocked:
+      elif over < 0 and ui.hover(newZone) and not a.editLocked:
         let ti = a.newPlaylist(show = false)
         a.inTab(ti): a.dropRows(-1)
       ui.activeId = ""  # not dropped on the rows too
@@ -14980,7 +15376,7 @@ proc playlistPanel(a: App, r: Rect) =
   if a.playlistLocked:
     a.plListRect = Rect()
     a.plGroups.setLen 0
-    (a.tabStrip, a.tabRects, a.tabPlus) = (Rect(), newSeq[Rect](), Rect())
+    (a.tabStrip, a.tabRects, a.tabPlus, a.tabNew) = (Rect(), newSeq[Rect](), Rect(), Rect())
     if a.plFindOpen: a.closePlaylistFind()
     ui.textIn("Locked while synchronized", rect(r.x, header.y + 30, r.w, r.h - 30),
       colTextDim, FontSmall, h = CenterAlign)
@@ -16458,7 +16854,7 @@ proc dropFiles(a: App, dropped: seq[string]) =
         a.showTab(i)
         a.addToPlaylist(paths)
         return
-    if a.dropAt.inside(a.tabPlus) and not a.editLocked:
+    if a.dropAt.inside(a.tabNew) and not a.editLocked:
       discard a.newPlaylist()
       a.addToPlaylist(paths)
     return
@@ -16480,9 +16876,11 @@ proc idleScreen(a: App, area: Rect) =
   let c = area.xy + area.wh / 2
   if a.chartShown:
     let t = now()
-    a.chart.draw(ui, area, a.chart.clock(a.player.timePos, a.player.speed, a.player.playing,
-                                           a.player.jumps, t), a.playingSide)
+    a.chartT = a.chart.clock(a.player.timePos, a.player.speed, a.player.playing, a.player.jumps, t)
+    a.chart.draw(ui, area, a.chartT, a.playingSide)
     a.chartDrawn = t
+  elif a.chartHeld:
+    a.chart.draw(ui, area, a.chartT, a.heldSide)  # the file before's, until the next one's
   elif a.avsShown and a.avs != nil and a.avs.hasFrame:
     discard  # the visualizer fills the frame (drawVideo)
   elif a.soundOnly:
@@ -17197,6 +17595,9 @@ proc renderAvsList(a: App, shot: string) =
   let d = a.avsDlg
   a.avsMenus.captureInput(ui)
   (d.beatThreshold, d.beatSensitivity) = (a.cfg.avsBeatThreshold, a.cfg.avsBeatSensitivity)  # Options may have changed them
+  (d.cycle, d.cycleOrder, d.cyclePerSong, d.cycleSeconds, d.cycleFollow) = (a.cfg.avsCycle,
+    a.cfg.avsCycleOrder, a.cfg.avsCyclePerSong, a.cfg.avsCycleSeconds,
+    a.cfg.avsCycleFollow)  # and the menu Cycle Presets
   let action = d.draw(ui, rect(vec2(0, 0), ui.size), a.avs)
   if d.nudgeUntil > now(): a.dirtyUntil = max(a.dirtyUntil, d.nudgeUntil + 0.05)
   ui.captured = false
@@ -17229,6 +17630,12 @@ proc renderAvsList(a: App, shot: string) =
     a.cfg.save()
   of aaBeat:
     (a.cfg.avsBeatThreshold, a.cfg.avsBeatSensitivity) = (d.beatThreshold, d.beatSensitivity)
+    a.cfg.save()
+  of aaCycle:
+    if d.cycle != a.cfg.avsCycle: a.setAvsCycle(d.cycle)
+    (a.cfg.avsCycleOrder, a.cfg.avsCyclePerSong) = (d.cycleOrder, d.cyclePerSong)
+    a.cfg.avsCycleFollow = d.cycleFollow
+    a.cfg.avsCycleSeconds = clamp(d.cycleSeconds, CycleMinSeconds, CycleMaxSeconds)
     a.cfg.save()
   of aaClose: a.closeAvsList()
 
@@ -17477,6 +17884,9 @@ proc renderPick(a: App, shot: string) =
       if path notin a.mediaInfo: return
       let m = a.mediaInfo[path]
       (true, m.duration, m.shownW, m.shownH))
+  if a.pickDlg.draggingFiles != a.pickGrabbing:
+    a.pickGrabbing = a.pickDlg.draggingFiles
+    w.cursor = Cursor(kind: if a.pickGrabbing: ClosedHandCursor else: ArrowCursor)
   ui.drawTooltip()
   a.pickSk.endUi()
   ui.endFrame()
@@ -17639,7 +18049,7 @@ proc shortcutColumns(a: App): array[2, seq[ShortcutGroup]] =
       ("Exit", @[kaExit], "")]),
     a.keyRows("Playback", [
       ("Play / Pause", @[kaPlayPause], ""), ("Stop", @[kaStop], ""),
-      ("Frame forward / back", @[kaFrameForward, kaFrameBack], ""),
+      ("Frame (sound only: sample) forward / back", @[kaFrameForward, kaFrameBack], ""),
       ("Fast-forward / slow down", @[kaFaster, kaSlower], "Shift+. / Shift+,"),
       ("Repeat forever", @[kaRepeatForever], ""),
       ("Repeat ping-pong", @[kaRepeatPingPong], ""),
@@ -17817,6 +18227,7 @@ proc shortcutColumns(a: App): array[2, seq[ShortcutGroup]] =
       ("Tracker chart: pan", "Ctrl+Drag video"),
       ("Tracker chart: fit to the frame", "Ctrl+Middle-click video"),
       ("Toggle seek snapping", "Shift+Drag seek bar"),
+      ("Make the waveform seek bar taller", "Drag its top edge"),
       ("Repeat options", "Right-click loop button"),
       ("Select word / all in a text field", "Double / Triple-click"),
       ("Library search: select the words typed / edit the tag clicked", "Click search / Click a tag"),
@@ -18168,7 +18579,7 @@ proc frame(a: App) =
   else:
     a.plListRect = Rect()
     a.plGroups.setLen 0
-    (a.tabStrip, a.tabRects, a.tabPlus) = (Rect(), newSeq[Rect](), Rect())
+    (a.tabStrip, a.tabRects, a.tabPlus, a.tabNew) = (Rect(), newSeq[Rect](), Rect(), Rect())
     if a.plFindOpen: a.closePlaylistFind()
   # The list or column holding the arrow keys (until Escape) shows it at its edge.
   if a.plArrows and a.cfg.showPlaylist and a.plListRect.w > 0:
@@ -18181,10 +18592,11 @@ proc frame(a: App) =
     ui.border(a.libCatRect, colAccentDim)
   if a.cfg.showRunLog: a.runLogPanel(rlRect)
   a.tkButton = Rect()
+  a.seekGrip = Rect()
   if bottomVisible and bottomH > 0:
     var y = H - bottomH
     if a.cfg.showSeekBar:
-      a.seekBar(rect(0, y, W, SeekBarHeight)); y += SeekBarHeight
+      a.seekBar(rect(0, y, W, a.seekBarH)); y += a.seekBarH
     if a.cfg.showControls:
       a.controls(rect(0, y, W, ControlsHeight)); y += ControlsHeight
     if a.cfg.showStatus:
@@ -18255,23 +18667,29 @@ proc frame(a: App) =
   let libSplitHover = ui.activeId == "libsplit" or both and
     ui.hover(rect(libRect.x, libRect.y - 2, libRect.w, LibrarySplitGrip)) and
     a.overlay == ovNone and not a.menus.isOpen
-  let resizeV = ui.activeId == "rlresize" or a.cfg.showRunLog and
-    ui.hover(rect(0, rlRect.y + rlRect.h - RunLogGripH, W, RunLogGripH)) and
+  let resizeV = ui.activeId in ["rlresize", "seekresize"] or
+    (a.cfg.showRunLog and ui.hover(rect(0, rlRect.y + rlRect.h - RunLogGripH, W, RunLogGripH)) or
+     a.seekGrip.h > 0 and ui.hover(a.seekGrip) and not a.seekDragging) and
     a.overlay == ovNone and not a.menus.isOpen
   let overLog = ui.activeId == "rlselect" or a.cfg.showRunLog and a.runLog.len > 0 and
     ui.hover(rect(rlRect.x, rlRect.y + RunLogHeaderH, rlRect.w - RunLogBarW - 4,
       rlRect.h - RunLogHeaderH - RunLogGripH)) and a.overlay == ovNone and not a.menus.isOpen
+  # Items dragged (playlist rows, Library rows, playlist tabs): a closed hand,
+  # over whatever they pass, even a grip or the playing video.
+  let itemDrag = ui.activeId == "plrow" and a.plRowFrom.moved or a.libDragging or
+    ui.activeId == "pltab" and a.tabFrom.moved
   var shape = if edge * {weLeft, weRight} != {}: ptResize
               elif edge * {weTop, weBottom} != {}: ptResizeV
               elif edge * {weTopLeft, weBottomRight} != {}: ptResizeNWSE
               elif edge != {}: ptResizeNESW
+              elif itemDrag: ptMoving
               elif hide: ptHidden elif libSplitHover: ptResizeV elif resize: ptResize
               elif resizeV: ptResizeV
               elif overLog: ptText
               elif ui.activeId == "plcolumn" and a.plColumnFrom.moved: ptMoving
               elif ui.activeId == "libcolumn" and a.libColumnFrom.moved: ptMoving
               else: ptArrow
-  if a.rectEdit != nil and (overVideo or w.buttonDown[MouseLeft]):
+  if a.rectEdit != nil and not itemDrag and (overVideo or w.buttonDown[MouseLeft]):
     shape = case a.rectEdit.cursorAt(a.videoMap, ui.mouse)
       of rcCross: ptCross
       of rcMove: ptMove
@@ -18426,6 +18844,17 @@ proc runScriptStep(a: App, st: ScriptStep) =
     stderr.writeLine "columns ", (if a.ownColumns: "own " else: "shared "), $a.plColumns, " ",
       $a.plColumnWidths, " order=", $columnOrder(a.plColumnOrder, a.plColumns),
       " shared=", $a.cfg.playlistColumns, " ", $a.cfg.playlistColumnWidths
+  of "sbaction":  # the seek bar menu's item by label (opened by sbctx first)
+    a.ctxMenu = cmSeekBar
+    let n = a.buildMenu().context
+    let i = n.children.mapIt(it.label).find(arg)
+    if i >= 0 and n.children[i].enabled and n.children[i].action != nil: n.children[i].action()
+    else: stderr.writeLine "sbaction: no enabled item ", arg
+  of "wavedump":  # the seek bar's waveform: what it's of and how far decoded
+    let wv = a.wave
+    stderr.writeLine "wave key=", a.waveKey.replace("\x00", "|"), " h=", a.seekBarH,
+      " marks=", a.cfg.seekMarks, " cached=", a.waveCache.len,
+      (if wv == nil: " none" else: &" buckets={wv.peak.len} bucket={wv.bucket:.4f} top={wv.top:.3f} done={wv.done} error={wv.error} file={wv.src.file} stream={wv.src.stream} start={wv.src.start} length={wv.src.length}")
   of "ctxaction":  # video frame context menu item by label, Sub>Item for a submenu's
     a.ctxMenu = cmVideo
     var n = a.buildMenu().context
@@ -18575,6 +19004,9 @@ proc runScriptStep(a: App, st: ScriptStep) =
     a.ui.fakeMouse = if arg == "off": vec2(-1, -1)
                      else: vec2(parseFloat(st.args[0]), parseFloat(st.args[1]))
   of "mods": a.fakeMods = if arg == "off": "" else: arg
+  of "moddump":  # the modifiers the window has held, and what the system says
+    stderr.writeLine "mods focused=", a.window.focused, " held=", a.window.heldMods,
+      " sys=", (if ctrlHeld(): "C" else: "-"), (if shiftHeld(): "S" else: "-"), (if altHeld(): "A" else: "-")
   of "hintscroll": a.hintScroll = parseFloat(arg)  # status bar key hints, clamped when drawn
   of "optfit":  # each Options page's height as last drawn, and the room it has
     for pg in OptionsPage:
@@ -18725,6 +19157,8 @@ proc runScriptStep(a: App, st: ScriptStep) =
   of "abloop":  # a b: sets both loop marks, starting the loop
     a.setLoopMark(false, parseFloat(st.args[0]))
     a.setLoopMark(true, parseFloat(st.args[1]))
+  of "aftercurrent":  # stop | pause: the Stop or Pause button's "... after current", toggled
+    a.toggleAfterCurrent(if arg == "pause": acPause else: acStop)
   of "look":  # yaw pitch fov: the 360° camera, degrees
     (a.lookYaw, a.lookPitch, a.lookFov) = (parseFloat(st.args[0]).float32,
       parseFloat(st.args[1]).float32, parseFloat(st.args[2]).float32)
@@ -18737,7 +19171,7 @@ proc runScriptStep(a: App, st: ScriptStep) =
     else: a.syncRequest(st.args[0], if st.args.len > 1: parseInt(st.args[1]) else: 0)
   of "syncprops": a.showSyncProps()  # Synchronize > Properties
   of "tags": a.showTagProps()  # the playlist's Properties, for the selection
-  of "avslist": a.showAvsList()  # Visualizer Preset > Visualizers...
+  of "avslist": a.showAvsList()  # Visualizer > Visualizers...
   of "avsclose": a.closeAvsList()  # as its Close button does
   of "avshi": (let id = a.avs.presets[parseInt(arg)]; a.avsDlg.sel = @[id]; a.pickAvs(id))  # highlight row i
   of "avstoggle": a.toggleAvs(@[a.avs.presets[parseInt(arg)]])  # row i's checkbox
@@ -18775,6 +19209,12 @@ proc runScriptStep(a: App, st: ScriptStep) =
       " aslisted=", $(a.avsDlg != nil and a.avsDlg.rows == v.presets),
       " sort=", a.cfg.avsSort, (if a.cfg.avsSortDescending: " desc" else: ""),
       " beat=", a.cfg.avsBeatThreshold, " sensitivity=", a.cfg.avsBeatSensitivity,
+      " cycle=", a.cfg.avsCycle, "/", a.cfg.avsCycleOrder, "/",
+      (if a.cfg.avsCyclePerSong: "song" else: $a.cfg.avsCycleSeconds),
+      (if a.cfg.avsCycleFollow: "/follow" else: ""), " shuffled=", a.avsShuffled.len,
+      " back=", $a.avsBack.mapIt(presetName(it)), " forward=", $a.avsForward.mapIt(presetName(it)),
+      " sel=", (if a.avsDlg != nil: $a.avsDlg.sel.mapIt(presetName(it)) else: "-"),
+      " clock=", a.avsCycleClock.formatFloat(ffDecimal, 1), " paused=", a.player.paused,
       " open=", $(a.avsWin != nil and a.avsWin.visible),
       " search=", (if a.avsDlg != nil: "\"" & a.avsDlg.search & "\"" else: "-"),
       " rows=", (if a.avsDlg != nil: $a.avsDlg.rows.mapIt(presetName(it)) else: "-")
@@ -19257,6 +19697,7 @@ proc main() =
     a.bridgeFrames()
     a.releaseStandby()
     a.pollProbe()
+    a.pollWaveform()
     a.probePickFiles()
     a.pollMediaKey()
     a.syncEqualizer()
@@ -19366,6 +19807,14 @@ proc main() =
        not (pointerButtonsDown() and a.optMenus.pointerOverPopup(a.optUi)):
       a.optMenus.close()
       a.dirtyUntil = now() + 0.5
+    # Ctrl, Shift and Alt held as a window gains focus, and their release.
+    if now() - a.modSyncAt >= 0.03:
+      a.modSyncAt = now()
+      for w in [a.window, a.optWin, a.renWin, a.cmdWin, a.pickWin, a.syncWin, a.ytWin, a.embWin,
+                a.cfmWin, a.upWin, a.eqWin, a.tagWin, a.avsWin, a.typesWin]:
+        if w != nil and w.focused and w.syncModifiers():
+          a.inputPending = true
+          a.dirtyUntil = max(a.dirtyUntil, now() + 0.1)
     a.pollLibrary()
     a.applyOnTop()
     a.applyKeepAwake()

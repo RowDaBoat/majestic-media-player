@@ -1074,6 +1074,10 @@ proc choose*(d: PickDialog, i: int, choices: seq[TimeChoice], k: int) =
 
 proc newPickDialog*(): PickDialog = PickDialog(openRow: -1, dragRow: -1, pressedOn: -1)
 
+proc draggingFiles*(d: PickDialog): bool =
+  ## A file list's selected files are being dragged to another place.
+  d.dragging
+
 proc start*(d: PickDialog, c: CommandLine, choices: seq[TimeChoice],
     last = initTable[string, RunValue](), seed: seq[string] = @[], seedFirst = false) =
   ## Prepares the window for c. Cards start at what they were last run with

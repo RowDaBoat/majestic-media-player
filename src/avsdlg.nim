@@ -1,4 +1,4 @@
-## The video frame menu's Visualizer Preset > Visualizers...: every preset in
+## The video frame menu's Visualizer > Visualizers...: every preset in
 ## a grid, with a checkbox each (presets turned off leave the menu's list and
 ## are never stepped to: Next, Previous, Random) and what the preset holds in
 ## columns resized by their header edges (the header's checkbox turns every
@@ -13,7 +13,10 @@
 ## the list (built-in ones can only be turned off). Frame Rate is how many
 ## times a second a preset steps (the context menu sets it). Beat threshold and
 ## Sensitivity, at the bottom, are Options' (how loud the sound must be for
-## beats, how readily they come). Presets turned off are hidden from the
+## beats, how readily they come). Above them, Cycle presets (the menu's Cycle
+## Presets): in which order the preset changes by itself, and when: once per
+## song or every so many seconds, and Follow (the highlight jumps to each
+## preset it switches to). Presets turned off are hidden from the
 ## grid unless Show hidden is ticked (and never in the command palette's
 ## Change Visualizer). The search field (Ctrl+F)
 ## shows only the presets matching it: by name, author or file name, or by
@@ -23,7 +26,7 @@
 import std/[os, strutils, sequtils, tables, sets, times, strformat, math, algorithm]
 from std/unicode import nil
 import silky, vmath, bumpy, pixie
-import ui, theme, avsview
+import ui, theme, avsview, config
 import avs/[list, effects, misc]
 
 type
@@ -34,7 +37,7 @@ type
     mtime: float              ## seconds since 1970; 0: none (built-in)
 
   AvsAction* = enum
-    aaNone, aaSelect, aaToggle, aaAdd, aaAddDir, aaRemove, aaPrefs, aaRate, aaBeat, aaContext, aaClose
+    aaNone, aaSelect, aaToggle, aaAdd, aaAddDir, aaRemove, aaPrefs, aaRate, aaBeat, aaCycle, aaContext, aaClose
 
   AvsContext* = enum
     acRows, acHeader, acEmpty   ## what was right-clicked: highlighted rows, the header, nothing
@@ -57,6 +60,11 @@ type
     beatThreshold*: float     ## the level beats need, % of Winamp's (the app's
                               ## avsBeatThreshold); aaBeat when changed here
     beatSensitivity*: float   ## how readily beats come, % of Winamp's (avsBeatSensitivity)
+    cycle*: bool              ## Cycle presets, the app's avsCycle...: aaCycle when changed here
+    cycleOrder*: AvsCycleOrder
+    cyclePerSong*: bool       ## once per song, else every cycleSeconds
+    cycleSeconds*: float
+    cycleFollow*: bool        ## the highlight jumps to each preset cycling plays (the app's jumpTo)
     rows*: seq[string]        ## the presets in the order shown (last frame)
     ctx*: AvsContext          ## with aaContext: what for, and where (window units)
     ctxPos*: Vec2
@@ -82,8 +90,11 @@ type
 
 const
   AvsSize* = ivec2(920, 580)
-  AvsMinSize* = ivec2(860, 320)  ## the smallest the window can be resized to: the toolbar fits
+  AvsMinSize* = ivec2(860, 360)  ## the smallest the window can be resized to: the toolbar fits
   RowH = 24'f32
+  CycleRowH = 40'f32         ## Cycle presets' row, over the bottom one
+  CycleMinSeconds* = 5.0
+  CycleMaxSeconds* = 3600.0
   CheckW = 30'f32
   MinCol = 50'f32
   BarW = 10'f32
@@ -480,7 +491,7 @@ proc draw*(d: AvsDialog, ui: Ui, r: Rect, v: AvsView): AvsAction =
   let on = shown.countIt(it notin v.disabled)
 
   # The grid.
-  let grid = rect(r.x + 16, r.y + 52, r.w - 32, r.h - 52 - 60)
+  let grid = rect(r.x + 16, r.y + 52, r.w - 32, r.h - 52 - 60 - CycleRowH)
   let head = rect(grid.x, grid.y, grid.w, RowH)
   let cols = d.layout(head)
   ui.rect(head, colPanelRaised)
@@ -753,6 +764,52 @@ proc draw*(d: AvsDialog, ui: Ui, r: Rect, v: AvsView): AvsAction =
     if id != playingId:
       d.pick = id
       result = aaSelect
+
+  # Cycle presets: on or off, in which order, once per song or every so many
+  # seconds; at the right end, Follow.
+  ui.rect(rect(r.x + 1, r.y + r.h - 50 - CycleRowH, r.w - 2, 1), colBorder)
+  block:
+    let y = r.y + r.h - 50 - CycleRowH + 9
+    var x = r.x + 16
+    proc box(label: string): Rect = rect(x, y, 22 + ui.textSize(label).x, 22)
+    let cr = box("Cycle presets")
+    if ui.checkbox("av-cycle", vec2(x, y), "Cycle presets", d.cycle): result = aaCycle
+    ui.tip(cr, "Change the preset by itself (the video menu's Visualizer > Cycle Presets)")
+    x += cr.w + 14
+    for (o, label, tip) in [
+        (acShuffle, "Shuffle", "Every preset turned on once, in a random order, then again"),
+        (acIncremental, "Incremental", "The next preset turned on, as Next does (the menu's list)"),
+        (acDecremental, "Decremental", "The previous preset turned on, as Previous does")]:
+      let rr = box(label)
+      if ui.radioButton("av-cycle-" & $o, vec2(x, y), label, d.cycleOrder == o):
+        d.cycleOrder = o
+        result = aaCycle
+      ui.tip(rr, tip)
+      x += rr.w + 8
+    x += 4
+    ui.rect(rect(x, y - 2, 1, 26), colBorder)
+    x += 13
+    let sr = box("Once per song")
+    if ui.radioButton("av-cycle-song", vec2(x, y), "Once per song", d.cyclePerSong):
+      d.cyclePerSong = true
+      result = aaCycle
+    ui.tip(sr, "A new preset as each song starts")
+    x += sr.w + 8
+    let er = box("Every")
+    if ui.radioButton("av-cycle-time", vec2(x, y), "Every", not d.cyclePerSong):
+      d.cyclePerSong = false
+      result = aaCycle
+    let fr = rect(x + er.w + 6, y - 2, 88, 26)
+    if ui.numberField("av-cycle-secs", fr, d.cycleSeconds, 5, CycleMinSeconds, CycleMaxSeconds):
+      d.cyclePerSong = false
+      result = aaCycle
+    let unitR = rect(fr.x + fr.w + 6, y, ui.textSize("s").x, 22)
+    ui.textIn("s", unitR, colTextDim)
+    ui.tip(rect(er.x, y - 2, unitR.x + unitR.w - er.x, 26),
+      "A new preset after this many seconds of it playing (paused time isn't counted)")
+    let flR = rect(r.x + r.w - 16 - (22 + ui.textSize("Follow").x), y, 22 + ui.textSize("Follow").x, 22)
+    if ui.checkbox("av-cycle-follow", flR.xy, "Follow", d.cycleFollow): result = aaCycle
+    ui.tip(flR, "Highlight each preset cycling switches to, scrolled into view")
 
   # Bottom: the beat threshold and sensitivity, the hint (when there's room),
   # how many presets are on (of those found, searching), Close.

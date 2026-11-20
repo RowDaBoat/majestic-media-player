@@ -113,6 +113,7 @@ const
   Button1to3Mask = 0x700.cuint
   ShiftMask = 0x1.cuint
   ControlMask = 0x4.cuint
+  Mod1Mask = 0x8.cuint  # Alt
 
 proc glXGetCurrentDisplay(): XDisplay {.importc, dynlib: "libGL.so.1".}
 proc XInternAtom(d: XDisplay, name: cstring, onlyIfExists: cint): Atom {.importc, cdecl.}
@@ -483,6 +484,32 @@ proc ctrlHeld*(): bool =
 proc shiftHeld*(): bool =
   ## Whether Shift is held, even while another window has the keyboard.
   (modifiersHeld() and ShiftMask) != 0
+
+proc altHeld*(): bool =
+  ## Whether Alt is held, even while another window has the keyboard.
+  (modifiersHeld() and Mod1Mask) != 0
+
+const ModifierKeys = [(KeyLeftControl, KeyRightControl), (KeyLeftShift, KeyRightShift),
+                      (KeyLeftAlt, KeyRightAlt)]
+
+proc syncModifiers*(window: Window): bool =
+  ## Brings the window's Ctrl, Shift and Alt in line with the keyboard, for
+  ## modifiers held as it gains focus: Xwayland may know those only as
+  ## modifier state, without the key down, and then never reports their
+  ## release either. Whether anything changed.
+  privateAccess(Window)
+  if glXGetCurrentDisplay() == nil: return
+  let m = modifiersHeld()
+  let held = [(m and ControlMask) != 0, (m and ShiftMask) != 0, (m and Mod1Mask) != 0]
+  for i, (l, r) in ModifierKeys:
+    let down = l in window.buttonDown or r in window.buttonDown
+    if held[i] and not down:
+      window.buttonDown.incl l
+      result = true
+    elif down and not held[i]:
+      window.buttonDown.excl l
+      window.buttonDown.excl r
+      result = true
 
 var grabCursor: XID
 

@@ -182,9 +182,10 @@ it held, to commit.
   index of each submenu down to it, so one whose label shows a value, "Pre-amp: +3 dB", is still
   found after picking a value in it), and Backspace in an empty search or the button left of the
   field goes back (`palBack`, the search as it was). Lists (`MenuNode.listed`, set with
-  `markListed` in `buildMenu`: recent files, tracks, chapters, bookmarks, players, command lines,
+  `markListed` in `buildMenu`: recent files, tracks, chapters, bookmarks, players,
   visualizer presets, stream qualities, numeric steps) show only inside their own submenu; other
-  items also show in searches from above. A column (Quality's Video and Audio) counts as part of
+  items also show in searches from above, the Run menu's command lines included. Run commands
+  starting with "Join" are also found as "Concatenate ..." (`PaletteWordAliases`). A column (Quality's Video and Audio) counts as part of
   its menu. With nothing typed it lists the open submenu's own items, at the top after the
   commands run lately (`paletteRecent` in the config, keyed "Menu › Item").
   Open Recent keeps 50 files (`MaxRecent`); the menu shows the latest 15 (`MenuRecent`), the
@@ -253,6 +254,13 @@ it held, to commit.
   key elsewhere whose symbol is one of them (Spanish `-`, by the right Shift) presses nothing.
   Letters and digits still go by the layout's symbol on X11. Test kit: `tmp/subdelay/` (nested
   KWin with a Spanish layout, `kw.sh`, `run.sh BIN CFG SCRIPT`; libei keys 12/13/53; `dump sub-delay`).
+- Modifiers held as a window gains focus (`syncModifiers`, every 30 ms for the focused window, from
+  the main loop): Ctrl, Shift and Alt follow the system's modifier state, not only key events.
+  Coming from a native Wayland window, Xwayland often knows a held modifier only as modifier state:
+  windy's FocusIn keymap read (`XQueryKeymap`) misses it, and the X server then drops its release
+  too. Windows windy forgets every key on WM_SETFOCUS. X11's windy `Window` keeps its own
+  `buttonDown`, not `state.buttonDown` as on Windows. Test kit: `tmp/focusmods/` (`test.sh BIN
+  KEYCODE [close]`, `WL=1` for a kcalc window instead of a plain X one; `moddump` step).
 - The playlist remembers the M3U/PLS file it was loaded from or last saved to (`App.plFile`,
   kept across restarts as `playlistFile`); opening files anew starts a playlist in no file.
   With the panel's Autosave checked (`playlistAutosave`, the files it's on for), `autosavePlaylist`
@@ -452,6 +460,9 @@ it held, to commit.
   so jumps show as jumps; between two consecutive rows it glides. Cells come from libopenmpt's
   own formatter at the widest of 0/10/6/3 characters (then the smaller font) that fits every
   channel. Redraws are capped at 144 fps while it plays (~10% of a core).
+  While the next local file opens, the chart drawn last stays up (`chartHeld`) until that file
+  shows its own chart or turns out to have none (or a picture): a module's chart opens only
+  once mpv names the format (`file-format`), and in between the frame showed the visualizer.
 - Tracker button (controls bar, beside the equalizer, while a module plays): a panel with a
   pitch shift in semitones and "Stretch sample playback". FFmpeg's libopenmpt demuxer takes no
   settings (only `sample_rate`, `layout`, `subsong`), so once either differs from the default the
@@ -762,14 +773,14 @@ it held, to commit.
   Hellhammer 8 at about twice their speed). Their steps can't be scaled by the time passed (code
   and feedback effects aren't linear in it), so a preset steps `rateOf` times a second instead:
   Frame Rate (60 down to 10, `avsFrameRates` by preset, 60 left out) in the video menu's
-  Visualizer Preset and the Visualizers context menu, a column there. Each tick feeds the audio
+  Visualizer and the Visualizers context menu, a column there. Each tick feeds the audio
   (`setAudio`: a beat found waits for the next step, the spectrum keeps its peaks till then, as
   main.cpp's render() did between frames) and adds rate/60 to an accumulator; a step is taken at
   1, and below 60 what's shown is the last two steps blended by the remainder (`blendFrames`), a
   step behind, so the picture moves every tick. A new preset or size starts again from a step.
   Presets: Winamp's own (assets/avs/, in the binary) and the presets folder (config dir `avs/`,
   any depth), picked from the video's right-click menu; the one in use is `avsPreset`.
-  Visualizer Preset > Visualizers... (`src/avsdlg.nim`, a window beside the player like the
+  Visualizer > Visualizers... (`src/avsdlg.nim`, a window beside the player like the
   Equalizer's, but resizable: `placeDialog`'s `minSize` keeps it from going below `AvsMinSize`,
   where the toolbar still fits with the search field at its old smallest (the hint goes first), and the size it was left at returns next time,
   `avsWindowW`/`avsWindowH` in UI units; on X11 dialog windows get `keepContentsOnResize`,
@@ -806,7 +817,7 @@ it held, to commit.
   first listed (`avsAddedDates`, stamped on each rescan for files without one, reset by Add... and
   Add Folder..., dropped by Remove; built-in ones have none), so sorting by it ascending, the default, is the
   order presets are listed in: those listed before dates were kept share one date. Sorting only
-  changes the grid; Next and Previous keep the listed order. Right-clicks open context menus: on
+  changes the grid; Next and Previous, past their history, keep the listed order. Right-clicks open context menus: on
   rows (highlighting a row outside the highlighted ones alone first, without playing it) Play,
   Turn On/Off, Rating, Frame Rate, Open Containing Directory, Copy Path, Add..., Remove, Show Hidden and Sort By; on the
   header the sorting; under the rows Add..., Show Hidden and Sort By. Presets turned off are
@@ -833,10 +844,30 @@ it held, to commit.
   wrapping onto a second line when narrow. The bottom bar starts with Beat threshold and
   Sensitivity, the same `avsBeatThreshold` and `avsBeatSensitivity` as Options' (read from the
   config every frame, saved on each change); the hint leaves when narrower than 140.
+  Above it, Cycle presets: the video menu's Visualizer > Cycle Presets (`avsCycle`, off by
+  default; the OSD says how it cycles when turned on) changes the preset by itself (`cycleAvs`,
+  from `pollAvs`), in `avsCycleOrder`'s order: Incremental and Decremental step the listed order
+  (not the grid's sort), Shuffle every preset turned on once in a random order
+  (`avsShuffled`, the round so far; a new round never starts with the one playing). When:
+  once per song (`avsCyclePerSong`: as the path the visualizer shows for changes, followed with
+  cycling off too, so turning it on mid-song waits for the next one; Repeat File's loops aren't
+  new songs), else after `avsCycleSeconds` (5 to 3600, 30 by default) of the preset showing
+  unpaused, counted from frame to frame (gaps over 0.5 s left out) and from 0 again whenever the
+  preset changes, by hand too. Automatic changes save `avsPreset` but show no OSD. Follow, at
+  the row's right end (`avsCycleFollow`, off by default, so a highlight made to rate or turn off
+  rows isn't taken away), makes each automatic change `jumpTo` its preset: highlighted alone and
+  centered in the grid unless already in view. The row's labels are short ("s") so it fits at
+  `AvsMinSize`.
+  The menu's Previous goes back through the presets shown (`avsBack`, up to `AvsHistoryMax`),
+  however they came (cycling, Random, a highlighted row: `noteAvs` notes each change from
+  `pollAvs`), and Next goes forward again through the ones Previous left (`avsForward`); any
+  other change forgets the way forward. Presets turned off or gone are passed over. Past the
+  history's start Previous takes the listed order, Next retracing it; past its end Next does.
   Script commands: `avslist`, `avshi i` (highlight; after `avslist`), `avstoggle i`, `avsrate i quarters`, `avsfps i rate`,
   `avssort column [desc]`, `avsctx rows|header|empty x y`, `avsadd paths`, `avsremove i`,
   `avsstep 1|-1|0`, `avsfind text` (as typed in the search), `avsdump` (also whether the window
-  is open, the search, the beat threshold and sensitivity).
+  is open, the search, the beat threshold and sensitivity, the cycling settings, its clock,
+  shuffle round and the grid's highlight).
 - Audio tap (`src/audiotap.nim`): mpv gives its clients no samples, so on Linux libpulse
   (`dlopen`ed, PipeWire's pulse server too) records the monitor of each playback stream of this
   process (`application.process.id`), as pavucontrol's meters do: what goes out, in time with
@@ -868,6 +899,9 @@ it held, to commit.
 - Stop / Pause after current (the Stop and Pause buttons' right-click menus, `cmStop`/`cmPause`): `afterCurrent` (session only, one of the two at a time) is read by `afterEof` before anything else. Stop runs `stop` there (no queue, no next entry, no After playback action); Pause lets the usual next entry open and pauses it right after `playIndex` (`pauseOnLoad` pauses it again when it has loaded and sends the synchronize group `pause` instead of `play`; Play clears it), and with Repeat File seeks the file back to 0, paused. While either is on, `applyLoop` leaves `loop-file` off so Repeat File reaches its end, a ping-pong file ends at its forward end, and the gapless queue and a short file's delay stand aside. Each goes off once used unless its "Preserve the above after current" (`stopAfterKeep`/`pauseAfterKeep`, saved) is on. The button shows a dot (`dot6`) at its symbol's top right while on: white, indigo (`colAccent`) when preserved. Script commands: `acmenu`, `acaction`, `acdump`.
 - Gapless audio: `gapless-audio` stays `no` (in gapless mode mpv reports the end with ~0.25 s still queued, which opening the next file would cut off), except when mpv has the next file itself. In the last 15 s of an audio file (an audio extension or a cue track) played straight through, `queueGapless` appends the entry `afterEof` would play (the playlist's next, the first when repeating the playlist, or the folder's next with Play next file in the folder) to mpv's playlist and turns gapless on (`weak`: a change of sample rate or channels still reopens the output, with a short gap); `prefetch-playlist` opens it ahead. Videos, the queue, loops, ping-pong, a short file's delay, Stop or Pause after current and synchronized slaves keep the app's own path. mpv then goes on by itself; `Player.wentOn` takes the new path from the `end-file` event and `adoptGapless` runs `playIndex` without opening the file (`adopting`). `handleEof` stands aside while a file is queued, as `eof-reached` can show for a moment before mpv moves on. Gapless is turned off again only once the new file plays (`settled`): turned off while mpv changes files, the new file's audio setup would drop the sound still queued.
 - Seek bar clicks: a click seeks exactly once, on press, so the picture never visits the keyframe before the spot; dragging seeks to keyframes between marks and exactly on a mark snapped to. `Player.landOn` keeps the time shown (seek bar, status bar, OSD) on an exact seek's target until `landingOn` sees it land: mpv's `time-pos` stays the old one for a while, and a keyframe's after an earlier seek.
+- Paused on the sound alone (no video, or a cover), mpv's `time-pos` after an exact seek is the output's, short of the spot by what it buffered (0.1-0.2 s), though playing goes on from the spot: `Player.soundHold` keeps the time sought until playing or another jump. Exact seeks give mpv the time to the microsecond, so a bookmark's sample or frame is where they land.
+- Waveform seek bar (its menu's Waveform; `src/waveform.nim`): the sound playing is decoded on a worker thread, by ffmpeg into a float WAV on a pipe (the audio track picked, `-map 0:a:N` counting the file's own audio tracks; an added track's file; a cue track's stretch via `-ss`/`-t`) or for MIDI by FluidSynth with its SoundFont. Each of 32768 buckets (1 ms at least) keeps the highest sample and the RMS of every channel; `pollWaveform` takes them in as they come, so it fills from the left, and keeps the last four decoded whole. Links show the plain bar. Its top edge, dragged up, makes the bar taller (`waveformHeight`), never shorter than the plain bar; turning it on or off resizes the window by the difference, as View > Seek Bar does.
+- Show Marks off hides chapters, bookmarks and loop marks unless the loop is active (both marks set and on), and they are neither snapped to nor picked by the seek bar's menu; the hover label still names the chapter it's in.
 - Synchronized frame steps: the master steps and names the time it landed on; slaves go to the frame that puts them at that time plus their offset rather than stepping themselves, so they can't drift at either end of a file. A slave's press only asks the master. A slave's offset is signed: positive is ahead of the master, negative behind it (it waits at its start until the master gets that far).
 - Frame steps: mpv's `frame-back-step` decodes from the previous keyframe on every press, so
   it scales with keyframe spacing. While paused, the hidden standby player steps through the
@@ -877,6 +911,26 @@ it held, to commit.
   a new picture: they arrive separately, in either order. The window refills near its edges.
   Links, 360° video, A-B loops and CPU rendering use the plain mpv step, as does a press in the
   second or so after pausing, before the frames are in.
+- Sample steps (`sampleStep`): with no video track on (or only a cover), `,` and `.` pause and
+  seek exactly one sample back or on, at the decoded rate (`audio-params/samplerate`). mpv
+  drops the decoded samples before the time asked for, rounding down, so the seek goes a quarter
+  sample in (9 decimals). A step counts from where playing would go on, never from mpv's
+  paused time alone: after a seek made while paused, mpv's `time-pos` (and `audio-pts`) is
+  short of it by the audio output's latency (~0.1 s: `playing_audio_pts` takes off
+  `ao_get_delay`, which counts the device's latency while nothing plays), so counting from it
+  went back ~0.1 s with either key. In order: the sample last stepped to (`ssAt`), while nothing
+  else moved the player and it hasn't played since (`Player.resumes`); else the last jump's
+  target (`Player.noteTarget`/`heldTarget`, set by exact, relative and percent seeks, Stop and
+  chapter jumps), until mpv's own time (`mpvTime`) goes past it: `hr-seek=default` makes every
+  seek exact on the sound alone, relative ones from mpv's lagging time, and a chapter jump lands
+  on the first chapter start at or after mpv's time; else `timePos` (pausing while playing has
+  no lag). FFmpeg's module seeks land on a row's start instead, usually after the target
+  (`modstream.landsAt` asks libopenmpt the same), so a module FFmpeg plays is opened again as a
+  module stream (`streamModule`, as the tracker button's settings do) at the sample: its seeks
+  are exact. Verified with a ramp signal (each sample's value its index) through a PipeWire
+  null sink (`ao=pcm` and `ao=null` have no latency and hide the lag): the first sample heard
+  on resuming is the one stepped to, after paused seeks, arrow keys, Stop, steps while playing
+  and fast or slow presses (`tmp/sstep/case.sh`).
 - 360° links: `detectSphere` needs a file, so `Player.findSphere` asks yt-dlp's JSON
   (`linkSphere`), per format and not per video: YouTube renders a 360° video's lesser DASH
   formats through a fixed camera. Those are noted as nothing, and so are its HLS formats, which
@@ -1072,6 +1126,7 @@ it held, to commit.
 |---|---|
 | `src/majestic.nim` | App state, menus, layout, panels, main loop |
 | `src/player.nim` | mpv playback instance, thumbnail-preview instance, folder helpers |
+| `src/waveform.nim` | The seek bar's waveform: the sound playing decoded on a thread into each bucket's peak and RMS |
 | `src/ytboard.nim` | YouTube storyboards for seek bar previews: fetched left to right into the cache, shown by the preview instance |
 | `src/mkvcues.nim` | Seek entries for the sound of a link's saved parts (FFmpeg's Cues list the video only) |
 | `src/srv3.nim` | YouTube's styled subtitles (srv3): fetched into the cache (the hook's links, `fmt=srv3`), turned into ASS, put in place of the plain tracks; File > Save muxes them into an .mkv with ffmpeg |
@@ -1091,7 +1146,7 @@ it held, to commit.
 | `src/midisong.nim` | MIDI and HMI files as timed messages (HMI through SOS's sequencer), and the chart's rows |
 | `src/midichart.nim` | A MIDI song laid out for the tracker chart |
 | `src/avs/` | AVS 2.81d ported: `eel.nim` (the expression language), `core.nim` (pixels, blends, lines), `list.nim` (effect lists, presets), the effects (`render*`, `trans*`, `misc`, `text` (Render / Text and its fonts), `apes*`), `engine.nim` (audio to visdata, beats, frames) |
-| `src/avsdlg.nim` | Visualizer Preset > Visualizers...: the presets' grid, turned on or off, hidden, added and removed, searched |
+| `src/avsdlg.nim` | Visualizer > Visualizers...: the presets' grid, turned on or off, hidden, added and removed, searched |
 | `src/avsview.nim`, `src/audiotap.nim` | The visualizer in the video frame (its worker thread, presets, texture); this process's sound, recorded from the sound server |
 | `src/videogl.nim` | mpv → texture rendering and the transformed video quad |
 | `src/coverart.nim`, `src/animpic.nim`, `src/gifanim.nim` | The pictures inside an audio file (their types and bytes); a moving cover's frames (GIF, APNG, WebP) |
@@ -1125,7 +1180,13 @@ it held, to commit.
   procs (`+%`, ORC's reference counting), which the app's modules can't turn off. For a full trace,
   build `-d:release --stackTrace:on --lineTrace:on` and reproduce with the state as a guide.
   The writer clears Nim's error flag first: with goto exceptions it stays set while the unhandled
-  exception is reported, and every call that can raise would return at once.
+  exception is reported, and every call that can raise would return at once. It also turns ORC's
+  cycle collector off first: a segfault inside the collector (a ref counted on two threads) leaves
+  the broken cell among its roots, and the next ref the writer dropped ran the collector on it
+  again, a second segfault with nothing saved. On Linux, another crash while it writes goes to a
+  handler that allocates nothing: it notes in the log and on stderr how far the report got, then
+  ends with the signal's default action (a core dump). A crash that left no `crash.log` still has
+  a native stack in `coredumpctl info <pid>` (the binary isn't stripped).
 - Text fields read the selection where they use it, never once per frame: keys pressed during a
   slow frame arrive together, and Ctrl+A then Backspace once deleted the pre-Ctrl+A selection
   (`IndexDefect` in `strutils.delete` when the caret was at the end).
