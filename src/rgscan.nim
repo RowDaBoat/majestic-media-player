@@ -287,7 +287,7 @@ proc measure(path: string, duration: float, index: int, font: string): Measure {
   let args = @["-v", "fatal", "-nostdin", "-i", path, "-map", "0:a:0", "-vn", "-sn", "-dn",
                "-c:a", "pcm_f32le", "-f", "wav", "-"]
   var p: Process
-  try: p = startProcess("ffmpeg", args = args, options = {poUsePath})
+  try: p = startProcess("ffmpeg", args = args, options = {poUsePath, poDaemon})  # poDaemon: no console window on Windows
   except OSError:
     result.error = "ffmpeg can't be run"
     return

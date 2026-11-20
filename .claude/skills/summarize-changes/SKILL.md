@@ -72,8 +72,14 @@ Stop listed YouTube playlists from adding their videos again after a restart.
 - Split unrelated changes into separate items, and leave out steps of a single change.
 - Don't list patch/diff noise (whitespace, reordering) unless that's all there is.
 - Don't include `.claude/` in the summary.
-- After the code block, flag anything that shouldn't go into the commit unnoticed, such as leftover
-  debug code or untracked personal notes. Leave these out of the list itself.
+- After the code block, write only real problems: something that would be wrong to commit as it
+  is, such as leftover debug code, untracked personal notes, conflict markers, or a file the change
+  needs that isn't in it. Give each one in a sentence that says what's wrong and what to do about
+  it. When there is none, write the single line "Nothing to flag." Leave these out of the list
+  itself.
+- Write nothing else after the code block: no heading over the flags, no facts that need no
+  action (what's staged, what a later step brings in, how Git records authors), and no notes on
+  why a list is empty. Information next to a flag reads as a warning and gets mistaken for one.
 
 ### No redundancy, one kind per item
 

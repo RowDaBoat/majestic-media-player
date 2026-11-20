@@ -151,7 +151,7 @@ proc work(job: WaveSource, bucket: float, gen: int) =
     args.add ["-map", "0:a:" & $job.stream, "-vn", "-sn", "-dn",
               "-c:a", "pcm_f32le", "-f", "wav", "-"]
     var p: Process
-    try: p = startProcess("ffmpeg", args = args, options = {poUsePath})
+    try: p = startProcess("ffmpeg", args = args, options = {poUsePath, poDaemon})  # poDaemon: no console window on Windows
     except OSError: err = "ffmpeg can't be run"
     if p != nil:
       var stale = false
