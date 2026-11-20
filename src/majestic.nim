@@ -693,6 +693,9 @@ type
     shielded: bool            ## the shield button: later launches don't hand
                               ## their files here (off in every new player)
     instanceRetry: float      ## when listening for later launches was last tried
+    outsideAt: float          ## when files last came from the file manager (or a later launch)
+    outsideFiles: seq[string] ## the playlist they made, while more may join it
+    outsideTab: int           ## its playlist's id
     scripted: bool            ## run by a debug script: never shares files
     peers: PeerNet            ## other players, for Synchronize
     syncMaster: int           ## pid of our group's master, 0 when not synchronized
@@ -2683,7 +2686,7 @@ proc expandPaths(paths: seq[string]): seq[string] =
     elif fileExists(p) or p.cueEntryExists: files.add p
   withCueTracks(files)
 
-proc openPaths(a: App, paths: seq[string]) =
+proc openPaths(a: App, paths: seq[string]): bool {.discardable.} =
   if a.editLocked: return
   # A cue track (from Open Recent) opens its album, playing from that track.
   let track = if paths.len == 1 and paths[0].isCueEntry: paths[0] else: ""
@@ -2702,6 +2705,38 @@ proc openPaths(a: App, paths: seq[string]) =
   a.plScroll = 0
   a.selectOnly(-1)
   a.playIndex(max(files.find(track), 0))
+  true
+
+const OutsideGap = 2.0
+  ## Launches this close together (in seconds) open one playlist.
+
+proc openFromOutside(a: App, launches: seq[seq[string]]) =
+  ## Files from the file manager or the command line, one list per launch.
+  ## Several files selected in a file manager can start one player each, all
+  ## at once (Windows Explorer does that), in no reliable order: launches that
+  ## close together make one playlist, sorted by name and played from the top.
+  for paths in launches:
+    let joins = a.outsideFiles.len > 0 and now() - a.outsideAt < OutsideGap and
+      a.tabPlaying == a.tabView and a.shownId == a.outsideTab and
+      a.playlist == a.outsideFiles and not a.editLocked
+    if not joins:
+      if not a.openPaths(paths):
+        a.outsideFiles.setLen 0
+        continue
+    else:
+      let files = expandPaths(paths).filterIt(it notin a.playlist)
+      if files.len > 0:
+        let playing = if a.plIndex in 0 ..< a.playlist.len: a.playlist[a.plIndex] else: ""
+        a.playlist = a.playlist & files
+        a.playlist.sort(proc (x, y: string): int = naturalCmp(x, y))
+        a.selectOnly(-1)
+        a.plScroll = 0
+        # The top one plays: the file that came first is any of them.
+        if a.playlist[0] != playing: a.playIndex(0)
+        else: a.plIndex = 0
+    a.outsideAt = now()
+    a.outsideFiles = a.playlist
+    a.outsideTab = a.shownId
 
 proc saveResume(a: App) =
   ## What the player is doing, for it to restart into an update with: the
@@ -13959,7 +13994,9 @@ proc setShield(a: App, on: bool) =
     a.instance.close()
     a.instance = nil
   elif a.instance == nil and not a.scripted:
-    a.instance = startServer()
+    var launch = lockLaunch(wait = 0.5)
+    if launch.held: a.instance = startServer()
+    launch.unlock()
     a.instanceRetry = now()
   a.osd(if on: "Shield on: files opened elsewhere start a new player"
         else: "Shield off")
@@ -19460,12 +19497,20 @@ proc main() =
   when defined(linux): discard integrate(always = false)
   # Debug scripts must not hand their files to (or take files from) a real
   # player the user has open.
+  # (MMP_INSTANCE_DIR lets them share among themselves.)
   let scripted = a.script.steps.len > 0
-  if files.len > 0 and a.cfg.openMode == omSamePlayer and not scripted and
+  let shares = not scripted or existsEnv("MMP_INSTANCE_DIR")
+  # One launch at a time looks for a running player and, finding none,
+  # becomes it: files selected together in a file manager can start a
+  # player each at once, and the first must be listening when the others look.
+  var launch = if shares: lockLaunch() else: LaunchLock()
+  if files.len > 0 and a.cfg.openMode == omSamePlayer and shares and
      NewPlayerArg notin params and forwardToRunning(files):
+    launch.unlock()
     return
-  a.scripted = scripted
-  if not scripted: a.instance = startServer()
+  a.scripted = not shares
+  if shares: a.instance = startServer()
+  launch.unlock()
   # Debug scripts only see other players in a folder of their own.
   if not scripted or existsEnv("MMP_SYNC_DIR"): a.peers = startPeerNet()
   a.positions = loadPositions()
@@ -19632,7 +19677,7 @@ proc main() =
   # The playlists, without playing: Play starts the entry that was current.
   a.loadTabs()
   if resumed: a.resumeState(rs)
-  elif files.len > 0: a.openPaths(files)
+  elif files.len > 0: a.openFromOutside(@[files])
 
   var lastFrame = 0.0
   proc enableRunes() =
@@ -19664,17 +19709,19 @@ proc main() =
     if a.instance == nil and not a.shielded and not a.scripted and
        now() - a.instanceRetry > 2:
       a.instanceRetry = now()
-      a.instance = startServer()
-    let incoming = a.instance.poll()
+      var launch = lockLaunch(wait = 0)  # a launch deciding meanwhile: next time
+      if launch.held: a.instance = startServer()
+      launch.unlock()
+    let incoming = a.instance.poll().mapIt(
+      it.mapIt(if it.contains("://"): it else: it.absolutePath))
     if incoming.len > 0 and a.playlistLocked:
       # The master's playlist rules; the files go there.
-      a.peers.send(a.syncMaster, @["open"] & incoming.mapIt(
-        if it.contains("://"): it else: it.absolutePath))
+      a.peers.send(a.syncMaster, @["open"] & incoming.concat)
       a.osd("Opening in the synchronization master")
     elif incoming.len > 0:
       a.closeDialogs()
       a.ui.focusId = ""
-      a.openPaths(incoming.mapIt(if it.contains("://"): it else: it.absolutePath))
+      a.openFromOutside(incoming)
       a.window.activate()
       a.dirtyUntil = now() + 0.5
     if a.menus.pollInput(): a.dirtyUntil = now() + 1.2

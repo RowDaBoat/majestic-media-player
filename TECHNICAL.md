@@ -388,6 +388,15 @@ it held, to commit.
   finds nobody and becomes a player of its own, listening in turn. Unshielding
   listens again; a player that's unshielded but not listening (another one was
   first) retries every 2 s from the main loop, taking over once that one quits.
+  Several files selected in a file manager can start one player each, all at
+  once (Windows Explorer does that), in no set order. A launch lock
+  (`lockLaunch`: a named mutex on Windows, `flock` on the socket path's `.lock`
+  elsewhere) lets one launch at a time look for a running player and, finding
+  none, start listening, so the others find it. `openFromOutside` turns
+  launches less than 2 s apart (`OutsideGap`) into one playlist sorted by name,
+  playing the top entry; a single launch with several files keeps their order.
+  Debug scripts share files only with `MMP_INSTANCE_DIR` set (the socket's
+  folder); `tmp/inst/burst.sh` starts one scripted player per file at once.
 - Options ▸ Formats writes file associations to `~/.config/mimeapps.list`.
 - Options pages never scroll: everything on a page must fit the window (`OptionsSize`, in UI
   units, so at any UI scale); only lists inside a page (Formats, Keys, Media Cache, Libraries) and
