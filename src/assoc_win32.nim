@@ -4,6 +4,7 @@
 ## own choice in Settings > Default apps override it, and only the user may
 ## change that choice; userOverrides lists the extensions where they did.
 
+import std/strutils
 import win32api
 
 const
@@ -67,23 +68,46 @@ proc userChoice(ext: string): string =
   regGet(r"Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts\." & ext &
     r"\UserChoice", "ProgId")
 
+proc openCommand(): string = "\"" & getAppFilename() & "\" \"%1\""
+
+proc appKey(): string = r"Software\Classes\Applications\" & getAppFilename().extractFilename
+
+proc setMultiSelect() =
+  ## Lets Explorer open any number of selected files: without it, a "%1"
+  ## command is offered for at most 15 and Enter does nothing past that.
+  ## Each file still starts a player of its own, which hands it to the first
+  ## (instance.nim), so they all end up in one playlist.
+  for verb in [r"Software\Classes\" & ProgId & r"\shell\open", appKey() & r"\shell\open"]:
+    regSet(verb, "MultiSelectModel", "Player")
+
 proc registerApp() =
   ## The ProgID that opens files with this executable, and the capabilities
   ## that list the player under Settings > Default apps.
   let exe = getAppFilename()
-  let cmd = "\"" & exe & "\" \"%1\""
+  let cmd = openCommand()
   regSet(r"Software\Classes\" & ProgId, "", "Media file")
   regSet(r"Software\Classes\" & ProgId & r"\DefaultIcon", "", exe & ",0")
   regSet(r"Software\Classes\" & ProgId & r"\shell\open\command", "", cmd)
-  let app = r"Software\Classes\Applications\" & exe.extractFilename
+  let app = appKey()
   regSet(app, "FriendlyAppName", AppTitle)
   regSet(app & r"\shell\open\command", "", cmd)
+  setMultiSelect()
   regSet(AppKey & r"\Capabilities", "ApplicationName", AppTitle)
   regSet(AppKey & r"\Capabilities", "ApplicationDescription",
     "Dark-themed media player built on mpv")
   for ext in @VideoExtensions & @AudioExtensions & @AssocTrackerExtensions:
     regSet(AppKey & r"\Capabilities\FileAssociations", "." & ext, ProgId)
   regSet(r"Software\RegisteredApplications", AppTitle, AppKey & r"\Capabilities")
+
+proc updateRegistration*() =
+  ## Brings associations made by an older version of this same executable up
+  ## to date (they lack MultiSelectModel); one pointing elsewhere is left alone.
+  let progVerb = r"Software\Classes\" & ProgId & r"\shell\open"
+  if cmpIgnoreCase(regGet(progVerb & r"\command"), openCommand()) != 0 or
+     regGet(progVerb, "MultiSelectModel") == "Player": return
+  try: setMultiSelect()
+  except OSError: return
+  SHChangeNotify(SHCNE_ASSOCCHANGED, 0, nil, nil)
 
 proc loadAssocItems*(): seq[AssocItem] =
   for (exts, video) in [(@VideoExtensions, true), (@AudioExtensions, false),

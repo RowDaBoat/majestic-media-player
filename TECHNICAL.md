@@ -395,6 +395,12 @@ it held, to commit.
   none, start listening, so the others find it. `openFromOutside` turns
   launches less than 2 s apart (`OutsideGap`) into one playlist sorted by name,
   playing the top entry; a single launch with several files keeps their order.
+  On Windows the open verb carries `MultiSelectModel=Player`: without it Explorer
+  offers a `"%1"` command for at most 15 selected files, and Enter does nothing
+  past that. `registerApp` writes it, and `updateRegistration` adds it at startup
+  to an association an older version of the same executable made.
+  `tmp/multi/shelltest.ps1` opens a folder's files at once through the shell's
+  open verb, as Explorer does, with isolated config and socket folders.
   Debug scripts share files only with `MMP_INSTANCE_DIR` set (the socket's
   folder); `tmp/inst/burst.sh` starts one scripted player per file at once.
 - Options ▸ Formats writes file associations to `~/.config/mimeapps.list`.

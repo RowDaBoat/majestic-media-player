@@ -10,7 +10,7 @@ import appimage, mpv, videogl, xwin, config, dialogs, theme, ui, menutree, playe
   netprobe, tracker, trackerchart, modstream, midisong, midistream, midichart, rgscan, tagdlg, avsdlg,
   avsview, plmanager, cue, animpic, library, libtypes, glyphcache, crashlog, waveform
 from coverart import pictures
-from assoc import loadAssocItems
+from assoc import loadAssocItems, updateRegistration
 import wsaud, m2c
 from folderpics import formatTitle, fileFields
 from std/uri import encodeUrl, decodeUrl, parseUri, decodeQuery, UriParseError
@@ -19511,6 +19511,7 @@ proc main() =
   a.scripted = not shares
   if shares: a.instance = startServer()
   launch.unlock()
+  if not scripted: updateRegistration()
   # Debug scripts only see other players in a folder of their own.
   if not scripted or existsEnv("MMP_SYNC_DIR"): a.peers = startPeerNet()
   a.positions = loadPositions()

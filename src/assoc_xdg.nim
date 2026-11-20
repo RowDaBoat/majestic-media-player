@@ -76,6 +76,10 @@ proc setEntries(lines: var seq[string], section, key: string, values: seq[string
     while at > a + 1 and lines[at - 1].strip.len == 0: dec at
     lines.insert(key & "=" & values.join(";") & ";", at)
 
+proc updateRegistration*() =
+  ## Nothing to bring up to date: the .desktop entry already takes many files.
+  discard
+
 proc loadAssocItems*(): seq[AssocItem] =
   let mimes = extensionMimes()
   let lines = readLines(mimeappsPath())

@@ -982,9 +982,19 @@ proc rememberValues*(c: CommandLine, values: Table[string, RunValue]) =
   all[c.title] = mine
   all.save()
 
-const PresetCommandLines = staticRead("../assets/presets/commandlines.json")
+# Bytes, not a string: MSVC refuses a C string literal past 16 KB.
+const PresetCommandLineBytes = block:
+  const s = staticRead("../assets/presets/commandlines.json")
+  var bytes: array[s.len, byte]
+  for i, c in s: bytes[i] = byte(c)
+  bytes
 
-let presetTitles = PresetCommandLines.fromJson(seq[CommandLine]).mapIt(it.title)
+proc presetCommandLines(): seq[CommandLine] =
+  var s = newString(PresetCommandLineBytes.len)
+  for i, b in PresetCommandLineBytes: s[i] = char(b)
+  s.fromJson(seq[CommandLine])
+
+let presetTitles = presetCommandLines().mapIt(it.title)
 
 proc isPreset*(c: CommandLine): bool =
   ## True when c carries the title of a shipped command line.
@@ -995,7 +1005,7 @@ proc seedPresets*(c: var Config): bool =
   ## once, so deleting one sticks. True when c changed and needs saving.
   var cmds = loadCommandLines()
   var added = false
-  for p in PresetCommandLines.fromJson(seq[CommandLine]):
+  for p in presetCommandLines():
     if p.title in c.seededPresets: continue
     c.seededPresets.add p.title
     result = true
