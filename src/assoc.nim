@@ -1,5 +1,6 @@
 ## File associations: makes the player the default application for media
-## types, through the XDG mimeapps.list on Linux and the registry on Windows.
+## types, through the XDG mimeapps.list on Linux, the registry on Windows and
+## Launch Services on macOS.
 
 import std/[os, algorithm]
 import config
@@ -39,7 +40,15 @@ proc pending*(items: seq[AssocItem]): bool =
   for it in items:
     if it.checked != it.current: return true
 
+const NoTypeText* = when defined(macosx): "only from the app bundle"
+                    else: "not in the MIME database"
+  ## Shown for a format that can't be associated.
+const TypeSearchHint* = when defined(macosx): "Search extensions or types"
+                        else: "Search extensions or MIME types"
+
 when defined(windows):
   include assoc_win32
+elif defined(macosx):
+  include assoc_macos
 else:
   include assoc_xdg

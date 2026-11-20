@@ -10,6 +10,7 @@
 ## without it an animated WebP can't be shown (`webpMissing`).
 
 import std/[dynlib, strutils]
+import dylibs
 import pixie, pixie/fileformats/png
 import gifanim
 
@@ -85,7 +86,7 @@ proc loadWebp(): bool =
               elif defined(macosx): @["libwebpdemux.2.dylib", "libwebpdemux.dylib"]
               else: @["libwebpdemux.so.2", "libwebpdemux.so"]
   var lib: LibHandle
-  for n in names:
+  for n in libNames(names):
     lib = loadLib(n)
     if lib != nil: break
   if lib == nil: return false

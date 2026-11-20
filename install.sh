@@ -33,7 +33,17 @@ fi
 
 # Build/runtime dependencies. On Arch-based systems, offer to install missing ones.
 pkgs=(nim git base-devel mpv libx11 libxrandr kdialog)
-if command -v pacman >/dev/null; then
+if [[ $(uname -s) == Darwin ]]; then
+  # macOS: libmpv from Homebrew; the compiler from the Xcode command line tools.
+  pkgs=(nim git "Xcode command line tools (xcode-select --install)" "mpv (brew install mpv)")
+  if command -v brew >/dev/null && ! brew list --versions mpv >/dev/null; then
+    echo "Installing mpv with Homebrew"
+    brew install mpv
+  fi
+  for c in nim git make cc; do
+    command -v "$c" >/dev/null || { echo "missing '$c' — install: ${pkgs[*]}" >&2; exit 1; }
+  done
+elif command -v pacman >/dev/null; then
   missing=()
   for p in "${pkgs[@]}"; do
     pacman -Qq "$p" >/dev/null 2>&1 || pacman -Qqg "$p" >/dev/null 2>&1 || missing+=("$p")

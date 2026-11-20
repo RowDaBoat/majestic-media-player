@@ -1169,17 +1169,20 @@ it held, to commit.
 | `src/cmdlines.nim`, `src/runlog.nim` | The Run menu: the Commands window (command lines of text and cards, composed into bash), the Run window (times, values, rectangles, paths, file lists); the run log |
 | `src/menutree.nim` | Menu bar / popup / context-menu system |
 | `src/options.nim` | Options window (page tree and pages) |
-| `src/assoc*.nim` | File associations (XDG mimeapps.list / Windows registry) |
+| `src/assoc*.nim` | File associations (XDG mimeapps.list / Windows registry / macOS Launch Services) |
 | `src/appimage.nim` | Running as an AppImage: its file, for restarts and updates, and its launcher entry |
 | `src/portal.nim` | xdg-desktop-portal requests over libdbus (color picker, file dialog fallback) |
 | `src/instance.nim`, `src/peers.nim`, `src/ipc.nim` | Single-instance hand-over, Synchronize links, local sockets |
 | `src/syncdlg.nim` | Synchronize ▸ Properties window (masters, slaves, offset, looping) |
-| `src/mediactl*.nim` | Task bar media controls (MPRIS / Windows thumbnail toolbar) |
+| `src/mediactl*.nim` | Task bar media controls (MPRIS / Windows thumbnail toolbar / macOS Now Playing and media keys) |
 | `src/ui.nim` | Widget helpers on top of Silky's drawing primitives |
 | `src/crashlog.nim` | Writes Nim's report of an unhandled exception or fatal signal to `crash.log`, with the app's state |
 | `src/glyphcache.nim`, `src/fallbackfonts.nim`, `src/emojifont.nim` | Characters the UI atlas lacks, rasterized on demand from Plex or a system font chosen per language; color emoji from CBDT or COLR fonts |
-| `src/xwin*.nim`, `src/win32api.nim` | X11 / Win32 helpers (drag, on-top, aspect hints, monitors, menu popup windows) |
-| `src/config.nim`, `src/dialogs*.nim`, `src/theme.nim`, `src/icons.nim` | Settings, file dialogs (kdialog/zenity/portal, Windows common dialogs), palette, vector icons |
+| `src/xwin*.nim`, `src/win32api.nim` | X11 / Win32 / Cocoa helpers (drag, on-top, aspect hints, monitors, menu popup windows) |
+| `src/cocoa.m`, `src/cocoa.nim` | macOS: every Cocoa call (windows, popups, file panels, Now Playing, Launch Services, the visualizer's audio tap), compiled from Objective-C |
+| `src/modkeys.nim` | The shortcut modifier: Ctrl, and Cmd as well on macOS, where shortcuts show as "Cmd+" |
+| `src/dylibs.nim` | Library names to load at run time, under Homebrew's folders too on macOS |
+| `src/config.nim`, `src/dialogs*.nim`, `src/theme.nim`, `src/icons.nim` | Settings, file dialogs (kdialog/zenity/portal, Windows common dialogs, macOS open/save panels), palette, vector icons |
 
 ## Debugging
 

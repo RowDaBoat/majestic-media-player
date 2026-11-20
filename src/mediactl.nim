@@ -1,7 +1,7 @@
 ## Playback controls in the desktop's task bar, one implementation per
 ## platform with the same interface: MPRIS on Linux, which Plasma's task manager
-## shows in its window tooltips (and media keys and widgets use), and thumbnail
-## toolbar buttons on Windows. The main loop feeds it the state with `update`
+## shows in its window tooltips (and media keys and widgets use), thumbnail
+## toolbar buttons on Windows, and Now Playing and the media keys on macOS. The main loop feeds it the state with `update`
 ## and carries out what `poll` returns.
 
 import windy
@@ -28,5 +28,7 @@ type
 
 when defined(windows):
   include mediactl_win32
+elif defined(macosx):
+  include mediactl_macos
 else:
   include mediactl_mpris

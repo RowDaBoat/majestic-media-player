@@ -8,6 +8,7 @@
 ## the file back to tell which.
 
 import std/[dynlib, strutils, tables, os]
+import dylibs
 when defined(windows): import std/widestrs
 
 type
@@ -43,7 +44,7 @@ proc load*(): bool =
               elif defined(macosx): @["libtag_c.2.dylib", "libtag_c.dylib"]
               else: @["libtag_c.so.2", "libtag_c.so"]
   var lib: LibHandle
-  for n in names:
+  for n in libNames(names):
     lib = loadLib(n)
     if lib != nil: break
   if lib == nil: return false

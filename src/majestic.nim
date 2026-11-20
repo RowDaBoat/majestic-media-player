@@ -1176,7 +1176,7 @@ proc pollTracker(a: App) =
 
 # --- small helpers ----------------------------------------------------------
 
-proc ctrl(w: Window): bool = w.buttonDown[KeyLeftControl] or w.buttonDown[KeyRightControl]
+proc ctrl(w: Window): bool = w.ctrlDown
 proc shift(w: Window): bool = w.buttonDown[KeyLeftShift] or w.buttonDown[KeyRightShift]
 proc alt(w: Window): bool = w.buttonDown[KeyLeftAlt] or w.buttonDown[KeyRightAlt]
 
@@ -3960,6 +3960,8 @@ proc showInFolder(a: App, paths: seq[string]) =
   if paths.len == 0: return
   when defined(windows):
     a.spawn("explorer.exe", "/select," & paths[0])
+  elif defined(macosx):
+    a.spawn("open", @["-R"] & paths)  # Finder, the files selected
   else:
     # FileManager1 (Dolphin, Nautilus, ...) selects the files; else just open the
     # folder. The URIs are percent-encoded: no comma splits one.
@@ -3979,6 +3981,7 @@ proc openFolder(a: App, dir: string) =
   try: createDir(dir)
   except OSError: discard
   when defined(windows): a.spawn("explorer.exe", dir)
+  elif defined(macosx): a.spawn("open", dir)
   else: a.spawn("xdg-open", dir)
 
 when defined(windows):
@@ -10352,6 +10355,7 @@ proc libraryMenu(a: App): MenuNode =
     m.sep()
     m.item("Open Folder", action = proc () =
       when defined(windows): a.spawn("explorer.exe", folder)
+      elif defined(macosx): a.spawn("open", folder)
       else: a.spawn("xdg-open", folder))
     m.item("Copy Path", action = proc () =
       setClipboardString(folder)
@@ -10975,7 +10979,7 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
         a.cfg.save())
     ctx.sep()
   if loaded and fileKind.sphere:
-    ctx.check("Ctrl+Drag to Look",
+    ctx.check(keyLabel("Ctrl+Drag to Look"),
       checked = a.cfg.sphereDragMovesWindow, action = proc () =
         a.cfg.sphereDragMovesWindow = not a.cfg.sphereDragMovesWindow
         a.cfg.save())
@@ -18302,6 +18306,8 @@ proc shortcutColumns(a: App): array[2, seq[ShortcutGroup]] =
       ("Draw, resize or move the rectangle", "Drag video / its side / inside it")])]
   for col in result.mitems:
     col.keepItIf(it.rows.len > 0)
+    for g in col.mitems:
+      for r in g.rows.mitems: r[1] = keyLabel(r[1])
 
 proc shortcutsOverlay(a: App) =
   let ui = a.ui
@@ -19539,6 +19545,10 @@ proc main() =
   # Ties the window to majestic-media-player.desktop (taskbar icon, audio
   # stream matching), whatever the binary is called.
   when defined(linux): x11ClassName = "majestic-media-player"
+  # Quit in the app menu (Cmd+Q) or the Dock: like closing the main window.
+  when defined(macosx):
+    onQuitRequest = proc () =
+      if a.window != nil: a.window.closeRequested = true
   try:
     a.window = newWindow(AppName, startSize, vsync = false)
     makeContextCurrent(a.window)
@@ -19561,7 +19571,7 @@ proc main() =
   a.media = newMediaControls(a.window)
   if c.compactMode: a.window.setDecorated(false)
   when defined(windows): setDialogOwner(a.window.getHWND)
-  else:
+  elif not defined(macosx):  # macOS: Cocoa panels, no dialog process to own
     let window = a.window
     setDialogOwner(window.windowId, proc (pid: int): bool = window.adoptDialog(pid))
   a.window.disableVsync()
@@ -19713,8 +19723,13 @@ proc main() =
       var launch = lockLaunch(wait = 0)  # a launch deciding meanwhile: next time
       if launch.held: a.instance = startServer()
       launch.unlock()
-    let incoming = a.instance.poll().mapIt(
+    var incoming = a.instance.poll().mapIt(
       it.mapIt(if it.contains("://"): it else: it.absolutePath))
+    # Files opened from Finder, Open With or the Dock (the app bundle's): one
+    # selection at a time.
+    when defined(macosx):
+      let opened = takeOpenedPaths()
+      if opened.len > 0: incoming.add opened
     if incoming.len > 0 and a.playlistLocked:
       # The master's playlist rules; the files go there.
       a.peers.send(a.syncMaster, @["open"] & incoming.concat)

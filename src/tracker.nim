@@ -14,6 +14,7 @@
 ## sample interpolation makes it cheaper, with the same rows and levels.
 
 import std/[dynlib, algorithm, tables, monotimes, times, strutils, sequtils]
+import dylibs
 
 const
   RenderRate = 48000          ## Hz: the song's own, for its tick lengths
@@ -89,7 +90,7 @@ proc loadApi*(): bool =
               elif defined(macosx): @["libopenmpt.0.dylib", "libopenmpt.dylib"]
               else: @["libopenmpt.so.0", "libopenmpt.so"]
   var lib: LibHandle
-  for n in names:
+  for n in libNames(names):
     lib = loadLib(n)
     if lib != nil: break
   if lib == nil: return false
@@ -264,7 +265,7 @@ proc loadDetailApi(): bool =
               elif defined(macosx): @["libopenmpt.0.dylib", "libopenmpt.dylib"]
               else: @["libopenmpt.so.0", "libopenmpt.so"]
   var lib: LibHandle
-  for n in names:
+  for n in libNames(names):
     lib = loadLib(n)
     if lib != nil: break
   if lib == nil: return false

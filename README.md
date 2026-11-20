@@ -42,6 +42,7 @@ Majestic's aim is to be the video player I wish I had.
 - Playlists line: - **Several playlists**, foobar2000-style, with a playback queue and group headers.
 - Tag editor line: - **A tag editor**, even for files that can't hold tags (MIDI, tracker modules...).
 - After "A shield button": - **Westwood `.aud` game music.**
+- Taskbar line: - **Taskbar media controls** on Windows and KDE Plasma, media keys and Now Playing on macOS.
 -->
 
 Hold Ctrl, Shift or Alt to see what else you can do, or press F1 for every shortcut. Try right-clicking everything, too!
@@ -77,6 +78,20 @@ cd majestic-media-player
 ```
 
 Majestic shows up in the Start menu.
+
+<!-- Unreleased (macOS support, newer than v0.26.1). Once a release with it is tagged, uncomment:
+### macOS from source
+
+Install the Xcode command line tools (`xcode-select --install`), [Nim](https://nim-lang.org) 2.2+ and [Homebrew](https://brew.sh). Then:
+
+```sh
+git clone https://github.com/arkl1te/majestic-media-player.git
+cd majestic-media-player
+./install.sh
+```
+
+**Majestic Media Player** shows up in `~/Applications` (`./install.sh --system` for `/Applications`). Shortcuts use Cmd where they say Ctrl.
+-->
 
 To update a source install, `git pull` and run `./install.sh` again. `./install.sh --uninstall` removes it.
 

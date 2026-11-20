@@ -3,7 +3,8 @@
 import std/[strformat, strutils, math]
 from std/times import epochTime
 import silky, vmath, bumpy, chroma, pixie, opengl
-import theme, xwin, glyphcache
+import theme, xwin, glyphcache, modkeys
+export modkeys
 
 type
   Ui* = ref object
@@ -170,6 +171,9 @@ proc scroll*(ui: Ui): float32 =
   when defined(windows):
     # Windy reports notches there (WHEEL_DELTA = 1), + = up.
     -ui.window.scrollDelta.y * 10
+  elif defined(macosx):
+    # Windy reports X11 units there too, but + = up.
+    -ui.window.scrollDelta.y
   else:
     ui.window.scrollDelta.y
 
@@ -197,7 +201,7 @@ proc tabNavigate*(ui: Ui): int =
   let w = ui.window
   result = -1
   if not w.buttonPressed[KeyTab] or ui.tabStops.len == 0: return
-  if w.buttonDown[KeyLeftControl] or w.buttonDown[KeyRightControl] or
+  if w.ctrlDown or
      w.buttonDown[KeyLeftAlt] or w.buttonDown[KeyRightAlt]: return
   let n = ui.tabStops.len
   var i = -1
@@ -379,7 +383,8 @@ proc icon*(ui: Ui, name: string, center: Vec2, color = colText) =
   ui.sk.drawImage(name, (center - sz / 2).floor, color)
 
 proc tip*(ui: Ui, r: Rect, s: string) =
-  if ui.hover(r): ui.tooltip = s; ui.tooltipAnchor = r
+  ## Shortcuts in s read "Ctrl+", shown as this platform names it (keyLabel).
+  if ui.hover(r): ui.tooltip = keyLabel(s); ui.tooltipAnchor = r
 
 proc drawTooltip*(ui: Ui) =
   if ui.tooltip.len == 0 or ui.sk.mouseIdleTime < 0.5: return
@@ -833,7 +838,7 @@ proc textField*(ui: Ui, id: string, r: Rect, text: var string,
       let ps = pieces
       ui.caret = ps.pastChipTag(ui.caret, true)
       ui.selAnchor = ps.pastChipTag(ui.selAnchor, true)
-    let ctrl = w.buttonDown[KeyLeftControl] or w.buttonDown[KeyRightControl]
+    let ctrl = w.ctrlDown
     let shift = w.shiftDown
     # The selection is read where it's used, never once per frame: keys
     # pressed faster than frames (a slow frame) arrive together, and Ctrl+A
@@ -1068,7 +1073,7 @@ proc textArea*(ui: Ui, id: string, r: Rect, text: var string,
   if focused:
     ui.caret = clamp(ui.caret, 0, text.len)
     ui.selAnchor = clamp(ui.selAnchor, 0, text.len)
-    let ctrl = w.buttonDown[KeyLeftControl] or w.buttonDown[KeyRightControl]
+    let ctrl = w.ctrlDown
     let shift = w.shiftDown
     # The selection is read where it's used, never once per frame: keys
     # pressed faster than frames (a slow frame) arrive together, and Ctrl+A

@@ -6,6 +6,7 @@
 ## stderr with ALSA's complaints. Its log is silenced too.
 
 import std/dynlib
+import dylibs
 
 type
   Settings* = pointer
@@ -44,7 +45,7 @@ proc load*(): bool =
               elif defined(macosx): @["libfluidsynth.3.dylib", "libfluidsynth.dylib"]
               else: @["libfluidsynth.so.3", "libfluidsynth.so"]
   var lib: LibHandle
-  for n in names:
+  for n in libNames(names):
     lib = loadLib(n)
     if lib != nil: break
   if lib == nil: return false

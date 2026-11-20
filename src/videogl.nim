@@ -22,6 +22,11 @@ when defined(windows):
     result = wglGetProcAddress(name)
     if cast[int](result) in [-1, 0, 1, 2, 3]:
       result = GetProcAddress(opengl32, name)
+elif defined(macosx):
+  import cocoa
+
+  proc mpvGetProcAddress(ctx: pointer, name: cstring): pointer {.cdecl.} =
+    mmpGlProc(name)
 else:
   proc glXGetProcAddressARB(name: cstring): pointer {.importc, dynlib: "libGL.so.1".}
 

@@ -111,6 +111,7 @@ when defined(windows):
 
 else:
   import std/dynlib
+  import dylibs
 
   type
     FcFontSet = object
@@ -139,8 +140,11 @@ else:
   proc loadFc(): bool =
     if fcTried: return fc.ok
     fcTried = true
-    var lib = loadLib("libfontconfig.so.1")
-    if lib == nil: lib = loadLib("libfontconfig.so")
+    var lib: LibHandle
+    for n in libNames(when defined(macosx): ["libfontconfig.1.dylib", "libfontconfig.dylib"]
+                      else: ["libfontconfig.so.1", "libfontconfig.so"]):
+      lib = loadLib(n)
+      if lib != nil: break
     if lib == nil: return false
     template sym(field, name: untyped) =
       fc.field = cast[typeof(fc.field)](lib.symAddr(name))
